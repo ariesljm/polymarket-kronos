@@ -225,12 +225,13 @@ def test_api_reset_rejected_in_live(monkeypatch):
         srv.server_close()
 
 
-def test_page_js_is_valid_javascript():
+def test_page_js_is_valid_javascript(tmp_path):
     """页面内联 JS 必须能通过语法解析。
 
     防回归：WEB_HTML 是运行时字符串，若 JS 字符串里误写 \n 等转义被
     Python 展开成真实换行，会把 JS 字符串拦腰截断（整个 script 失效，
     页面永远停留在“连接中…”）。用 node --check 对运行时内容做校验。
+    Windows 上 node 从 stdin 检查存在句柄竞态（偶发挂起），改用临时文件。
     """
     import re
     import shutil
@@ -243,8 +244,10 @@ def test_page_js_is_valid_javascript():
         pytest.skip("node 不可用，跳过 JS 语法检查")
     html = web_ui.WEB_HTML  # 运行时字符串（转义已展开）
     js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
-    r = subprocess.run([node, "--check", "-"], input=js,
-                       capture_output=True, text=True)
+    js_file = tmp_path / "check.js"
+    js_file.write_text(js, encoding="utf-8")
+    r = subprocess.run([node, "--check", str(js_file)],
+                       capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, f"页面 JS 语法错误:\n{r.stderr}"
 
 

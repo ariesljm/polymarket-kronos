@@ -18,14 +18,13 @@ dependencies = [
     "websockets>=17.0.1",
 ]
 
-# GPU 推理：torch 走 CUDA 12.6 源（GTX 1060/Pascal 不支持 CUDA 13；
-# cu126 wheel 兼容 sm_50+，含 Pascal）。无 GPU 主机仍可装 cpu 版。
-[tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+# GPU 推理（NVIDIA）：恢复 CUDA 12.6 源用
+#   [tool.uv.sources]
+#   torch = { index = "pytorch-cu126" }
+#   [[tool.uv.index]]
+#   name = "pytorch-cu126"
+#   url = "https://download.pytorch.org/whl/cu126"
+# 本机（AMD iGPU / 无 NVIDIA）使用 PyPI CPU 版 torch。
 
 [dependency-groups]
 dev = [
