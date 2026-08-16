@@ -92,6 +92,7 @@ class MarketLifecycle:
             finally:
                 st.predicting = False
                 st.last_predict_sec = now_sec
+                self.deps.save_status()  # 推理结束落盘：防强杀/崩溃残留 predicting=true
             logger.info("信号: %s (P(up)=%.3f)", st.signal.direction.value, st.signal.p_up)
         self.phase = Phase.RUNNING
 

@@ -30,13 +30,15 @@ def make_state(**kw) -> TradeState:
 
 
 def make_pos(**kw) -> Position:
-    return Position(Direction.UP, 0.45, 2.0, 800, 999_900, **kw)
+    # 默认 window_start 为很早的旧窗口（幽灵场景：窗口早已结束且超过宽限期）
+    return Position(Direction.UP, 0.45, 2.0, 800, kw.pop("window_start", 995_000), **kw)
 
 
-def _eth_pos(size=5.0):
+def _eth_pos(size=5.0, slug="btc-updown-15m-999900", outcome="Up"):
     return {"asset": "tok1", "conditionId": "c1", "size": size,
             "avgPrice": 0.5, "curPrice": 0.6, "cashPnl": 0.5,
-            "title": "Bitcoin Up or Down - Aug 16", "outcome": "Up"}
+            "title": "Bitcoin Up or Down - Aug 16", "outcome": outcome,
+            "slug": slug}
 
 
 def _make(save_log=None, **kw) -> tuple[WalletReconciler, FakeWallet, TradeState, list]:
@@ -145,12 +147,59 @@ def test_throttled_positions_check():
     assert src.position_queries == q + 1
 
 
-def test_untracked_position_warns_but_keeps():
-    """本地无记录但 Polymarket 有持仓：警告，不自动接管。"""
+def test_adopts_untracked_position():
+    """本地无记录但 Polymarket 有本标的持仓（成交响应丢失/误清恢复）→ 自动接管。
+
+    接管后持仓回到 bot 管理：止损/时间止损/结算可正常触发（回归：误清后资金裸奔）。
+    """
     r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": [_eth_pos()]})
+    st.window_start = 999_900
+    r.reconcile(1_000_031, st)
+    assert st.position is not None
+    assert st.position.direction is Direction.UP
+    assert st.position.size == 5.0
+    assert st.position.entry_price == 0.5
+    assert st.position.window_start == 999_900  # 从 slug 解析窗口起点
+    assert st.window_bet_placed is True  # 同窗口已下注，防重复买入
+    assert st.live_positions == [_eth_pos()]
+
+
+def test_adopt_down_position_and_old_window():
+    """接管 DOWN 方向；持仓窗口早于当前窗口时不置 window_bet_placed（不误伤新窗口下注）。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={
+        "positions": [_eth_pos(outcome="Down", slug="btc-updown-15m-999900")]})
+    st.window_start = 1_000_800  # 当前窗口晚于持仓窗口
+    r.reconcile(1_001_031, st)
+    assert st.position is not None
+    assert st.position.direction is Direction.DOWN
+    assert st.window_bet_placed is False  # 旧窗口仓位不影响新窗口下注
+
+
+def test_adopt_skips_slug_without_window():
+    """slug 解析不出窗口起点（非 bot 市场格式，疑似手动仓位）→ 不接管，仅警告。"""
+    pos = _eth_pos(slug="some-other-market")
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": [pos]})
     r.reconcile(1_000_031, st)
     assert st.position is None  # 不接管
-    assert st.live_positions == [_eth_pos()]
+    assert st.live_positions == [pos]
+
+
+def test_recent_position_not_cleared_during_index_delay():
+    """刚买入的持仓（窗口未结束/宽限期内）Polymarket 暂未出现 → 不清除。
+
+    回归：买入后 /positions 索引延迟返回空，被误判幽灵清除 → 真实持仓
+    失去止损/时间止损/结算管理（本地 position=null、UI 与实盘不符）。
+    """
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": []})
+    # 窗口 999900（step 300s：结束 1_000_200，宽限至 1_000_380）
+    st.position = make_pos(window_start=999_900)
+    r.reconcile(1_000_031, st)  # 买入 31s 后核对：索引可能未同步
+    assert st.position is not None  # 不误清
+    assert st.live_positions == []
+    # 窗口结束且超过宽限（>1_000_380）后仍无持仓 → 真幽灵，清除
+    r.reconcile(1_000_500, st)
+    assert st.position is None
+    assert saved  # 有落盘回调
 
 
 def test_title_alias_matching():

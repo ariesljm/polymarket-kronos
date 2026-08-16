@@ -80,6 +80,7 @@ def _main_with_guard(args, mode: str, data_dir: str) -> int:
     # spawn 细节（base python + PYTHONPATH 绕 venv shim、日志重定向）收敛在
     # paths.spawn_loop——Web 控制台 start 按钮与桌面双击共用同一实现。
     from pmbot.paths import spawn_loop
+    from pmbot.single_instance import InstanceGuard
 
     bot = spawn_loop(args.config, args.live, data_dir)
     logging.info("主循环已启动（PID %s, %s, data=%s）", bot.pid, mode, data_dir)
@@ -99,16 +100,20 @@ def _main_with_guard(args, mode: str, data_dir: str) -> int:
         _wd_log.flush()
         while True:
             time.sleep(2)
-            try:
-                os.kill(parent_pid, 0)
-            except OSError:
+            # 存活检查用 ctypes OpenProcess（PROCESS_QUERY_LIMITED_INFORMATION）：
+            # Windows 上 os.kill(pid, 0) 是 TerminateProcess(pid, 0) 而非存在性检查，
+            # 对双击 bat 启动的 cmd 父进程稳定失败（OSError 22）→ 误判父进程退出、
+            # 误杀主循环并自杀（watchdog.log "父进程已退出"）。
+            if not InstanceGuard.alive(parent_pid):
                 _wd_log.write(f"[{time.time():.0f}] 父进程已退出 poll={bot.poll()} pid={bot.pid}\n")
                 _wd_log.flush()
                 try:
                     if bot.poll() is None:
+                        # 只看 returncode，不读输出：taskkill 在中文系统输出 GBK，
+                        # text=True 按 UTF-8 解码会抛 UnicodeDecodeError（reader 线程崩溃）
                         r = subprocess.run(
                             ["taskkill", "/PID", str(bot.pid), "/T", "/F"],
-                            capture_output=True, text=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         )
                         _wd_log.write(f"[{time.time():.0f}] taskkill rc={r.returncode}\n")

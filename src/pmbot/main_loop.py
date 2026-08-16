@@ -72,7 +72,10 @@ class TradingLoop:
         self.poll_sec = poll_sec
         self.user_stream = user_stream
         # 钱包核对（余额/实时持仓/幽灵持仓）：外部世界同步关注点，独立可测
-        self.wallet_sync = WalletReconciler(self.wallet, self.save_status, dry_run=dry_run)
+        self.wallet_sync = WalletReconciler(
+            self.wallet, self.save_status, dry_run=dry_run,
+            step_sec=self.step_sec,  # 幽灵判定/接管计时需知持仓窗口何时结束
+        )
         self._lifecycle: MarketLifecycle | None = None
         self._skip_window_until = 0  # 启动跳过窗口终点（秒；0=不跳过，run_forever 启动时设置）
 
@@ -96,6 +99,13 @@ class TradingLoop:
             pass  # 非主线程/平台不支持时退化为 KeyboardInterrupt
 
         logger.info("主循环启动（symbol=%s, dry_run=%s, 轮询 %ds）", self.symbol, self.dry_run, self.poll_sec)
+        # 启动重置瞬态推理状态：旧进程崩溃/强杀可能残留 predicting=true 与旧计时，
+        # 新进程不可能“正在推理”（推理随旧进程消亡）——面板不再显示虚假的推理计时
+        if self.state.predicting or self.state.predict_start_sec is not None:
+            self.state.predicting = False
+            self.state.predict_start_sec = None
+            self.save_status()
+            logger.info("启动重置残留推理状态（predicting/predict_start_sec）")
         # 启动跳过进行中的窗口：不推理不交易，下一窗口起点才开始（避免中途启动做半窗决策）
         step = self.discovery.step_ms // 1000
         self._skip_window_until = window_start_sec(int(time.time()), step) + step

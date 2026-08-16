@@ -1044,13 +1044,19 @@ def _eth_pos(size=5.0, outcome="Up"):
 
 
 def test_reconcile_clears_ghost_position(tmp_path):
-    """本地有持仓、Polymarket 无本标的持仓 → 幽灵持仓清除（防崩溃残留占用）。"""
+    """本地有持仓、Polymarket 无本标的持仓（窗口早已结束且超宽限期）→ 幽灵持仓清除。
+
+    注意：买入后立即核对不清除（/positions 索引延迟，见
+    test_recent_position_not_cleared_during_index_delay 回归）。
+    """
     ex = BalanceExecutor(balance=20.0)
-    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    dis = FakeDiscovery(make_market())
+    loop = make_loop(tmp_path, executor=ex, dry_run=False, discovery=dis)
     loop.tick(now_ms=1_000_000_000)  # 入场
     assert loop.state.position is not None
     ex.live_positions_value = []  # Polymarket 确认无任何持仓
-    loop.tick(now_ms=1_000_000_000 + 31_000)  # ≥30s 触发核对
+    dis.market = None  # 下一 tick 市场不可用：避免窗口切换后重新买入干扰断言
+    loop.tick(now_ms=(999_900 + 900 + 180 + 10) * 1000)  # 窗口结束 190s 后（>宽限 180s）
     assert loop.state.position is None  # 幽灵持仓已清除
     assert loop.state.live_positions == []
 
@@ -1084,6 +1090,29 @@ def test_reconcile_skipped_in_dry_run(tmp_path):
     ex.live_positions_value = []
     loop.tick(now_ms=1_000_000_000 + 31_000)
     assert loop.state.position is not None  # 模拟持仓不动
+
+
+def test_index_delay_does_not_kill_position_and_stop_still_works(tmp_path):
+    """事故链回归：买入 → /positions 索引延迟返回空 → 不误清 → 止损仍正常触发。
+
+    曾发生：20:05:30 买入成交，20:05:33 核对返回空被误判幽灵清除 →
+    本地 position=null → 止损/时间止损/结算全部失效（资金裸奔、UI 与实盘不符）。
+    """
+    ex = FakeExecutor()
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    assert loop.state.position is not None
+    ex.live_positions_value = []  # 索引延迟：Polymarket 查询暂时为空
+    loop.tick(now_ms=1_000_000_031)  # 买入 30s 后核对
+    assert loop.state.position is not None  # 不误清（回归：曾在此被清）
+    ex.live_positions_value = [_eth_pos()]  # 索引同步：远端出现
+    loop.tick(now_ms=1_000_000_061)  # 再核对
+    assert loop.state.position is not None  # 保留
+    ex.best_bid_value = 0.30  # 触发止损（entry 0.45 → sl 0.36）
+    loop.tick(now_ms=1_000_100_000)
+    assert loop.state.position is None  # 止损正常平仓
+    trades = Path(tmp_path, "trades.csv").read_text(encoding="utf-8")
+    assert "stop_loss" in trades
 
 
 def test_sell_pnl_uses_real_fills(tmp_path):

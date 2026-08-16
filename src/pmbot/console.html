@@ -403,22 +403,11 @@ async function refresh() {
     document.getElementById("book-cell").innerHTML = cell("盘口", "—");
   }
   const p = d.position;
-  // 实时持仓（Polymarket /positions 快照，本标的）
-  const lps = (d.live_positions || []).filter(x =>
-    (x.title || "").toLowerCase().includes((d.symbol || "").toLowerCase()));
-  let liveSub = "";
-  if (lps.length) {
-    liveSub = "实时: " + lps.map(x =>
-      (x.outcome || "") + " " + Number(x.size || 0).toFixed(2) + "股 现" + centsStr(x.curPrice || 0) +
-      " 浮动" + signed(x.cashPnl || 0)).join(" · ");
-  }
+  // 持仓只显示方向/数量/价格三项（用户口径）
   document.getElementById("pos-cell").innerHTML = p
     ? cell("持仓", "<span class='dir'>" + p.direction.toUpperCase() + "</span> <span class='mono'>" + p.size.toFixed(2) +
-        " 股 @ " + centsStr(p.entry_price) + "</span>",
-        ((p.tp_price ? "止盈 +" + Math.round((p.tp_pct || 0) * 100) + "% → " + centsStr(p.tp_price) : "") +
-        (p.sl_price ? (p.tp_price ? " · " : "") + "止损 -" + Math.round((p.sl_pct || 0) * 100) + "% → " + centsStr(p.sl_price) : "") +
-        (liveSub ? (p.tp_price || p.sl_price ? " · " : "") + liveSub : "")))
-    : cell("持仓", lps.length ? "<span class='mono'>" + liveSub + "</span>" : "—", liveSub && lps.length ? "" : undefined);
+        " 股 @ " + centsStr(p.entry_price) + "</span>")
+    : cell("持仓", "—");
   let kronos = "—";
   if (d.predicting) {
     const secs = Math.max(0, Math.floor(Date.now() / 1000 - (d.predict_start_sec || 0)));

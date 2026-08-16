@@ -308,8 +308,8 @@ def test_position_line_shows_mark_and_floating_pnl():
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY)
     text = render(v)
     assert "持仓: UP 5.00股 @45" in text
-    assert "现价 47" in text
-    assert "浮动 +0.10" in text  # (0.47-0.45)×5
+    assert "现价" not in text  # 持仓只显示方向/数量/价格（用户口径）
+    assert "浮动" not in text
 
 
 def test_position_line_without_mark_safe():
@@ -325,48 +325,23 @@ def test_position_line_without_mark_safe():
     assert "现价" not in text
 
 
-def test_position_shows_tp_sl_prices():
-    """持仓行显示动态止盈/止损价（美分）：entry 0.50 → 止盈 65 / 止损 40。"""
+def test_position_line_shows_direction_size_price_only():
+    """持仓行只显示方向/数量/价格三项：不含现价/浮动/止盈/止损（用户口径）。"""
     from pmbot.monitor import render
 
     st = status_dict(
         position={"direction": "up", "entry_price": 0.50, "size": 5.0,
                   "entered_remaining_sec": 300, "window_start": WINDOW_START},
+        market_prices={"up_ask": 0.48, "up_bid": 0.47, "down_ask": 0.54, "down_bid": 0.53},
     )
     tp_sl = {"pct": 0.30, "max": 0.95, "sl": 0.20}
-    v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(tp_sl=tp_sl))
+    v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY,
+                   panel=PanelConfig(tp_sl=tp_sl))
     text = render(v)
-    assert "止盈 65" in text  # min(0.50×1.3, 0.95)
-    assert "止损 40" in text  # 0.50×0.8
-
-
-def test_position_tp_capped_by_max():
-    """入场价高时止盈价按 take_profit_max 封顶：entry 0.80 → 止盈 95。"""
-    from pmbot.monitor import render
-
-    st = status_dict(
-        position={"direction": "up", "entry_price": 0.80, "size": 2.0,
-                  "entered_remaining_sec": 300, "window_start": WINDOW_START},
-    )
-    tp_sl = {"pct": 0.30, "max": 0.95, "sl": 0.20}
-    v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(tp_sl=tp_sl))
-    text = render(v)
-    assert "止盈 95" in text
-    assert "止损 64" in text  # 0.80×0.8 = 0.64
-
-
-def test_position_sl_hidden_when_disabled():
-    """stop_loss=0（关闭止损）→ 不显示止损段。"""
-    from pmbot.monitor import render
-
-    st = status_dict(
-        position={"direction": "up", "entry_price": 0.50, "size": 5.0,
-                  "entered_remaining_sec": 300, "window_start": WINDOW_START},
-    )
-    tp_sl = {"pct": 0.30, "max": 0.95, "sl": 0.0}
-    v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(tp_sl=tp_sl))
-    text = render(v)
-    assert "止盈 65" in text
+    assert "持仓: UP 5.00股 @50" in text
+    assert "现价" not in text
+    assert "浮动" not in text
+    assert "止盈" not in text
     assert "止损" not in text
 
 
@@ -485,7 +460,6 @@ def test_position_size_two_decimals():
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY)
     text = render(v)
     assert "持仓: UP 1.49股 @67" in text
-    assert "现价 70" in text
     assert "1.4925" not in text
 
 
@@ -587,16 +561,6 @@ def test_render_trade_low_entry_shows_fractional_cents():
     text = render(v)
     assert "入0.10 出80" in text
     assert "入0 " not in text
-
-
-def test_position_carries_tp_sl_percent_source():
-    """持仓止盈止损同时携带百分比来源（web 显示标注用）。"""
-    v = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START,
-                   panel=PanelConfig(tp_sl={"pct": 0.50, "max": 0.90, "sl": 0.60}))
-    pos = v.position
-    assert pos["tp_price"] == 0.45 * 1.50
-    assert pos["tp_pct"] == 0.50
-    assert pos["sl_pct"] == 0.60
 
 
 def test_view_carries_spot_price():

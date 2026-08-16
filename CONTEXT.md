@@ -31,7 +31,7 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 
 - **执行器（OrderPlacer）** — 主循环/生命周期下单依赖的协议：市价/限价/撤单/盘口/余额/凭证。接口按消费角色拆窄：`MarketBook`（盘口）、`TradeExecutor`（下单）、`WalletView`（钱包）、`AuthSource`（凭证）；OrderPlacer 是四者并集的组合面。两个适配器：`ClobExecutor`（实盘：真实下单、解析 API 成交 averagePrice/matchedAmount）与 `SimExecutor`（dry-run：打印指令、按盘口估算模拟成交；盘口/钱包/凭证面委托内部实盘实例）。限价规则校验（validate_limit_order）与成交解析（_parse_fill）为执行器内部单一事实源（禁止适配器各自复刻）。采样器依赖经 `SamplerProto` 窄接口注入。
 - **钱包核对（WalletReconciler）** — 引擎 tick 的“外部世界同步”关注点（深模块）：余额定时刷新（30s 节流 + 今日盈亏基准捕获）与 Polymarket 实时持仓核对。引擎只留一行调用（wallet_sync.reconcile），规则独立可测（注入 WalletSource 窄替身）。
-- **幽灵持仓（ghost position）** — 本地记录有持仓但 Polymarket 实际无该标的持仓（崩溃/强杀残留）：核对时清除并警告；反向（本地无但远端有）只警告不自动接管；查询失败不核对（防误清真实持仓）。
+- **幽灵持仓（ghost position）** — 本地记录有持仓但 Polymarket 实际无该标的持仓（崩溃/强杀残留）：核对时清除并警告；**清除有宽限保护**（持仓窗口结束 + 180s 后仍无才判幽灵，防买入后 /positions 索引延迟误清）；反向（本地无但远端有）未跟踪持仓**自动接管**（slug 可解析窗口起点时，重建 position 恢复止损/结算管理；非 bot 市场格式只警告不接管）；查询失败不核对（防误清真实持仓）。
 - **盘口采样器（BookSampler）** — 高频盘口 WS 线程（REST 兜底），内存快照供执行器报价，book.json 落盘供面板 1s 级展示。
 - **用户流（UserStream）** — 认证 WS（订单/成交推送）→ 事件队列，主循环 tick drain。无凭证时空转。
 - **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/PING/停止/4 钩子）。新 WS 流应继承它而非复制样板。

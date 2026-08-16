@@ -18,7 +18,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pmbot.constants import WINDOW_SECONDS, step_ms_for
-from pmbot.exit_rules import position_exit_levels
 from pmbot.state import StateStore, TradeState
 
 REFRESH_SEC = 1.0
@@ -312,16 +311,6 @@ def build_view(status: TradeState | None, trades: list[dict], accuracy: dict | N
         if status.position:
             p = status.position
             v.position = {"direction": p.direction.value, "entry_price": p.entry_price, "size": p.size}
-            if panel.tp_sl:
-                # 持仓动态止盈/止损价（与 engine 同一公式源，防漂移）
-                tp, sl = position_exit_levels(
-                    p.entry_price, panel.tp_sl["pct"], panel.tp_sl["sl"], tp_max=panel.tp_sl["max"],
-                )
-                v.position["tp_price"] = tp
-                v.position["sl_price"] = sl if sl > 0 else None
-                # 百分比来源（config take_profit/stop_loss），web 显示标注用
-                v.position["tp_pct"] = panel.tp_sl["pct"]
-                v.position["sl_pct"] = panel.tp_sl["sl"]
         v.paused = bool(status.paused)
         v.pause_reason = status.pause_reason
         v.consecutive_losses = status.consecutive_losses
@@ -401,17 +390,8 @@ def render(v: PanelView) -> str:
         lines.append("挂单: —")
     pos = v.position
     if pos:
-        prices = v.prices or {}
-        mark = prices.get(f"{pos['direction']}_bid")
-        line = f"持仓: {pos['direction'].upper()} {pos['size']:.2f}股 @{_fmt_cents(pos['entry_price'])}"
-        if mark is not None:
-            pnl = (mark - pos["entry_price"]) * pos["size"]
-            line += f"  现价 {_fmt_cents(mark)}  浮动 {pnl:+.2f}"
-        if pos.get("tp_price"):
-            line += f"  止盈 {_fmt_cents(pos['tp_price'])}"
-        if pos.get("sl_price"):
-            line += f"  止损 {_fmt_cents(pos['sl_price'])}"
-        lines.append(line)
+        # 持仓只显示方向/数量/价格三项（用户口径）
+        lines.append(f"持仓: {pos['direction'].upper()} {pos['size']:.2f}股 @{_fmt_cents(pos['entry_price'])}")
     else:
         lines.append("持仓: —")
     if v.live_positions:
