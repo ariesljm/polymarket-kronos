@@ -13,10 +13,31 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
+from pathlib import Path
 
-LOG_FILE = "logs/bot.log"
+
+def _kill_tree(pid: int) -> None:
+    """整树强杀子进程（uv shim → base python 双层结构）。
+
+    terminate() 只能杀直接子进程（uv shim），base python 会成孤儿继续跑——
+    与 single_instance._kill 同一策略（taskkill /T /F）。
+    """
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,14 +66,61 @@ def main(argv: list[str] | None = None) -> int:
 def _main_with_guard(args, mode: str, data_dir: str) -> int:
     import pmbot.monitor as monitor
 
-    # 主循环子进程：输出进 logs/bot.log（不占终端）
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        bot = subprocess.Popen(
-            [sys.executable, "-m", "pmbot.run", mode, "--config", args.config,
-             "--data-dir", data_dir],
-            stdout=f, stderr=subprocess.STDOUT,
-        )
+    # 终端关闭（CTRL_CLOSE/LOGOFF/SHUTDOWN）在 Windows 上触发 SIGTERM：
+    # 转为 KeyboardInterrupt 走统一优雅退出路径（finally 整树清理）。
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        pass
+
+    # 主循环子进程：输出进 logs/bot.log（不占终端）。
+    # spawn 细节（base python + PYTHONPATH 绕 venv shim、日志重定向）收敛在
+    # paths.spawn_loop——Web 控制台 start 按钮与桌面双击共用同一实现。
+    from pmbot.paths import spawn_loop
+
+    bot = spawn_loop(args.config, args.live, data_dir)
     logging.info("主循环已启动（PID %s, %s, data=%s）", bot.pid, mode, data_dir)
+
+    # 父进程看门狗：uv run 的 shim 层脱离控制台信号，关闭终端窗口时
+    # 信号传不到本进程——改为主动探测终端进程（父进程）存活，
+    # 父进程退出（终端关闭）即整树清理子进程并自退出。
+    parent_pid = os.getppid() if hasattr(os, "getppid") else None
+    _wd_log = open("logs/watchdog.log", "a", encoding="utf-8")
+
+    def _watch_parent() -> None:
+        if not parent_pid:
+            _wd_log.write(f"[{time.time():.0f}] 无父进程可监视\n")
+            _wd_log.flush()
+            return
+        _wd_log.write(f"[{time.time():.0f}] 监视父进程 PID={parent_pid}\n")
+        _wd_log.flush()
+        while True:
+            time.sleep(2)
+            try:
+                os.kill(parent_pid, 0)
+            except OSError:
+                _wd_log.write(f"[{time.time():.0f}] 父进程已退出 poll={bot.poll()} pid={bot.pid}\n")
+                _wd_log.flush()
+                try:
+                    if bot.poll() is None:
+                        r = subprocess.run(
+                            ["taskkill", "/PID", str(bot.pid), "/T", "/F"],
+                            capture_output=True, text=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        _wd_log.write(f"[{time.time():.0f}] taskkill rc={r.returncode}\n")
+                        _wd_log.flush()
+                except Exception as e:
+                    _wd_log.write(f"[{time.time():.0f}] watchdog 清理异常: {e}\n")
+                    _wd_log.flush()
+                _wd_log.write(f"[{time.time():.0f}] watchdog 退出\n")
+                _wd_log.flush()
+                os._exit(0)
+
+    threading.Thread(target=_watch_parent, daemon=True).start()
 
     try:
         # 前台跑监控面板（web-only：不渲染终端面板，浏览器打开 Web 控制台；
@@ -62,11 +130,11 @@ def _main_with_guard(args, mode: str, data_dir: str) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        bot.terminate()
+        _kill_tree(bot.pid)  # 整树杀（uv shim + base python 一并清理）
         try:
             bot.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            bot.kill()
+            pass
         logging.info("主循环已停止（PID %s）", bot.pid)
     return 0
 

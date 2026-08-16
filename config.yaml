@@ -15,7 +15,7 @@ kronos:
   no_entry_before_end_sec: 60  # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓；0 = 关闭）
   take_profit: 0.5          # 百分比止盈：入场价 +50% 卖出（如入场 0.50 → 0.75）
   take_profit_max: 0.90      # 止盈封顶价：算出的止盈价 > 此值则按此价止盈（如入场 0.80 → 1.04 → 0.90）
-  stop_loss: 0            # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
+  stop_loss: 0.9            # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
   time_stop_min: 4           # 窗口过 N 分钟未盈利则时间止损（5m 窗口 = 4 分钟）
   max_consecutive_losses: 5 # 连亏 N 笔熔断
   max_daily_loss: 10         # 单日亏损 N USDC 熔断

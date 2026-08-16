@@ -45,6 +45,40 @@ def read_control(path: str | Path = CONTROL_FILE) -> str | None:
     return cmd
 
 
+def reset_runtime(status_path: str | Path, trades_path: str | Path, data_dir: str | Path,
+                  *, symbol: str | None = None, interval: str | None = None,
+                  config: str | None = None) -> None:
+    """清除运行数据文件（主循环与面板共用同一 reset 语义）。
+
+    删除 status/trades/K线/预测记录；下次启动自动重建。
+    symbol/interval 未显式给出时从 status.json / config 读取（面板侧路径）；
+    主循环侧显式传入（symbol=self.symbol, interval=self.discovery.interval）。
+    """
+    symbol = symbol or _read_symbol(status_path)
+    interval = interval or _read_interval(config)
+    clear_data_files(status_path, trades_path, data_dir, symbol, interval)
+
+
+def _read_symbol(status_path: str | Path) -> str:
+    """从 status.json 读取交易标的（读取失败返回空串）。"""
+    try:
+        return str(json.loads(Path(status_path).read_text(encoding="utf-8")).get("symbol", ""))
+    except Exception:
+        return ""
+
+
+def _read_interval(config: str | None) -> str:
+    """从配置文件读取 market_interval（读取失败/未提供返回默认 15m）。"""
+    if config is None:
+        return "15m"
+    try:
+        from pmbot.config import load_config
+
+        return load_config(config).market_interval
+    except Exception:
+        return "15m"
+
+
 def clear_data_files(status_path: str | Path, trades_path: str | Path, data_dir: str | Path,
                      symbol: str, interval: str) -> None:
     """清除交易运行数据文件（主循环未运行时由面板直接调用）。

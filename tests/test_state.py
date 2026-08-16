@@ -126,10 +126,10 @@ def test_status_roundtrip(tmp_path):
         daily_loss=2.5,
         paused=True,
         balance=12.34,
+        day_start_balance=10.0,
         position=make_position(),
         pending_order=make_pending(),
     )
-    st.position.entry_balance = 10.0
     store = StateStore(Path(tmp_path) / "status.json")
     store.save(st)
     loaded = store.load()
@@ -138,16 +138,15 @@ def test_status_roundtrip(tmp_path):
     assert loaded.daily_loss == pytest.approx(2.5)
     assert loaded.paused is True
     assert loaded.balance == pytest.approx(12.34)
+    assert loaded.day_start_balance == pytest.approx(10.0)
     assert loaded.position.direction is Direction.UP
-    assert loaded.position.entry_balance == pytest.approx(10.0)
     assert loaded.pending_order == make_pending()
 
 
 def test_close_position_uses_actual_pnl():
-    """余额差值（含滑点/手续费）优先于理论价差。"""
+    """真实成交盈亏（卖出收入 − 买入成本）优先于理论价差。"""
     st = make_state(position=make_position(entry_price=0.42, size=2.0))
-    st.position.entry_balance = 10.0
-    # 理论 2.0*(0.9-0.42)=0.96；实际余额差 0.85（手续费扣减）
+    # 理论 2.0*(0.9-0.42)=0.96；实际成交盈亏 0.85（滑点/手续费扣减）
     pnl = st.close_position(settle_price=0.9, actual_pnl=0.85)
     assert pnl == pytest.approx(0.85)
     assert st.consecutive_losses == 0
@@ -156,7 +155,6 @@ def test_close_position_uses_actual_pnl():
 def test_close_position_actual_loss_counts_breaker():
     """手续费可致理论盈实际亏：熔断按实际盈亏计。"""
     st = make_state(position=make_position(entry_price=0.42, size=2.0))
-    st.position.entry_balance = 10.0
     st.close_position(settle_price=0.9, actual_pnl=-0.05)
     assert st.consecutive_losses == 1
     assert st.daily_loss == pytest.approx(0.05)

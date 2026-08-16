@@ -62,7 +62,6 @@ class Position:
     size: float
     entered_remaining_sec: int
     window_start: int
-    entry_balance: float | None = None  # 入场时钱包余额快照（实盘盈亏基准，查询失败为 None）
 
 
 @dataclass

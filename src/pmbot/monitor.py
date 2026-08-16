@@ -51,7 +51,7 @@ class PanelConfig:
 class SpotPrice:
     """交易品种实时价轮询（Binance 公共数据镜像，与 K 线同源；失败静默保留旧值）。"""
 
-    def __init__(self, symbol: str = "ETH", interval: float = 5.0):
+    def __init__(self, symbol: str = "ETH", interval: float = 3.0):
         self.symbol = symbol
         self.interval = interval
         self._lock = threading.Lock()
@@ -153,6 +153,7 @@ class PanelView:
     consecutive_losses: int = 0
     daily_loss: float = 0.0
     today_pnl: float = 0.0
+    today_pnl_src: str = ""  # 今日盈亏口径："balance"=钱包余额差（实盘），""=交易聚合回退
     today_trades: int = 0
     today_stats: dict | None = None
     recent_trades: list = field(default_factory=list)
@@ -163,6 +164,7 @@ class PanelView:
     predicting: bool = False
     predict_start_sec: int | None = None
     prices: dict | None = None
+    live_positions: list = field(default_factory=list)  # Polymarket 实时持仓（/positions 快照）
     config_summary: str = ""
     tp_sl: dict | None = None
     uptime_sec: int | None = None
@@ -328,12 +330,17 @@ def build_view(status: TradeState | None, trades: list[dict], accuracy: dict | N
         v.predicting = bool(status.predicting)
         v.predict_start_sec = status.predict_start_sec
         v.prices = status.market_prices
+        v.live_positions = status.live_positions or []
         v.config_summary = panel.config_summary
         v.spot = panel.spot
         v.balance = status.balance
         _fill_status_note(v, status, trades)
 
     _fill_trades(v, trades, today, tz, recent_limit)
+    # 实盘今日盈亏 = 现钱包余额 − 今日起始余额基准（含手续费/结算等全部真实资金变化）
+    if status is not None and status.day_start_balance is not None and status.balance is not None:
+        v.today_pnl = round(status.balance - status.day_start_balance, 4)
+        v.today_pnl_src = "balance"
     # 交易记录统计：全部交易（笔数/胜率/盈亏/盈利与亏损分计/最大亏损），非仅最近显示的行
     total = _aggregate_trades(trades)
     v.recent_stats = total if total["n"] else None
@@ -407,17 +414,31 @@ def render(v: PanelView) -> str:
         lines.append(line)
     else:
         lines.append("持仓: —")
+    if v.live_positions:
+        lines.append("实时持仓（Polymarket）:")
+        for p in v.live_positions[:5]:
+            try:
+                size = float(p.get("size") or 0)
+                avg = float(p.get("avgPrice") or 0)
+                cur = float(p.get("curPrice") or 0)
+                pnl = float(p.get("cashPnl") or 0)
+                title = str(p.get("title") or "")[:34]
+                lines.append(
+                    f"  {title:34s} {size:.4f}股 均{avg:.3f} 现{cur:.3f} 浮动{pnl:+.2f}"
+                )
+            except (TypeError, ValueError):
+                continue
     lines.append(f"连亏: {v.consecutive_losses} 笔")
     lines.append("-" * 62)
     ts = v.today_stats
+    pnl_src = "（余额差）" if v.today_pnl_src == "balance" else ""
+    lines.append(f"今日盈亏: {v.today_pnl:+.2f} USDC{pnl_src}")
     if ts:
         lines.append(
-            f"今日: {ts['pnl']:+.2f} USDC（{ts['n']} 笔 · 胜率 {ts['wins'] / ts['n']:.0%} · "
+            f"今日交易: {ts['n']} 笔 · 胜率 {ts['wins'] / ts['n']:.0%} · "
             f"盈利 {ts['wins']} 笔 +{ts['gain']:.2f} · 亏损 {ts['losses']} 笔 {ts['loss']:.2f} · "
-            f"最大亏损 {ts['max_loss']:.2f}）"
+            f"最大亏损 {ts['max_loss']:.2f}"
         )
-    else:
-        lines.append(f"今日: {v.today_pnl:+.2f} USDC（{v.today_trades} 笔）")
     lines.append("-" * 62)
     rs = v.recent_stats
     if rs:
@@ -453,10 +474,12 @@ def render(v: PanelView) -> str:
     return "\n".join(lines)
 
 
-def _build_live_view(args, paths: RuntimePaths, recent_limit: int | None = RECENT_LIMIT,
+def _build_live_view(symbol: str | None, config: str, paths: RuntimePaths,
+                     recent_limit: int | None = RECENT_LIMIT,
                      uptime_sec: int | None = None, spot: dict | None = None) -> PanelView:
     """读取状态/交易/盘口/配置并构建视图（TUI 与 Web 控制台共用）。
 
+    symbol: 交易品种（None 时从 status.json 回退）；config: 配置文件路径。
     paths: 运行路径单一事实源（模式切换后自动跟随新数据目录）。
     spot: 交易品种实时价快照（{"price", "delta"}；Web 控制台由 SpotPrice 轮询提供）。
     """
@@ -471,7 +494,7 @@ def _build_live_view(args, paths: RuntimePaths, recent_limit: int | None = RECEN
         with open(tp, encoding="utf-8") as f:
             trades = list(csv.DictReader(f))
 
-    symbol = args.symbol or (st.symbol if st else None)
+    symbol = symbol or (st.symbol if st else None)
     from pmbot.config import load_config
     from pmbot.prediction_log import PredictionLog
 
@@ -481,7 +504,7 @@ def _build_live_view(args, paths: RuntimePaths, recent_limit: int | None = RECEN
     config_summary = ""
     tp_sl = None
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(config)
         model_variant = cfg.model_variant
         thresholds = {"p_up_buy": cfg.p_up_buy, "p_down_buy": cfg.p_down_buy}
         window_seconds = step_ms_for(cfg.market_interval) // 1000
@@ -523,10 +546,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", dest="live", action="store_false", help="模拟模式（默认）")
     parser.set_defaults(live=False)
     parser.add_argument("--web-port", type=int, default=WEB_PORT, help="Web 控制台端口（-1 禁用）")
+    parser.add_argument("--web-host", default="0.0.0.0",
+                        help="Web 控制台绑定地址（默认 0.0.0.0 局域网可访问；写操作需 token）")
     parser.add_argument("--web-only", action="store_true",
                         help="只跑 Web 控制台，不渲染终端面板（start_bot 默认）")
     args = parser.parse_args(argv)
     # 显式路径参数可覆盖派生；未指定时基于 data-dir 派生（与主循环同目录）
+    from pmbot.config import load_config as _load_config
     from pmbot.paths import ProcessControl, RuntimePaths, paths_for
 
     paths = RuntimePaths(
@@ -549,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
     lock = threading.Lock()
     t_start = time.monotonic()
     server = None
-    spot = SpotPrice()
+    spot = SpotPrice(symbol=args.symbol or _load_config(args.config).symbols[0])
 
     def apply_mode(live: bool) -> None:
         """切换面板/启动主循环的运行模式（模拟 ↔ 实盘，含数据目录切换）。
@@ -560,22 +586,46 @@ def main(argv: list[str] | None = None) -> int:
         pc.paths = paths_for(live)
 
     if args.web_port > 0:
-        from pmbot.web_ui import WEB_PORT, loop_alive, start_server
+        import os
+        import secrets
+
+        from pmbot.web_ui import WEB_PORT, start_server
+
+        # 写操作访问令牌：优先环境变量，否则读/生成 data/web_token.txt
+        token = os.environ.get("PMBOT_WEB_TOKEN", "")
+        token_file = Path("data") / "web_token.txt"
+        if not token:
+            try:
+                if token_file.is_file():
+                    token = token_file.read_text(encoding="utf-8").strip()
+                if not token:
+                    token = secrets.token_urlsafe(16)
+                    token_file.write_text(token, encoding="utf-8")
+            except OSError:
+                token = ""
 
         spot.start()
         server = start_server(
-            lambda: _build_live_view(args, paths, recent_limit=None,
+            lambda: _build_live_view(args.symbol, args.config, pc.paths, recent_limit=None,
                                      uptime_sec=int(time.monotonic() - t_start),
                                      spot=spot.snapshot()),
-            args.config, args.live, args.web_port, pc, lock,
-            status_path=paths.status, trades_path=paths.trades, log_dir=paths.log_dir,
-            data_dir=paths.data_dir, pid_file=paths.pid_file,
+            args.config, args.live, args.web_port, args.web_host, pc, lock,
+            token=token,
             set_mode_fn=apply_mode,
         )
-        console.print(f"[bold green]Web 控制台: http://127.0.0.1:{args.web_port}[/]")
+        url = f"http://127.0.0.1:{args.web_port}"
+        console.print(f"[bold green]Web 控制台: {url}[/]")
+        if args.web_host not in ("127.0.0.1", "localhost"):
+            import socket
+
+            try:
+                ip = socket.gethostbyname(socket.gethostname())
+                console.print(f"[bold green]局域网访问: http://{ip}:{args.web_port}?token={token}[/]")
+            except OSError:
+                pass
         if args.web_only:
             try:
-                webbrowser.open(f"http://127.0.0.1:{args.web_port}")
+                webbrowser.open(url)  # 本机回环访问免 token（局域网访问需带 token，见启动日志）
             except Exception:
                 pass
             console.print("[dim]终端面板已隐藏；可在 Web 控制台「终端面板」按钮打开[/]")
@@ -584,11 +634,10 @@ def main(argv: list[str] | None = None) -> int:
             while True:
                 if pc.show_tui:
                     try:
-                        v = _build_live_view(args, paths, uptime_sec=int(time.monotonic() - t_start))
+                        v = _build_live_view(args.symbol, args.config, pc.paths,
+                                             uptime_sec=int(time.monotonic() - t_start))
                         if args.web_port > 0:
-                            from pmbot.web_ui import loop_alive
-
-                            v.loop_alive = loop_alive(pc.paths.pid_file)
+                            v.loop_alive = pc.loop_alive()
                         live.update(render(v))
                     except Exception as e:  # 只读面板：任何异常都不崩溃，显示错误继续
                         live.update(f"读取失败: {e}")

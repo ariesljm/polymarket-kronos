@@ -19,7 +19,9 @@ def test_dry_run_market_buy_sell():
     ex = SimExecutor(private_key="0x" + "0" * 64)
     assert ex.market_buy("111", 2.38) is not None  # 小数份额
     assert ex.market_buy("111", 0.5) is not None   # 低于 5 股也放行
-    assert ex.market_sell("111", 2.38) == ex.best_bid("111")  # dry-run 按 best_bid 成交
+    r = ex.market_sell("111", 2.38)
+    assert r is not None and r["price"] == ex.best_bid("111")  # dry-run 按 best_bid 成交
+    assert r["order_id"] is None and ex.sell_proceeds("x", "111") is None  # 无真实订单
 
 
 def test_order_rules_enforced():
@@ -111,3 +113,46 @@ def test_weighted_price_insufficient_liquidity():
     book = {"asks": [{"price": "0.10", "size": "2"}]}  # 总量 2 < 5
     assert _weighted_price(book, "asks", size=5) is None
     assert _weighted_price(None, "asks", size=5) is None
+
+
+def test_parse_fill_uses_order_detail(monkeypatch):
+    """实际成交数据：get_order 详情 price/size_matched 优先（服务端权威）。
+
+    回归：16:53 实盘买入后详情返回 price=0.57/size_matched=1.754384，但旧解析
+    只认 averagePrice/matchedAmount 键 → 回退盘口估算（1.9231 股 @ 0.52），
+    结算兑付 1.75 与持仓记录对不上（网页实际：1.8 份 @ 0.57）。
+    """
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "get_order", lambda oid: {
+        "id": "0x953b", "price": "0.57", "size_matched": "1.754384",
+        "status": "MATCHED", "side": "BUY",
+    })
+    fill = ex._parse_fill({"orderID": "0x953b", "status": "matched"})
+    assert fill["order_id"] == "0x953b"
+    assert fill["filled_size"] == pytest.approx(1.754384)  # 实际股数（网页 1.8）
+    assert fill["avg_price"] == pytest.approx(0.57)  # 实际成交价（不含费）
+
+
+def test_parse_fill_taking_amount_fallback(monkeypatch):
+    """响应自带 takingAmount 时直接取实际股数（无详情也准确）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "get_order", lambda oid: None)
+    fill = ex._parse_fill({"orderID": "0x953b", "takingAmount": "1.754384",
+                           "status": "matched", "success": True})
+    assert fill["filled_size"] == pytest.approx(1.754384)
+    assert fill["avg_price"] is None  # 无价格字段 → 调用方回退盘口价
+
+
+def test_parse_fill_making_taking_actual_price(monkeypatch):
+    """市价单响应 making/taking 金额 → 实际成交价（付/得），非订单保护价。
+
+    回归：17:46 实盘买入 making=0.999999 taking=6.666665 → 实际 0.15，
+    旧逻辑取不到 avg_price 字段回退订单详情 price（0.16 保护价），
+    与 Polymarket 网页成交价（0.15）不对齐。
+    """
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "get_order", lambda oid: {"price": "0.16", "size_matched": "6.666665"})
+    fill = ex._parse_fill({"orderID": "0x953b", "makingAmount": "0.999999",
+                           "takingAmount": "6.666665", "status": "matched"})
+    assert fill["avg_price"] == pytest.approx(0.999999 / 6.666665)  # 0.15（网页口径）
+    assert fill["filled_size"] == pytest.approx(6.666665)

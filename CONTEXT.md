@@ -22,12 +22,16 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 - **市场视图（MarketView）** — 决策输入：窗口剩余秒、目标方向 best ask/bid、当前持仓、挂单。
 - **接缝方法（seam methods）** — TradingLoop 上生命周期消费的公开方法：`refresh_pending / build_view / decide / execute / save_status`。不要改回下划线私有穿透。
 - **状态（state）** — `TradeState` 领域对象：只含交易语义（窗口/持仓/挂单/熔断/运行快照字段）。**不做序列化**——持久化归 StateStore。
-- **平仓（close）** — `TradingLoop._close_position` 统一卖出/结算两条路径：余额差 PnL（exit_balance − entry_balance，含滑点/手续费）优先，余额查询失败回退理论价差；兑现持仓、更新熔断计数、记 trades.csv。
+- **平仓（close）** — `TradingLoop._close_position` 统一卖出/结算两条路径：余额差 PnL（exit_balance − entry_balance，含滑点/手续费）优先，余额查询失败回退理论价差；兑现持仓、更新熔断计数、记 trades.csv。`entry_balance` 取**买入前**余额（净盈亏基准：结算所得 − 买入成本含费）。
+- **实盘数据只用实际获取值** — 持仓股数=订单详情 `size_matched`/响应 `takingAmount`；入场价=详情 `price`（纯成交价，不含费）；盈亏=余额差（实证含 ~3% taker 手续费：1 USDC 单实扣 1.0301，链上两笔转账：成交 1.0 + 费用 0.03）。API 无实际成交数据时**放弃建仓**（不盘口估算，dry-run 除外）。
 - **状态存储（StateStore）** — TradeState 的持久化：status.json 快照 + trades.csv 交易日志。序列化只在进程边界（run/monitor）发生。
+- **控制指令（control）** — 面板 ↔ 主循环指令通道（control.json 原子写 + 读删）：resume/reset/stop；start 为进程级操作不走本通道。reset 语义收敛于 `control.reset_runtime`（主循环与面板共用同一文件删除清单：status/trades/K线/预测记录；实盘拒绝 reset 保护在各调用方）。
 
 ### 市场接入
 
-- **执行器（OrderPlacer）** — 主循环/生命周期下单依赖的协议：市价/限价/撤单/盘口/余额/凭证。两个适配器：`ClobExecutor`（实盘：真实下单、解析 API 成交 averagePrice/matchedAmount）与 `SimExecutor`（dry-run：打印指令、按盘口估算模拟成交）；盘口查询与凭证能力两适配器共享。采样器依赖经 `SamplerProto` 窄接口注入。
+- **执行器（OrderPlacer）** — 主循环/生命周期下单依赖的协议：市价/限价/撤单/盘口/余额/凭证。接口按消费角色拆窄：`MarketBook`（盘口）、`TradeExecutor`（下单）、`WalletView`（钱包）、`AuthSource`（凭证）；OrderPlacer 是四者并集的组合面。两个适配器：`ClobExecutor`（实盘：真实下单、解析 API 成交 averagePrice/matchedAmount）与 `SimExecutor`（dry-run：打印指令、按盘口估算模拟成交；盘口/钱包/凭证面委托内部实盘实例）。限价规则校验（validate_limit_order）与成交解析（_parse_fill）为执行器内部单一事实源（禁止适配器各自复刻）。采样器依赖经 `SamplerProto` 窄接口注入。
+- **钱包核对（WalletReconciler）** — 引擎 tick 的“外部世界同步”关注点（深模块）：余额定时刷新（30s 节流 + 今日盈亏基准捕获）与 Polymarket 实时持仓核对。引擎只留一行调用（wallet_sync.reconcile），规则独立可测（注入 WalletSource 窄替身）。
+- **幽灵持仓（ghost position）** — 本地记录有持仓但 Polymarket 实际无该标的持仓（崩溃/强杀残留）：核对时清除并警告；反向（本地无但远端有）只警告不自动接管；查询失败不核对（防误清真实持仓）。
 - **盘口采样器（BookSampler）** — 高频盘口 WS 线程（REST 兜底），内存快照供执行器报价，book.json 落盘供面板 1s 级展示。
 - **用户流（UserStream）** — 认证 WS（订单/成交推送）→ 事件队列，主循环 tick drain。无凭证时空转。
 - **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/PING/停止/4 钩子）。新 WS 流应继承它而非复制样板。
@@ -40,7 +44,7 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 - **监控面板（monitor）** — 只读 TUI，独立进程：从 `StateStore.load()` 读状态、trades.csv、PredictionLog、book.json 构建视图。任何异常只显示不崩溃。`build_view` 的展示配置（模型变体/阈值/窗口长度/摘要/止盈止损/运行时长）经 `PanelConfig` 打包注入。
 - **展示视图（PanelView）** — `build_view` 输出的类型化视图：TUI render 属性访问（静态检查）；Web 控制台经 `asdict` 边界转换，字段名即 JSON 键名唯一出处。展示侧禁止魔法字符串键（ADR-0001 精神延伸）。
 - **运行路径（RuntimePaths）** — 数据目录派生单一事实源（status/trades/log_dir/pid_file/mode）：模拟 data/、实盘 data_live/；`paths_for(live, data_dir)` 工厂。
-- **协调状态（ProcessControl）** — monitor ↔ Web 控制台共享的进程协调（proc/show_tui/live/paths），替代裸 holder dict；模拟/实盘切换一次赋值（pc.paths 换新即全部跟随）。
+- **协调状态（ProcessControl）** — monitor ↔ Web 控制台共享的进程协调（proc/show_tui/live/paths），替代裸 holder dict；模拟/实盘切换一次赋值（pc.paths 换新即全部跟随）。进程级操作也收敛于此：`spawn(config)`（按当前模式/数据目录拉起主循环）与 `loop_alive()`（读当前 pid 文件判存活），spawn_loop 模块函数在 paths.py，web_ui 只做 HTTP 路由。
 - **预测日志（PredictionLog）** — 预测方向准确率记录（与交易盈亏解耦），`predictions_<symbol>.csv`。
 - **回测（backtest）** — 离线方向准确率评估，走 `KronosPredictorClient.predict_targets` 公开接口（禁止复刻推理循环或调用 `_load()`）。
 

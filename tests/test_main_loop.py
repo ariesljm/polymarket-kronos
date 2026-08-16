@@ -9,6 +9,8 @@
 
 from pathlib import Path
 
+import csv
+
 import pytest
 
 from pmbot.config import Config
@@ -53,6 +55,7 @@ class FakeStrategy:
 
 class FakeDiscovery:
     step_ms = 900_000  # 15m（与测试窗口对齐）
+    interval = "15m"  # reset 文件清除用（与真实 MarketDiscovery 同属性）
 
     def __init__(self, market=None, settled=None):
         self.market = market
@@ -75,6 +78,8 @@ class FakeExecutor:
         self.filled = False
         self.best_bid_value = None
         self.best_ask_value = 0.42
+        self.sell_proceeds_value = None
+        self.live_positions_value = None
         self._sampler = None
 
     @property
@@ -94,7 +99,10 @@ class FakeExecutor:
 
     def market_sell(self, token_id, size):
         self.calls.append(("sell", token_id, size))
-        return self.best_bid_value
+        return {"order_id": "sell-oid", "price": self.best_bid_value}
+
+    def sell_proceeds(self, order_id, token_id):
+        return self.sell_proceeds_value
 
     def market_buy(self, token_id, amount):
         self.calls.append(("market_buy", token_id, amount))
@@ -108,6 +116,9 @@ class FakeExecutor:
 
     def best_ask(self, token_id):
         return self.best_ask_value
+
+    def live_positions(self, user=None):
+        return self.live_positions_value
 
     def get_order(self, order_id):
         return {"status": "filled" if self.filled else "live", "orderID": order_id}
@@ -960,7 +971,7 @@ def test_no_inference_mid_window_start(tmp_path):
     assert st.signal.direction is Direction.UP
 
 
-# ---- 钱包余额：快照刷新与实盘盈亏（余额差值） ----
+# ---- 钱包余额：快照刷新、今日盈亏基准与真实成交盈亏 ----
 
 class BalanceExecutor(FakeExecutor):
     """带余额查询的 fake：collateral_balance 返回可配置值/异常。"""
@@ -998,34 +1009,117 @@ def test_balance_query_failure_keeps_old_and_trades(tmp_path):
     loop.tick(now_ms=1_000_000_000)
     assert loop.state.balance is None
     assert loop.state.position is not None  # 交易不受影响
-    assert loop.state.position.entry_balance is None  # 无快照 → 平仓回退理论价差
 
 
-def test_market_entry_records_balance_snapshot(tmp_path):
-    """实盘模式：入场捕获余额快照（供平仓余额差 PnL）。"""
+def test_live_mode_captures_day_start_balance(tmp_path):
+    """实盘模式：首次余额刷新捕获今日起始基准（今日盈亏 = 现余额 − 基准）。"""
     ex = BalanceExecutor(balance=20.0)
     loop = make_loop(tmp_path, executor=ex, dry_run=False)
     loop.tick(now_ms=1_000_000_000)
-    assert loop.state.position.entry_balance == 20.0
+    assert loop.state.day_start_balance == 20.0
 
 
-def test_sell_pnl_uses_balance_diff(tmp_path):
-    """实盘平仓盈亏 = 平仓后余额 − 入场时余额（含滑点/手续费），而非理论价差。"""
+def test_day_roll_resets_day_start_balance(tmp_path):
+    """跨天重置今日盈亏基准，新基准由下一次余额刷新捕获。
+
+    回归：曾因刷新先于跨天重置执行，把刚捕获的基准清掉（基准恒 None）。
+    """
     ex = BalanceExecutor(balance=20.0)
     loop = make_loop(tmp_path, executor=ex, dry_run=False)
-    loop.tick(now_ms=1_000_000_000)  # 入场：entry_balance=20.0
+    loop.tick(now_ms=1_000_000_000)  # 首日：捕获基准 20.0
+    assert loop.state.day_start_balance == 20.0
+    # 跨天（次日 0 点后），余额变化：新基准 = 次日首次刷新值
+    ex.balance = 25.0
+    loop.tick(now_ms=1_000_000_000 + 24 * 3600 * 1000 + 31_000)
+    assert loop.state.day_start_balance == 25.0
+    assert loop.state.balance == 25.0
+
+
+# ---- 实时持仓核对（Polymarket /positions 防幽灵持仓） ----
+
+def _eth_pos(size=5.0, outcome="Up"):
+    return {"asset": "tok1", "conditionId": "c1", "size": size,
+            "avgPrice": 0.5, "curPrice": 0.6, "cashPnl": 0.5,
+            "title": "Bitcoin Up or Down - Aug 16", "outcome": outcome}
+
+
+def test_reconcile_clears_ghost_position(tmp_path):
+    """本地有持仓、Polymarket 无本标的持仓 → 幽灵持仓清除（防崩溃残留占用）。"""
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    assert loop.state.position is not None
+    ex.live_positions_value = []  # Polymarket 确认无任何持仓
+    loop.tick(now_ms=1_000_000_000 + 31_000)  # ≥30s 触发核对
+    assert loop.state.position is None  # 幽灵持仓已清除
+    assert loop.state.live_positions == []
+
+
+def test_reconcile_keeps_position_when_polymarket_has_it(tmp_path):
+    """Polymarket 有本标的持仓 → 本地持仓保留。"""
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    ex.live_positions_value = [_eth_pos()]
+    loop.tick(now_ms=1_000_000_000 + 31_000)
+    assert loop.state.position is not None  # 保留
+    assert len(loop.state.live_positions) == 1
+
+
+def test_reconcile_query_failure_keeps_position(tmp_path):
+    """查询失败（None）不核对：防误清真实持仓。"""
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    ex.live_positions_value = None  # 查询失败
+    loop.tick(now_ms=1_000_000_000 + 31_000)
+    assert loop.state.position is not None  # 不动
+
+
+def test_reconcile_skipped_in_dry_run(tmp_path):
+    """dry-run 模拟持仓与真实钱包无关：不核对。"""
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex)  # dry_run=True（默认）
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    ex.live_positions_value = []
+    loop.tick(now_ms=1_000_000_000 + 31_000)
+    assert loop.state.position is not None  # 模拟持仓不动
+
+
+def test_sell_pnl_uses_real_fills(tmp_path):
+    """实盘平仓盈亏 = Polymarket 真实成交（卖出收入 − 买入成本），而非余额差值。
+
+    回归：余额差在卖出资金到账前查询 → 止盈也显示 ≈ -成本（如 -1.03 假亏损）。
+    """
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)  # 入场
     pos = loop.state.position
-    # 实际成交比理论差：余额只涨 size*0.45（理论应为 size*0.48）
+    # 真实到账（sell_proceeds 聚合）：卖出 0.84，与 best_bid 展示无关
     ex.best_bid_value = 0.9
-    ex.balance = 20.0 + pos.size * 0.45
+    ex.sell_proceeds_value = pos.size * 0.84
     loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
     assert loop.state.position is None
-    expect = pos.size * 0.45  # 余额差值
+    expect = pos.size * (0.84 - pos.entry_price)  # 真实成交盈亏（非余额差）
+    assert expect > 0
     assert loop.state.consecutive_losses == 0
     import csv
 
     rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
     assert rows and abs(float(rows[-1]["pnl"]) - expect) < 1e-5  # CSV 落盘 round(pnl,6)
+
+
+def test_sell_pnl_falls_back_to_theoretical_when_no_fills(tmp_path):
+    """真实成交聚合失败（无订单/网络）时回退理论价差，不产生假亏损。"""
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    pos = loop.state.position
+    ex.best_bid_value = 0.9  # sell_proceeds_value=None（聚合失败）
+    loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    expect = pos.size * (0.9 - pos.entry_price)  # 理论价差（best_bid）
+    assert rows and abs(float(rows[-1]["pnl"]) - expect) < 1e-5
 
 
 def test_dry_run_pnl_uses_theoretical_not_balance_diff(tmp_path):
@@ -1038,7 +1132,7 @@ def test_dry_run_pnl_uses_theoretical_not_balance_diff(tmp_path):
     loop = make_loop(tmp_path, executor=ex)  # dry_run=True（默认）
     loop.tick(now_ms=1_000_000_000)  # 入场
     pos = loop.state.position
-    assert pos.entry_balance is None  # dry-run 不记余额快照
+    assert pos.entry_price > 0
     ex.best_bid_value = 0.9  # 触发止盈
     loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
     assert loop.state.position is None
@@ -1061,3 +1155,41 @@ def test_control_reset_rejected_in_live_mode(tmp_path, monkeypatch):
     assert st.daily_loss == 4.0  # 状态未清
     assert st.window_start == 999_900
     assert trades.is_file()  # 交易历史未删
+
+
+def test_start_skips_in_progress_window(tmp_path):
+    """启动跳过进行中的窗口：不建生命周期（不推理不交易），下一窗口才运行。"""
+    from pmbot.market_lifecycle import Phase
+
+    loop = make_loop(tmp_path)
+    loop._skip_window_until = 999_900 + 900  # 模拟 run_forever 启动：跳过当前窗口（step=900s）
+    loop.tick(now_ms=1_000_000_000)  # 当前窗口（999900 起点）已进行 100s
+    assert loop._lifecycle is None  # 跳过：不推理不交易
+    loop.tick(now_ms=1_000_000_000 + 900_000)  # 下一窗口起点（1000800）
+    assert loop._lifecycle is not None
+    assert loop._lifecycle.window_start == 1_000_800
+    assert loop._lifecycle.phase in (Phase.INIT, Phase.RUNNING)
+
+
+def test_settle_pnl_uses_settle_price(tmp_path):
+    """结算（窗口到期自动兑付）盈亏 = 理论价差（结算价 − 入场价）× 股数。
+
+    V2 无手续费：兑付额 = size×1.0，成本 = size×entry_price，理论价差即净盈亏。
+    """
+    class FeeExecutor(BalanceExecutor):
+        def market_buy(self, token_id, amount):
+            return {"order_id": "mk-1", "avg_price": 0.57, "filled_size": 1.754384}
+
+    ex = FeeExecutor(balance=8.788843)
+    settled = make_market(price=1.0)  # 结算后 Up=1 → 兑付 1.754384
+    loop = make_loop(tmp_path, executor=ex, dry_run=False,
+                     discovery=FakeDiscovery(make_market(), settled=settled))
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    pos = loop.state.position
+    assert pos.size == 1.754384  # 实际成交股数
+    # 窗口结束结算：无卖出订单，走理论价差
+    loop.tick(now_ms=1_000_000_000 + WINDOW_MS + 60_000)  # 跨窗口：结算旧持仓 → 新窗口重新入场
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    assert rows and rows[-1]["reason"] == "settle"
+    pnl = float(rows[-1]["pnl"])
+    assert pnl == pytest.approx(1.754384 * (1 - 0.57))  # 兑付 − 成本（理论价差）

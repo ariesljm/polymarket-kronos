@@ -46,10 +46,12 @@ def test_start_bot_spawns_run_and_stops(monkeypatch):
 
     monkeypatch.setattr("pmbot.monitor.main", fake_monitor)
     monkeypatch.setattr("pmbot.run.main", lambda *a, **kw: None)
+    killed = []
+    monkeypatch.setattr(start_bot, "_kill_tree", lambda pid: killed.append(pid))  # 整树杀（避免真实 taskkill）
 
     assert start_bot.main(["--dry-run"]) == 0
     assert calls, "应启动主循环子进程"
-    assert proc["terminated"], "面板退出后应终止主循环"
+    assert killed == [12345], "面板退出后应整树终止主循环（uv shim + base python）"
     # 面板以 web-only 模式启动（不渲染终端面板，浏览器打开 Web 控制台）
     assert monitor_calls == [["--dry-run", "--config", "config.yaml", "--web-only", "--data-dir", "data"]]
 

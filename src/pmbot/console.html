@@ -50,15 +50,31 @@ body { overflow-x: clip; margin: 0; background: var(--color-paper); color: var(-
 .brand-sym { font-family: var(--font-mono); color: var(--color-accent); font-weight: 500; }
 .topbar-right { margin-left: auto; display: flex; align-items: center; gap: var(--space-md); }
 .badge { display: inline-flex; align-items: center; gap: var(--space-2xs); font-size: var(--text-2xs); }
+.badge-mode { display: inline-flex; align-items: center; gap: var(--space-2xs); font-size: var(--text-2xs);
+             padding: var(--space-2xs) var(--space-md); border-radius: var(--radius-sm);
+             font-weight: 700; letter-spacing: 0.06em; white-space: nowrap; }
+.badge-mode.sim { background: var(--color-paper-3); color: var(--color-ink-2); border: 1px solid var(--color-rule); }
+.badge-mode.live { background: var(--color-neg); color: #fff; box-shadow: 0 0 0 1px rgba(255,255,255,.25) inset; }
+@keyframes mode-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+.badge-mode.live .dot { animation: mode-pulse 1.6s ease-in-out infinite; }
+.banner { padding: 10px 14px; border-radius: var(--radius-sm); font-size: var(--text-sm);
+          margin-bottom: 12px; line-height: 1.5; }
+.banner-pause { background: var(--color-accent); color: var(--color-paper); font-weight: 600; }
+.banner-warn { background: var(--color-paper-3); color: var(--color-ink-2); border: 1px solid var(--color-rule); }
+.btn-warn { background: var(--color-accent); color: var(--color-paper); border-color: var(--color-accent); }
+.btn-warn:hover:not(:disabled) { background: var(--color-paper); color: var(--color-accent); border-color: var(--color-accent); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--color-rule); }
 .dot-on { background: var(--color-pos); }
 .dot-pause { background: var(--color-accent); }
 .dot-live { background: var(--color-neg); }
 .meta { color: var(--color-ink-2); font-size: var(--text-2xs); }
 .spot { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--color-ink);
-        font-size: var(--text-2xs); white-space: nowrap; }
+        font-size: var(--text-sm); font-weight: 500; white-space: nowrap; }
 .spot .up { color: var(--color-pos); }
 .spot .dn { color: var(--color-neg); }
+@keyframes spot-flash { 0% { color: var(--color-accent); } 100% { color: var(--color-ink); } }
+.spot.flash { animation: spot-flash 1.2s ease-out; }
+.pnl-side { display: flex; align-items: center; gap: var(--space-lg); }
 /* ---- 盈亏条 ---- */
 .pnl { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--space-md);
        padding: var(--space-lg) var(--space-lg) var(--space-md); }
@@ -97,6 +113,7 @@ body { overflow-x: clip; margin: 0; background: var(--color-paper); color: var(-
 .trades-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-md); margin-bottom: var(--space-sm); }
 .trades-title { font-family: var(--font-display); font-size: var(--text-md); font-weight: 700; letter-spacing: -0.02em; margin: 0; overflow-wrap: anywhere; min-width: 0; }
 .trades-sum { font-size: var(--text-2xs); color: var(--color-ink-2); }
+tr.open td { background: var(--color-paper-3); border-top: 1px solid var(--color-accent); font-weight: 600; }
 .table-wrap { overflow-x: auto; border-radius: var(--radius-md); background: var(--color-paper-2);
               border: 1px solid var(--color-rule); }
 table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
@@ -134,23 +151,27 @@ td.num, th.num { text-align: right; }
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><span class="brand-mark">PMBOT</span><span class="brand-sym" id="sym">—</span><span class="spot" id="spot">—</span></div>
+  <div class="brand"><span class="brand-mark">PMBOT</span><span class="brand-sym" id="sym">—</span></div>
   <div class="topbar-right">
-    <span class="badge" id="mode-badge" style="display:none"><span class="dot" id="mode-dot"></span><span id="mode-text"></span></span>
+    <span class="badge-mode" id="mode-badge" style="display:none"><span class="dot" id="mode-dot"></span><span id="mode-text"></span></span>
     <span class="badge"><span class="dot" id="loop-dot"></span><span id="loop-text">连接中…</span></span>
     <span class="meta" id="model">—</span>
+    <span class="meta mono" id="data-dir" title="数据目录（模拟/实盘各自独立）"></span>
     <span class="meta mono" id="balance">余额 —</span>
     <span class="meta mono" id="last-pred">上次预测 —</span>
   </div>
 </header>
 
 <section class="pnl">
+  <div id="pause-banner" class="banner" hidden></div>
   <div class="pnl-main" aria-live="polite">
     <div class="pnl-label">今日盈亏</div>
     <div class="pnl-value mono" id="pnl">+0.00<span class="pnl-unit">USDC</span></div>
     <div class="pnl-sub" id="pnl-sub">—</div>
   </div>
-  <div class="controls" role="group" aria-label="控制">
+  <div class="pnl-side">
+    <span class="spot" id="spot">—</span>
+    <div class="controls" role="group" aria-label="控制">
     <button id="btn-start" class="btn" onclick="ctrl('start')">启动</button>
     <button id="btn-stop" class="btn" onclick="ctrl('stop')">停止</button>
     <button id="btn-resume" class="btn" onclick="ctrl('resume')">恢复运行</button>
@@ -197,10 +218,13 @@ td.num, th.num { text-align: right; }
 </footer>
 
 <script>
-const REASONS = {take_profit:"止盈", stop_loss:"止损", time_stop:"时间止损", window_end:"窗口结束", settle:"结算", sell:"平仓"};
 const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+// 写操作令牌：URL ?token=xxx（局域网访问时由启动日志给出完整地址；本机 127.0.0.1 访问免 token）
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const isLocal = ["127.0.0.1", "localhost", "::1"].includes(location.hostname);
 async function api(path, body) {
   const opt = body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {};
+  if (body && TOKEN) opt.headers["X-PMBOT-Token"] = TOKEN;
   const r = await fetch(path, opt);
   return r.json().catch(() => ({}));
 }
@@ -241,10 +265,13 @@ async function switchMode() {
 async function ctrl(cmd) {
   const map = {start:"btn-start", stop:"btn-stop", resume:"btn-resume"};
   const el = document.getElementById(map[cmd]);
-  if (el) { el.disabled = true; el.dataset.orig = el.textContent; el.textContent = "发送中…"; }
+  const busy = {start:"启动中…", stop:"停止中…", resume:"恢复中…"}[cmd] || "发送中…";
+  if (el) { el.disabled = true; el.dataset.orig = el.textContent; el.textContent = busy; }
   const d = await api("/api/control", {cmd});
-  msg(d.ok ? "指令已发送" : ("失败：" + (d.error || "")), !d.ok);
-  if (el) { el.disabled = false; el.textContent = el.dataset.orig; }
+  msg(d.ok
+    ? (cmd === "stop" ? "停止指令已发送：正在优雅停机（当前窗口推理完成后停止，最长约 1 个窗口周期）" : "指令已发送")
+    : ("失败：" + (d.error || "")), !d.ok);
+  if (el && !d.ok) { el.disabled = false; el.textContent = el.dataset.orig; }
   refresh();
 }
 let lastPnl = null;
@@ -283,14 +310,22 @@ async function refresh() {
   const alive = d.loop_alive;
   // 顶栏
   document.getElementById("sym").textContent = d.symbol;
+  const ddEl = document.getElementById("data-dir");
+  if (ddEl) ddEl.textContent = d.data_dir ? "数据目录 " + d.data_dir : "";
   const mode = d.mode;
+  const isLive = mode === "live";
   const mb = document.getElementById("mode-badge");
   if (mode) {
     mb.style.display = "";
-    document.getElementById("mode-text").textContent = mode === "live" ? "实盘" : "模拟";
+    mb.className = isLive ? "badge-mode live" : "badge-mode sim";
+    document.getElementById("mode-text").textContent = isLive ? "实盘" : "模拟";
     const mdot = document.getElementById("mode-dot");
-    mdot.className = mode === "live" ? "dot dot-live" : "dot";
-  } else { mb.style.display = "none"; }
+    mdot.className = isLive ? "dot dot-live" : "dot";
+    document.title = (isLive ? "[实盘] " : "[模拟] ") + "PMBOT 控制台";
+  } else {
+    mb.style.display = "none";
+    document.title = "PMBOT 控制台";
+  }
   const dot = document.getElementById("loop-dot");
   const ltxt = document.getElementById("loop-text");
   if (alive && d.paused) { dot.className = "dot dot-pause"; ltxt.textContent = "已暂停"; }
@@ -306,14 +341,35 @@ async function refresh() {
   tickPnl(document.getElementById("pnl"), d.today_pnl,
           d.today_pnl > 0 ? "pos" : d.today_pnl < 0 ? "neg" : "");
   const ts = d.today_stats;
-  document.getElementById("pnl-sub").textContent = d.today_trades + " 笔今日交易" +
-    (ts ? " · 胜率 " + Math.round(ts.wins / ts.n * 100) + "% · 盈利 " + ts.wins + " 笔 +" + ts.gain.toFixed(2) +
-      " · 亏损 " + ts.losses + " 笔 " + ts.loss.toFixed(2) + " · 最大亏损 " + ts.max_loss.toFixed(2) : "");
+  const srcTag = d.today_pnl_src === "balance" ? "余额差口径" : "交易汇总";
+  let pnlSub = srcTag + " · " + d.today_trades + " 笔今日交易";
+  if (ts) pnlSub += " · 胜率 " + Math.round(ts.wins / ts.n * 100) + "% · 盈利 " + ts.wins + " 笔 +" + ts.gain.toFixed(2) +
+    " · 亏损 " + ts.losses + " 笔 " + ts.loss.toFixed(2) + " · 最大亏损 " + ts.max_loss.toFixed(2);
+  document.getElementById("pnl-sub").textContent = pnlSub;
   // 控制按钮
+  const stopBtn = document.getElementById("btn-stop");
+  if (!alive && stopBtn.textContent !== "停止") stopBtn.textContent = "停止";  // 停机完成后恢复文本
   document.getElementById("btn-start").disabled = alive;
-  document.getElementById("btn-stop").disabled = !alive;
-  document.getElementById("btn-resume").disabled = !d.paused;
-  const isLive = mode === "live";
+  stopBtn.disabled = !alive;
+  // 熔断时「解除熔断」高亮可用；平时 disabled（无熔断无需恢复）
+  const btnResume = document.getElementById("btn-resume");
+  btnResume.disabled = !d.paused;
+  btnResume.className = "btn" + (d.paused ? " btn-warn" : "");
+  btnResume.textContent = d.paused ? "解除熔断" : "恢复运行";
+  // 熔断横幅：熔断原因醒目提示；无 token 时提示控制按钮不可用
+  const banner = document.getElementById("pause-banner");
+  if (d.paused) {
+    banner.hidden = false;
+    banner.className = "banner banner-pause";
+    banner.textContent = "⛔ 已熔断暂停：" + (d.pause_reason || "未知原因") +
+      " —— 点击「解除熔断」恢复运行（连亏/日亏计数将清零）";
+  } else if (!TOKEN && !isLocal) {
+    banner.hidden = false;
+    banner.className = "banner banner-warn";
+    banner.innerHTML = "⚠ 局域网访问写操作未授权：请在浏览器地址栏 URL 末尾加 <b>?token=</b> 后重新打开（本机 127.0.0.1 访问免 token）。";
+  } else {
+    banner.hidden = true;
+  }
   const btnMode = document.getElementById("btn-mode");
   btnMode.disabled = alive;  // 主循环运行中不可切换模式
   btnMode.textContent = isLive ? "切到模拟" : "切到实盘";
@@ -347,12 +403,22 @@ async function refresh() {
     document.getElementById("book-cell").innerHTML = cell("盘口", "—");
   }
   const p = d.position;
+  // 实时持仓（Polymarket /positions 快照，本标的）
+  const lps = (d.live_positions || []).filter(x =>
+    (x.title || "").toLowerCase().includes((d.symbol || "").toLowerCase()));
+  let liveSub = "";
+  if (lps.length) {
+    liveSub = "实时: " + lps.map(x =>
+      (x.outcome || "") + " " + Number(x.size || 0).toFixed(2) + "股 现" + centsStr(x.curPrice || 0) +
+      " 浮动" + signed(x.cashPnl || 0)).join(" · ");
+  }
   document.getElementById("pos-cell").innerHTML = p
     ? cell("持仓", "<span class='dir'>" + p.direction.toUpperCase() + "</span> <span class='mono'>" + p.size.toFixed(2) +
         " 股 @ " + centsStr(p.entry_price) + "</span>",
-        (p.tp_price ? "止盈 +" + Math.round((p.tp_pct || 0) * 100) + "% → " + centsStr(p.tp_price) : "") +
-        (p.sl_price ? (p.tp_price ? " · " : "") + "止损 -" + Math.round((p.sl_pct || 0) * 100) + "% → " + centsStr(p.sl_price) : ""))
-    : cell("持仓", "—");
+        ((p.tp_price ? "止盈 +" + Math.round((p.tp_pct || 0) * 100) + "% → " + centsStr(p.tp_price) : "") +
+        (p.sl_price ? (p.tp_price ? " · " : "") + "止损 -" + Math.round((p.sl_pct || 0) * 100) + "% → " + centsStr(p.sl_price) : "") +
+        (liveSub ? (p.tp_price || p.sl_price ? " · " : "") + liveSub : "")))
+    : cell("持仓", lps.length ? "<span class='mono'>" + liveSub + "</span>" : "—", liveSub && lps.length ? "" : undefined);
   let kronos = "—";
   if (d.predicting) {
     const secs = Math.max(0, Math.floor(Date.now() / 1000 - (d.predict_start_sec || 0)));
@@ -376,13 +442,20 @@ async function refresh() {
        " · 盈利 " + rs.wins + " 笔 +" + rs.gain.toFixed(2) + " · 亏损 " + rs.losses + " 笔 " + rs.loss.toFixed(2) +
        " · 最大亏损 " + rs.max_loss.toFixed(2))
     : "暂无交易记录";
-  const rows = (d.recent_trades || []).map(t =>
+  const rows = [];
+  if (p) {
+    // 持仓中：未平仓持仓置顶显示（实盘买入后立即可见，避免“买了但表格空”的困惑）
+    rows.push("<tr class='open'><td class='mono'>持仓中</td><td>" + p.direction.toUpperCase() +
+      "</td><td class='num mono'>" + priceCents(p.entry_price) + "</td><td class='num mono'>—</td>" +
+      "<td class='num mono'>—</td><td>持仓中</td></tr>");
+  }
+  (d.recent_trades || []).forEach(t => rows.push(
     "<tr><td class='mono'>" + t.ts + "</td><td>" + t.direction.toUpperCase() +
     "</td><td class='num mono'>" + priceCents(t.entry) + "</td><td class='num mono'>" + priceCents(t.exit) +
     "</td><td class='num mono " + (t.pnl >= 0 ? "pos" : "neg") + "'>" + signed(t.pnl) +
-    "</td><td>" + (REASONS[t.reason] || t.reason) + "</td></tr>"
-  ).join("");
-  // 交易品种实时价
+    "</td><td>" + (t.label || t.reason) + "</td></tr>"
+  ));
+  // 交易品种实时价（变化时闪烁提示，独立于 2s 轮询的瞬时值）
   const spotEl = document.getElementById("spot");
   const sp = d.spot;
   if (sp) {
@@ -391,17 +464,24 @@ async function refresh() {
       : sp.price.toFixed(2);
     const arrow = sp.delta > 0.0001 ? "<span class='up'>▲</span>"
       : sp.delta < -0.0001 ? "<span class='dn'>▼</span>" : "<span class='meta'>•</span>";
-    spotEl.innerHTML = d.symbol + " $" + fmt + " " + arrow;
+    const txt = d.symbol + " $" + fmt + " " + arrow;
+    if (spotEl.innerHTML !== txt) {
+      spotEl.innerHTML = txt;
+      spotEl.classList.remove("flash");
+      void spotEl.offsetWidth;  // 重启动画
+      spotEl.classList.add("flash");
+    }
   } else {
     spotEl.textContent = "—";
   }
   // 配置条
   const cfgBar = document.getElementById("cfg-bar");
   if (d.config_summary) { cfgBar.textContent = "配置 " + d.config_summary; cfgBar.hidden = false; }
-  document.getElementById("trades").innerHTML = rows || "<tr><td colspan='6'>（暂无）</td></tr>";
+  document.getElementById("trades").innerHTML = rows.join("") || "<tr><td colspan='6'>（暂无）</td></tr>";
   document.getElementById("updated").textContent = new Date().toTimeString().slice(0, 8);
   document.getElementById("uptime").textContent = fmtUptime(d.uptime_sec || 0);
-  document.title = "PMBOT 控制台 · " + (alive ? (d.paused ? "已暂停" : "运行中") : "已停止");
+  document.title = (isLive ? "[实盘] " : "[模拟] ") + "PMBOT 控制台 · " +
+    (alive ? (d.paused ? "已暂停" : "运行中") : "已停止");
 }
 refresh();
 setInterval(refresh, 2000);

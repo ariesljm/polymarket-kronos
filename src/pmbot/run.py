@@ -109,6 +109,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             loop.run_forever()
 
+    # 终端关闭（CTRL_CLOSE）在 Windows 触发 SIGTERM → 优雅停机（同 Ctrl-C）
+    import signal as _signal
+
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        _signal.signal(_signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        pass
+
     # 单实例守护：杀旧 run 实例防多开互踩状态文件；退出自动注销
     run_with_guard("run", _run, pid_file=paths.pid_file)
     return 0

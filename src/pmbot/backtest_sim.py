@@ -72,16 +72,21 @@ def fetch_window(cid: str, tokens: list[str], win_start: int, win_end: int) -> l
 
 
 def simulate_path(path: list[tuple[int, float]], entry_price: float, size: float,
-                  is_taker: bool) -> dict:
-    """沿成交路径模拟持仓管理。path: [(ts, price), ...] 升序。"""
-    tp, sl = position_exit_levels(entry_price, TP_PCT, SL_PCT)  # 共享公式源（tp_max=0.999, floor=0.001 默认）
+                  is_taker: bool, tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
+                  time_stop_min: int = TIME_STOP_MIN) -> dict:
+    """沿成交路径模拟持仓管理。path: [(ts, price), ...] 升序。
+
+    tp_pct/sl_pct/time_stop_min 默认模块内置值；run() 从 config 注入实盘参数
+    （与 exit_rules 单一事实源精神闭环：公式与参数同源）。
+    """
+    tp, sl = position_exit_levels(entry_price, tp_pct, sl_pct)  # 共享公式源（tp_max=0.999, floor=0.001 默认）
     t0 = path[0][0]
     for i, (ts, price) in enumerate(path):
         if price >= tp:
             return _trade(entry_price, tp, size, is_taker, "take_profit", ts - t0)
         if price <= sl:
             return _trade(entry_price, sl, size, is_taker, "stop_loss", ts - t0)
-        if (ts - t0) >= TIME_STOP_MIN * 60 and price <= entry_price:
+        if (ts - t0) >= time_stop_min * 60 and price <= entry_price:
             return _trade(entry_price, price, size, is_taker, "time_stop", ts - t0)
     return _trade(entry_price, path[-1][1], size, is_taker, "window_end", path[-1][0] - t0)
 
@@ -104,6 +109,28 @@ def fetch_market(win_start: int) -> dict | None:
     return {"cid": m["conditionId"], "tokens": json.loads(m["clobTokenIds"])}
 
 
+def trade_params(args: argparse.Namespace) -> tuple[float, float, int]:
+    """止盈/止损/时间止损参数：CLI 覆盖 > config.yaml > 内置默认。
+
+    与 exit_rules 单一事实源精神闭环：回测跟随实盘配置（config 调整
+    止盈止损后离线模拟口径一致），CLI 可显式覆盖研究设定。
+    """
+    tp, sl, tsm = args.tp, args.sl, args.time_stop
+    if tp is None or sl is None or tsm is None:
+        try:
+            from pmbot.config import load_config
+
+            cfg = load_config(args.config)
+            tp = tp if tp is not None else cfg.take_profit
+            sl = sl if sl is not None else cfg.stop_loss
+            tsm = tsm if tsm is not None else cfg.time_stop_min
+        except Exception:
+            tp = tp if tp is not None else TP_PCT
+            sl = sl if sl is not None else SL_PCT
+            tsm = tsm if tsm is not None else TIME_STOP_MIN
+    return tp, sl, tsm
+
+
 def run(args: argparse.Namespace) -> int:
     ctx = 512  # kronos-small 上下文
     need5m = ctx + args.points + 1
@@ -111,6 +138,7 @@ def run(args: argparse.Namespace) -> int:
     df5 = fetch_klines(args.symbol, "5m", need5m)
     df5 = df5.sort_values("timestamp").reset_index(drop=True)
 
+    tp_pct, sl_pct, time_stop_min = trade_params(args)
     client = KronosPredictorClient(variant=args.variant)
     t0 = time.time()
     limit_trades, market_trades = [], []
@@ -136,7 +164,8 @@ def run(args: argparse.Namespace) -> int:
         # ---- 市价模式：推理完成即按路径首笔成交价入场 ----
         entry_m = path[0][1]
         size_m = args.amount / entry_m  # 按金额，份额可小数
-        tr_m = simulate_path(path[1:], entry_m, size_m, is_taker=True)
+        tr_m = simulate_path(path[1:], entry_m, size_m, is_taker=True,
+                             tp_pct=tp_pct, sl_pct=sl_pct, time_stop_min=time_stop_min)
         market_trades.append(tr_m)
 
         # ---- 限价模式：路径上成交价 ≤ LIMIT_PRICE 才入场 ----
@@ -145,7 +174,8 @@ def run(args: argparse.Namespace) -> int:
             if price <= LIMIT_PRICE:
                 entry_l = price
                 size_l = max(MIN_ORDER_SIZE, int(1 / entry_l) + 1)
-                tr_l = simulate_path(path[i + 1:], entry_l, size_l, is_taker=True)
+                tr_l = simulate_path(path[i + 1:], entry_l, size_l, is_taker=True,
+                                     tp_pct=tp_pct, sl_pct=sl_pct, time_stop_min=time_stop_min)
                 break
         if tr_l is not None:
             limit_trades.append(tr_l)
@@ -164,7 +194,7 @@ def run(args: argparse.Namespace) -> int:
 
     s_l, s_m = stats(limit_trades), stats(market_trades)
     print(f"\n评估 {args.points} 个窗口（耗时 {time.time() - t0:.0f}s，{args.samples} 采样/窗口，"
-          f"金额 ${args.amount}，TP {TP_PCT:.0%} / SL {SL_PCT:.0%}，真实成交路径）")
+          f"金额 ${args.amount}，TP {tp_pct:.0%} / SL {sl_pct:.0%}，真实成交路径）")
     print("=" * 68)
     for name, s in (("限价(等回调≤0.50)", s_l), ("市价(立即入场)", s_m)):
         if s is None:
@@ -183,6 +213,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--samples", type=int, default=10, help="每窗口采样次数")
     parser.add_argument("--amount", type=float, default=1.0, help="市价模式每注金额（USDC）")
     parser.add_argument("--variant", default="kronos-small")
+    parser.add_argument("--config", default="config.yaml", help="配置文件（TP/SL/时间止损参数源）")
+    parser.add_argument("--tp", type=float, default=None, help="止盈百分比（覆盖 config，如 0.30）")
+    parser.add_argument("--sl", type=float, default=None, help="止损百分比（覆盖 config，如 0.20）")
+    parser.add_argument("--time-stop", dest="time_stop", type=int, default=None,
+                        help="时间止损分钟（覆盖 config）")
     args = parser.parse_args(argv)
     return run(args)
 

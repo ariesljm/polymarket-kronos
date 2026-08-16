@@ -62,6 +62,27 @@ def status_dict(**over):
     return TradeState(**data)
 
 
+def test_today_pnl_uses_balance_diff_when_available():
+    """实盘今日盈亏 = 现余额 − 今日起始基准（余额差口径，覆盖交易聚合）。"""
+    from pmbot.monitor import render
+
+    rows = trades_rows(1, pnl=0.55)  # 交易聚合 +0.55，但余额差 +5.00 优先
+    v = build_view(status_dict(balance=25.0, day_start_balance=20.0), rows, None,
+                   now_sec=WINDOW_START, today=TODAY)
+    assert v.today_pnl == pytest.approx(5.0)
+    assert v.today_pnl_src == "balance"
+    text = render(v)
+    assert "今日盈亏: +5.00 USDC（余额差）" in text
+
+
+def test_today_pnl_falls_back_to_trades_aggregate():
+    """无余额基准（dry-run/未捕获）时回退交易聚合口径。"""
+    v = build_view(status_dict(), trades_rows(2, pnl=0.55), None,
+                   now_sec=WINDOW_START, today=TODAY)
+    assert v.today_pnl == pytest.approx(1.10)
+    assert v.today_pnl_src == ""
+
+
 def trades_rows(n=3, pnl=0.55):
     base = datetime(2026, 8, 14, 3, 0, tzinfo=timezone.utc)
     return [
@@ -407,17 +428,18 @@ def test_today_line_shows_win_loss_breakdown():
     assert ts["max_loss"] == pytest.approx(-0.30)  # 最大亏损单笔
     assert ts["pnl"] == pytest.approx(2.35)
     text = render(v)
-    assert "今日: +2.35 USDC（7 笔 · 胜率 71% · 盈利 5 笔 +2.75 · 亏损 2 笔 -0.40 · 最大亏损 -0.30）" in text
+    assert "今日盈亏: +2.35 USDC" in text
+    assert "今日交易: 7 笔 · 胜率 71% · 盈利 5 笔 +2.75 · 亏损 2 笔 -0.40 · 最大亏损 -0.30" in text
 
 
 def test_today_line_plain_when_no_trades():
-    """无今日交易时保持简洁格式。"""
+    """无今日交易时只显示盈亏行（余额差口径无标记 = 交易聚合回退）。"""
     from pmbot.monitor import render
 
     v = build_view(status_dict(), [], None, now_sec=WINDOW_START, today=TODAY)
     assert v.today_stats is None
     text = render(v)
-    assert "今日: +0.00 USDC（0 笔）" in text
+    assert "今日盈亏: +0.00 USDC" in text
 
 
 def test_recent_trades_stats_hidden_when_empty():
@@ -597,3 +619,20 @@ def test_spot_price_snapshot_and_delta():
     sp._price = 2010.0
     sp._delta = 10.0
     assert sp.snapshot() == {"price": 2010.0, "delta": 10.0}
+
+
+def test_live_view_uses_config_interval(tmp_path, monkeypatch):
+    """_build_live_view 必须用 config 参数（不是 args 残留）：窗口标签按 config 的 5m 对齐。
+
+    回归：签名解耦（候选 C）后函数体内残留 args.config → NameError 被
+    except 吞掉 → window_seconds 回退默认 900s（显示 15m 窗口标签）、
+    config_summary 为空。
+    """
+    from pmbot.monitor import _build_live_view
+    from pmbot.paths import RuntimePaths
+
+    (tmp_path / "status.json").write_text('{"symbol": "ETH", "window_start": 1786872300}',
+                                         encoding="utf-8")
+    v = _build_live_view("ETH", "config.yaml", RuntimePaths(data_dir=str(tmp_path)))
+    assert v.window_label.endswith("-17:30")  # 17:25-17:30（5m 对齐）
+    assert "5m" in v.config_summary  # config 读取未失败

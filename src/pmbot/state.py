@@ -46,6 +46,8 @@ class TradeState:
     predict_start_sec: int | None = None
     market_prices: dict | None = None
     balance: float | None = None  # 钱包余额快照（主循环定时刷新，供面板显示）
+    day_start_balance: float | None = None  # 今日起始余额基准（跨天重置，今日盈亏 = 现余额 − 基准）
+    live_positions: list | None = None  # Polymarket 实时持仓快照（/positions，UI 展示 + 幽灵持仓核对）
     mode: str = ""  # 运行模式标记："dry-run"/"live"（空 = 旧数据，不校验）
 
     def roll_window(self, window_start: int) -> None:
@@ -58,15 +60,17 @@ class TradeState:
         self.signal = None
 
     def roll_day(self, day: str) -> None:
-        """跨天重置当日亏损。"""
+        """跨天重置当日亏损与今日盈亏基准（新基准由下一次余额刷新捕获）。"""
         if day != self.last_day:
             self.daily_loss = 0.0
+            self.day_start_balance = None
             self.last_day = day
 
     def close_position(self, settle_price: float, actual_pnl: float | None = None) -> float:
         """按结算/平仓价兑现持仓，返回盈亏；更新熔断计数。
 
-        actual_pnl 非 None 时用它（实盘余额差值，含滑点/手续费）；否则理论价差。
+        actual_pnl 非 None 时用它（Polymarket 真实成交盈亏：卖出收入 − 买入成本）；
+        否则理论价差（dry-run / 结算兑付）。
         """
         pos = self.position
         if pos is None:
@@ -108,7 +112,8 @@ class StateStore:
             "字段含义：paused=熔断暂停；daily_loss=当日累计亏损；"
             "consecutive_losses=连亏笔数；window_bet_placed=当前窗口已下注；"
             "signal=最近一次 Kronos 信号；position=当前持仓（无持仓为 null）；"
-            "balance=钱包余额快照（实盘时定时刷新）；mode=运行模式（dry-run/live）。"
+            "balance=钱包余额快照（实盘时定时刷新）；day_start_balance=今日起始余额基准"
+            "（今日盈亏 = 现余额 − 基准，跨天重置）；mode=运行模式（dry-run/live）。"
         )
         from pmbot.fileio import atomic_write_text
 
@@ -134,7 +139,6 @@ class StateStore:
                 size=float(pos["size"]),
                 entered_remaining_sec=int(pos["entered_remaining_sec"]),
                 window_start=int(pos["window_start"]),
-                entry_balance=float(pos["entry_balance"]) if pos.get("entry_balance") is not None else None,
             )
         if data.get("pending_order"):
             po = data["pending_order"]
