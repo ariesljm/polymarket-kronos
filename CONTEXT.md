@@ -35,7 +35,7 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 - **幽灵持仓（ghost position）** — 本地记录有持仓但 Polymarket 实际无该标的持仓（崩溃/强杀残留）：核对时清除并警告；**清除有宽限保护**（持仓窗口结束 + 180s 后仍无才判幽灵，防买入后 /positions 索引延迟误清）；反向（本地无但远端有）未跟踪持仓**自动接管**（slug 可解析窗口起点时，重建 position 恢复止损/结算管理；非 bot 市场格式只警告不接管）；查询失败不核对（防误清真实持仓）。
 - **盘口采样器（BookSampler）** — 高频盘口 WS 线程（REST 兜底），内存快照供执行器报价，book.json 落盘供面板 1s 级展示。
 - **用户流（UserStream）** — 认证 WS（订单/成交推送）→ 事件队列，主循环 tick drain。无凭证时空转。
-- **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/PING/停止/4 钩子）。新 WS 流应继承它而非复制样板。
+- **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/心跳应答/停止/4 钩子）。新 WS 流应继承它而非复制样板。**心跳：应答不主动**——Polymarket 应用层心跳为服务端发 PING 文本、客户端回 PONG；客户端主动发 PING 被判非法（1008 policy violation，曾致盘口流 3 秒断连循环）。
 - **盘口定价（weighted_price / best_price）** — `book_price.py` 纯函数，单一事实源：按可成交量加权均价，**流动性不足返回 None**（宁缺毋滥，不显示误导价）。执行器与面板落盘必须共用，禁止本地复刻。
 - **市场发现（MarketDiscovery）** — 定位当前窗口的 Up/Down 市场（gamma-api，slug 模式）。
 - **数据源（BinanceDataSource / KlineStore）** — Binance 镜像 K 线拉取 + 本地 CSV 滚动存储，增量/去重/裁剪。单批拉取统一走 `fetch_klines_batch`（在线与离线回测共用，禁止复刻）。

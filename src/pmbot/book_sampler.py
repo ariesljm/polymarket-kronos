@@ -180,9 +180,11 @@ class BookSampler(ReconnectingWsThread):
         with self._lock:
             tokens = list(self._tokens)
         if tokens:
+            # 官方 market channel 订阅格式：type=market + assets_ids。
+            # initial_dump/level 为非法字段：曾导致 1008 policy violation 拒收，
+            # 盘口流全程靠 REST 兜底 + 无限重连刷屏（连接后服务端本就主动 dump 盘口）。
             await ws.send(json.dumps({
                 "type": "market", "assets_ids": tokens,
-                "initial_dump": True, "level": 2,
             }))
             # 连接时全量订阅 → 更新已发送集合基线（后续增量 diff 的基础）
             self._last_subscribed = set(tokens)

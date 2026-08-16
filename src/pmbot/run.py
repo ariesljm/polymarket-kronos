@@ -70,8 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     executor.attach_sampler(sampler)
     sampler.start()
 
-    # 认证 WS（订单/成交推送）：凭证从 CLOB 缓存读取（与下单客户端同源），无则仅盘口 WS 工作
-    user_stream = UserStream(executor.api_auth(), proxy=proxy)
+    # 认证 WS（订单/成交推送）：仅实盘使用——dry-run 不触碰真实凭证（clob_creds.json
+    # 存在时也不连接认证 WS），模拟持仓与真实钱包无关，事件空转。
+    user_stream = UserStream(executor.api_auth() if not args.dry_run else None, proxy=proxy)
     user_stream.start()
 
     state = StateStore(paths.status).load()

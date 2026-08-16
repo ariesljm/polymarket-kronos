@@ -1,6 +1,6 @@
 """可重连 WS 线程基类：后台线程跑 asyncio 事件循环。
 
-统一连接生命周期骨架（指数退避重连 + PING 保活 + 优雅停止），
+统一连接生命周期骨架（指数退避重连 + 应用层心跳应答 + 优雅停止），
 业务差异由子类实现：订阅消息、消息处理、连接/断线回调。
 
 两个消费者（BookSampler / UserStream）共享此骨架，第三个 WS 流直接复用。
@@ -16,7 +16,6 @@ from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
 
-PING_INTERVAL = 3.0
 RECONNECT_BASE = 2.0
 RECONNECT_MAX = 30.0
 
@@ -25,7 +24,6 @@ class ReconnectingWsThread(threading.Thread):
     """WS 连接线程骨架。子类实现四个钩子即可接入。"""
 
     ws_url: str = ""
-    ping_interval: float = PING_INTERVAL
     reconnect_base: float = RECONNECT_BASE
     reconnect_max: float = RECONNECT_MAX
 
@@ -66,12 +64,13 @@ class ReconnectingWsThread(threading.Thread):
                     self._loop = asyncio.get_running_loop()
                     try:
                         await self._send_subscribe(ws)
-                        ping_task = asyncio.create_task(self._ping_loop(ws))
                         try:
                             async for msg in ws:
+                                if await self._answer_heartbeat(ws, msg):
+                                    continue  # 心跳应答不交给子类
                                 self._handle_message(msg)
                         finally:
-                            ping_task.cancel()
+                            pass
                     finally:
                         self._connected_ws = None
                         self._loop = None
@@ -89,13 +88,20 @@ class ReconnectingWsThread(threading.Thread):
                     waited += wait
                 backoff = min(backoff * 2, self.reconnect_max)
 
-    async def _ping_loop(self, ws: ClientConnection) -> None:
-        while True:
-            await asyncio.sleep(self.ping_interval)
+    async def _answer_heartbeat(self, ws: ClientConnection, msg) -> bool:
+        """Polymarket 应用层心跳应答：服务端发 PING 文本 → 回 PONG（应答即保活）。
+
+        客户端**不主动发** PING：曾每 3s 发 PING 文本被服务端判非法
+        （1008 policy violation）→ WS 每 3s 断开重连（回归：20:51 盘口流
+        连接后 ~3s 必断，REST 兜底救场）。返回 True 表示已应答、消息不交子类。
+        """
+        if isinstance(msg, str) and msg.strip() == "PING":
             try:
-                await ws.send("PING")
+                await ws.send("PONG")
             except Exception:
-                return
+                pass
+            return True
+        return False
 
     # ---- 子类钩子 ----
 
