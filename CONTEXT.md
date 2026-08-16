@@ -23,6 +23,7 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 - **接缝方法（seam methods）** — TradingLoop 上生命周期消费的公开方法：`refresh_pending / build_view / decide / execute / save_status`。不要改回下划线私有穿透。
 - **状态（state）** — `TradeState` 领域对象：只含交易语义（窗口/持仓/挂单/熔断/运行快照字段）。**不做序列化**——持久化归 StateStore。
 - **平仓（close）** — `TradingLoop._close_position` 统一卖出/结算两条路径：余额差 PnL（exit_balance − entry_balance，含滑点/手续费）优先，余额查询失败回退理论价差；兑现持仓、更新熔断计数、记 trades.csv。`entry_balance` 取**买入前**余额（净盈亏基准：结算所得 − 买入成本含费）。
+- **结算等待期（settle pending）** — 持仓窗口已结束后 gamma 结算未完成的等待期：**不交易只等结算**（build_view 不给 bid → 决策引擎不卖）。曾因结算等待期止盈卖出失败（Polymarket 已结算 token 失效，balance 0）导致 tick 异常死循环与结算超时丢跟踪。
 - **实盘数据只用实际获取值** — 持仓股数=订单详情 `size_matched`/响应 `takingAmount`；入场价=详情 `price`（纯成交价，不含费）；盈亏=余额差（实证含 ~3% taker 手续费：1 USDC 单实扣 1.0301，链上两笔转账：成交 1.0 + 费用 0.03）。API 无实际成交数据时**放弃建仓**（不盘口估算，dry-run 除外）。
 - **状态存储（StateStore）** — TradeState 的持久化：status.json 快照 + trades.csv 交易日志。序列化只在进程边界（run/monitor）发生。
 - **控制指令（control）** — 面板 ↔ 主循环指令通道（control.json 原子写 + 读删）：resume/reset/stop；start 为进程级操作不走本通道。reset 语义收敛于 `control.reset_runtime`（主循环与面板共用同一文件删除清单：status/trades/K线/预测记录；实盘拒绝 reset 保护在各调用方）。

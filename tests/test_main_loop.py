@@ -15,7 +15,7 @@ import pytest
 
 from pmbot.config import Config
 from pmbot.main_loop import TradingLoop
-from pmbot.state import Position, TradeState
+from pmbot.state import Position, StateStore, TradeState
 from pmbot.types import Direction, PendingOrder, Signal
 
 WINDOW_MS = 900_000
@@ -548,6 +548,55 @@ def test_old_position_stop_loss_still_managed(tmp_path):
     loop.tick(now_ms=1_000_000_000)
     assert ("sell", "YES", 2.0) in ex.calls
     assert loop.state.position is None
+
+
+def test_expired_position_waits_for_settle_not_sell(tmp_path):
+    """持仓窗口已结束（结算等待期）→ 不卖出，只等 _settle 结算记账。
+
+    回归：18:47 窗口结束止盈卖出失败（Polymarket 已结算 token 失效，balance 0
+    报错）→ 每 2s tick 异常死循环数分钟 → 结算超时丢跟踪、交易无记录。
+    """
+    ex = FakeExecutor()
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(
+            symbol="BTC",
+            window_start=999_900,
+            window_bet_placed=True,
+            position=make_position(window=999_900),  # 持仓窗口已结束
+        ),
+        discovery=FakeDiscovery(make_market(), settled=make_market(price=0.55)),  # 未结算：等待
+        executor=ex,
+    )
+    ex.best_bid_value = 0.90  # 若决策卖出会触发止盈
+    loop.tick(now_ms=1_000_900_000)  # 持仓窗口结束 100s
+    assert ("sell", "YES", 2.0) not in ex.calls  # 不卖
+    assert loop.state.position is not None  # 等 _settle 结算
+
+
+def test_sell_failure_keeps_position(tmp_path):
+    """市价卖出失败（网络/已结算 token 失效）→ 保留持仓，不崩 tick。"""
+
+    class FailSell(FakeExecutor):
+        def market_sell(self, token_id, size):
+            raise RuntimeError("balance 0")
+
+    ex = FailSell()
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(
+            symbol="BTC",
+            window_start=999_900,
+            window_bet_placed=True,
+            position=make_position(),
+        ),
+        executor=ex,
+    )
+    ex.best_bid_value = 0.10  # 触发止损
+    loop.tick(now_ms=1_000_100_000)
+    assert loop.state.position is not None  # 卖出失败保留持仓
+    saved = StateStore(Path(tmp_path) / "status.json").load()
+    assert saved is not None and saved.position is not None  # tick 正常落盘（未崩）
 
 
 def test_settle_timeout_fallback(tmp_path):

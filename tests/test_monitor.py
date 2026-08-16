@@ -72,7 +72,7 @@ def test_today_pnl_uses_balance_diff_when_available():
     assert v.today_pnl == pytest.approx(5.0)
     assert v.today_pnl_src == "balance"
     text = render(v)
-    assert "今日盈亏: +5.00 USDC（余额差）" in text
+    assert "今日盈亏: +5.00 USDC（按钱包余额）" in text
 
 
 def test_today_pnl_falls_back_to_trades_aggregate():

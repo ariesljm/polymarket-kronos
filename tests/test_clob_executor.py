@@ -156,3 +156,17 @@ def test_parse_fill_making_taking_actual_price(monkeypatch):
                            "takingAmount": "6.666665", "status": "matched"})
     assert fill["avg_price"] == pytest.approx(0.999999 / 6.666665)  # 0.15（网页口径）
     assert fill["filled_size"] == pytest.approx(6.666665)
+
+
+def test_parse_fill_sell_making_taking_direction(monkeypatch):
+    """卖单响应 making/taking 方向与买单相反：价 = taking/making（收到的 USDC/卖出的 token）。
+
+    回归：20:39 time_stop 平仓卖出 1.9608 股收到 0.549 USDC（真实价 0.28），
+    旧解析 making/taking = 3.571（=1/0.28）→ exit_price 记错，UI 显示 357 美分。
+    """
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "get_order", lambda oid: None)
+    fill = ex._parse_fill({"orderID": "0xabc", "makingAmount": "1.9608",
+                           "takingAmount": "0.549", "status": "matched"}, side="sell")
+    assert fill["avg_price"] == pytest.approx(0.549 / 1.9608)  # 0.28（网页口径）
+    assert fill["filled_size"] == pytest.approx(1.9608)  # 卖单股数 = makingAmount

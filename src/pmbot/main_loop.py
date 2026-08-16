@@ -109,6 +109,8 @@ class TradingLoop:
         # 启动跳过进行中的窗口：不推理不交易，下一窗口起点才开始（避免中途启动做半窗决策）
         step = self.discovery.step_ms // 1000
         self._skip_window_until = window_start_sec(int(time.time()), step) + step
+        self.state.skip_until_sec = self._skip_window_until
+        self.save_status()  # 落盘：面板显示启动等待（独立进程读 status.json）
         logger.info("跳过进行中的窗口，%s 起运行推理与交易", self._skip_window_until)
         while not self._shutdown:
             try:
@@ -154,11 +156,22 @@ class TradingLoop:
             if new_window < self._skip_window_until:
                 # 启动跳过进行中的窗口：对齐窗口起点但不建生命周期（不推理不交易）
                 self._lifecycle = None
+                st.skip_until_sec = self._skip_window_until
+                self.save_status()  # 落盘：面板显示启动等待
                 logger.info("启动跳过进行中的窗口 %s（%s 起运行）", new_window, self._skip_window_until)
             else:
+                st.skip_until_sec = None
                 self._lifecycle = MarketLifecycle(deps=self, window_start=new_window, now_sec=now_sec)
-        elif self._lifecycle is None and new_window >= self._skip_window_until:
-            self._lifecycle = MarketLifecycle(deps=self, window_start=new_window, now_sec=now_sec)
+        elif self._lifecycle is None:
+            if new_window >= self._skip_window_until:
+                st.skip_until_sec = None
+                self._lifecycle = MarketLifecycle(deps=self, window_start=new_window, now_sec=now_sec)
+            elif st.skip_until_sec != self._skip_window_until:
+                # 重启恢复：同窗口内首次 tick（st.window_start == new_window）不建生命周期，
+                # 补记跳过信息（防面板无提示、误以为启动失败而反复停止/启动）
+                st.skip_until_sec = self._skip_window_until
+                self.save_status()
+                logger.info("启动跳过进行中的窗口 %s（%s 起运行）", new_window, self._skip_window_until)
 
         # 4. 市场发现（引擎级：市场不存在时窗口逻辑整体跳过）
         market = self.discovery.find_current_window(self.symbol, now_ms)
@@ -300,9 +313,12 @@ class TradingLoop:
         best_ask = self.book.best_ask(target_token)
         best_bid = None
         if st.position is not None:
-            # 持仓 token 盘口在结算前始终有效：跨窗口持仓（结算等待期）同样执行止盈/止损
-            pos_token = token_for(market, st.position.direction)
-            best_bid = self.book.best_bid(pos_token)
+            # 持仓窗口已结束（结算等待期）→ 不报价不卖出：Polymarket 后端可能已结算
+            # （token 失效），卖出必失败（balance 0 → tick 异常死循环），只等 _settle 结算记账。
+            # 回归：18:47 窗口结束止盈卖出报错 → 每 2s tick 异常持续数分钟 → 结算超时丢跟踪。
+            if st.position.window_start + self.step_sec > now_sec:
+                pos_token = token_for(market, st.position.direction)
+                best_bid = self.book.best_bid(pos_token)
         return MarketView(
             remaining_sec=self._window_end_sec(now_sec) - now_sec,
             best_ask=best_ask,
@@ -477,7 +493,14 @@ class TradingLoop:
         if pos is None:
             return
         token = token_for(market, pos.direction)
-        resp = self.trade.market_sell(token, pos.size)
+        try:
+            resp = self.trade.market_sell(token, pos.size)
+        except Exception:
+            # 卖出失败（网络/已结算 token 失效）：保留持仓交给 settle/下 tick，不崩 tick
+            # （回归：卖出失败曾导致每 2s tick 异常死循环 + 结算超时丢跟踪）
+            logger.warning("市价卖出失败（%s %s %.4f 股），保留持仓等待下一 tick",
+                           token[:16], pos.direction.value, pos.size)
+            return
         resp = resp or {}
         exit_price = resp.get("price")
         if exit_price is None:

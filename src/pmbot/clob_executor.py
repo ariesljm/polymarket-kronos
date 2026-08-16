@@ -307,18 +307,25 @@ class ClobExecutor:
             logger.warning("市价买入失败：无响应 token=%s", token_id[:16])
             return None
         logger.info("市价买入响应：%s", resp)
-        return self._parse_fill(resp)
+        return self._parse_fill(resp, side="buy")
 
-    def _parse_fill(self, resp: dict) -> dict:
+    def _parse_fill(self, resp: dict, side: str = "buy") -> dict:
         """从订单响应/详情提取真实成交（均价/份额）；缺失字段为 None。
 
         优先订单详情（get_order：price/size_matched 为服务端实际成交）；
         其次响应键（averagePrice/matchedAmount/takingAmount）。不反推估算。
+        side: "buy"/"sell"（making/taking 方向随买卖互换）。
         """
         oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
         avg = resp.get("averagePrice") or resp.get("avg_price") or resp.get("average_price") or resp.get("price")
-        filled = (resp.get("matchedAmount") or resp.get("matched_amount")
-                  or resp.get("size_matched") or resp.get("takingAmount"))
+        if side == "sell":
+            # 卖单：makingAmount=卖出的 token 股数，takingAmount=收到的 USDC
+            filled = (resp.get("matchedAmount") or resp.get("matched_amount")
+                      or resp.get("size_matched") or resp.get("makingAmount"))
+        else:
+            # 买单：makingAmount=付出的 USDC，takingAmount=得到的 token 股数
+            filled = (resp.get("matchedAmount") or resp.get("matched_amount")
+                      or resp.get("size_matched") or resp.get("takingAmount"))
         # 市价单响应含 making/taking 金额：实际成交价 = 付/得（订单 price 是保护价非成交价）
         if avg is None:
             making, taking = resp.get("makingAmount"), resp.get("takingAmount")
@@ -326,7 +333,10 @@ class ClobExecutor:
                 try:
                     m, t = float(making), float(taking)
                     if m > 0 and t > 0:
-                        avg = m / t
+                        # 买单：价 = making/taking（付出的 USDC/得到的 token）；
+                        # 卖单：价 = taking/making（收到的 USDC/卖出的 token）。
+                        # 回归：20:39 卖单方向反算 → exit_price=3.571（1/0.28）写入 trades.csv。
+                        avg = (m / t) if side == "buy" else (t / m)
                 except (TypeError, ValueError):
                     pass
         if (avg is None or filled is None) and oid:
@@ -368,7 +378,7 @@ class ClobExecutor:
         )
         if not isinstance(resp, dict):
             return None
-        fill = self._parse_fill(resp)
+        fill = self._parse_fill(resp, side="sell")  # 卖单 making/taking 方向与买单相反
         return {"order_id": fill["order_id"], "price": fill["avg_price"]}
 
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None:

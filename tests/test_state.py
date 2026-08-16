@@ -129,6 +129,7 @@ def test_status_roundtrip(tmp_path):
         day_start_balance=10.0,
         position=make_position(),
         pending_order=make_pending(),
+        skip_until_sec=1_234_567,
     )
     store = StateStore(Path(tmp_path) / "status.json")
     store.save(st)
@@ -141,6 +142,7 @@ def test_status_roundtrip(tmp_path):
     assert loaded.day_start_balance == pytest.approx(10.0)
     assert loaded.position.direction is Direction.UP
     assert loaded.pending_order == make_pending()
+    assert loaded.skip_until_sec == 1_234_567
 
 
 def test_close_position_uses_actual_pnl():

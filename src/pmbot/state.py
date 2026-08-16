@@ -48,6 +48,7 @@ class TradeState:
     balance: float | None = None  # 钱包余额快照（主循环定时刷新，供面板显示）
     day_start_balance: float | None = None  # 今日起始余额基准（跨天重置，今日盈亏 = 现余额 − 基准）
     live_positions: list | None = None  # Polymarket 实时持仓快照（/positions，UI 展示 + 幽灵持仓核对）
+    skip_until_sec: int | None = None  # 启动跳过进行中窗口：此时间戳起恢复交易（面板提示用）
     mode: str = ""  # 运行模式标记："dry-run"/"live"（空 = 旧数据，不校验）
 
     def roll_window(self, window_start: int) -> None:

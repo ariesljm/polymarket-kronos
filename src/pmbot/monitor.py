@@ -152,7 +152,7 @@ class PanelView:
     consecutive_losses: int = 0
     daily_loss: float = 0.0
     today_pnl: float = 0.0
-    today_pnl_src: str = ""  # 今日盈亏口径："balance"=钱包余额差（实盘），""=交易聚合回退
+    today_pnl_src: str = ""  # 今日盈亏口径："balance"=按钱包余额（实盘真实资金变动），""=按交易记录聚合回退
     today_trades: int = 0
     today_stats: dict | None = None
     recent_trades: list = field(default_factory=list)
@@ -167,6 +167,7 @@ class PanelView:
     config_summary: str = ""
     tp_sl: dict | None = None
     uptime_sec: int | None = None
+    startup_wait_sec: int | None = None  # 启动跳过进行中窗口的剩余等待秒（面板提示，避免误判启动失败）
     now_sec: int = 0
     last_updated: str = ""
     balance: float | None = None
@@ -319,6 +320,9 @@ def build_view(status: TradeState | None, trades: list[dict], accuracy: dict | N
         v.predicting = bool(status.predicting)
         v.predict_start_sec = status.predict_start_sec
         v.prices = status.market_prices
+        # 启动跳过进行中窗口：剩余等待秒（>0 时面板提示，避免误以为启动失败）
+        if status.skip_until_sec and status.skip_until_sec > now_sec:
+            v.startup_wait_sec = status.skip_until_sec - now_sec
         v.live_positions = status.live_positions or []
         v.config_summary = panel.config_summary
         v.spot = panel.spot
@@ -375,6 +379,9 @@ def render(v: PanelView) -> str:
                      f"DOWN: {fmt(prices.get('down_bid'))}/{fmt(prices.get('down_ask'))}（买/卖）")
     rem = v.window_remaining_sec
     lines.append(f"窗口剩余: {f'{rem // 60}分{rem % 60:02d}秒' if rem is not None else '—'}")
+    if v.startup_wait_sec is not None:
+        m, s = divmod(v.startup_wait_sec, 60)
+        lines.append(f"启动等待: ⏳ 跳过进行中窗口，{m}分{s:02d}秒后开始交易")
     sig = v.signal
     if sig:
         note = f" [{v.signal_note}]" if v.signal_note else ""
@@ -411,7 +418,7 @@ def render(v: PanelView) -> str:
     lines.append(f"连亏: {v.consecutive_losses} 笔")
     lines.append("-" * 62)
     ts = v.today_stats
-    pnl_src = "（余额差）" if v.today_pnl_src == "balance" else ""
+    pnl_src = "（按钱包余额）" if v.today_pnl_src == "balance" else "（按交易记录）"
     lines.append(f"今日盈亏: {v.today_pnl:+.2f} USDC{pnl_src}")
     if ts:
         lines.append(

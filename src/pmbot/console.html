@@ -155,6 +155,7 @@ td.num, th.num { text-align: right; }
   <div class="topbar-right">
     <span class="badge-mode" id="mode-badge" style="display:none"><span class="dot" id="mode-dot"></span><span id="mode-text"></span></span>
     <span class="badge"><span class="dot" id="loop-dot"></span><span id="loop-text">连接中…</span></span>
+    <span class="meta" id="startup-wait" hidden></span>
     <span class="meta" id="model">—</span>
     <span class="meta mono" id="data-dir" title="数据目录（模拟/实盘各自独立）"></span>
     <span class="meta mono" id="balance">余额 —</span>
@@ -328,6 +329,15 @@ async function refresh() {
   }
   const dot = document.getElementById("loop-dot");
   const ltxt = document.getElementById("loop-text");
+  const sw = document.getElementById("startup-wait");
+  // 启动跳过进行中窗口：面板提示剩余等待，避免误判启动失败而反复停止/启动
+  if (d.startup_wait_sec > 0) {
+    sw.textContent = "⏳ 跳过进行中窗口，" + Math.floor(d.startup_wait_sec / 60) + "分" +
+      String(d.startup_wait_sec % 60).padStart(2, "0") + "秒后开始交易";
+    sw.hidden = false;
+  } else {
+    sw.hidden = true;
+  }
   if (alive && d.paused) { dot.className = "dot dot-pause"; ltxt.textContent = "已暂停"; }
   else if (alive) { dot.className = "dot dot-on"; ltxt.textContent = "运行中"; }
   else { dot.className = "dot"; ltxt.textContent = "已停止"; }
@@ -341,7 +351,7 @@ async function refresh() {
   tickPnl(document.getElementById("pnl"), d.today_pnl,
           d.today_pnl > 0 ? "pos" : d.today_pnl < 0 ? "neg" : "");
   const ts = d.today_stats;
-  const srcTag = d.today_pnl_src === "balance" ? "余额差口径" : "交易汇总";
+  const srcTag = d.today_pnl_src === "balance" ? "按钱包余额" : "按交易记录";
   let pnlSub = srcTag + " · " + d.today_trades + " 笔今日交易";
   if (ts) pnlSub += " · 胜率 " + Math.round(ts.wins / ts.n * 100) + "% · 盈利 " + ts.wins + " 笔 +" + ts.gain.toFixed(2) +
     " · 亏损 " + ts.losses + " 笔 " + ts.loss.toFixed(2) + " · 最大亏损 " + ts.max_loss.toFixed(2);
