@@ -1,0 +1,26 @@
+# pmbot 配置文件 —— 所有策略参数集中在此，改参数无需改代码
+
+strategy: kronos
+market_interval: 5m        # 市场/K线频率：5m / 15m / 1h（Polymarket slug 与窗口对齐随此）
+
+# 策略参数（按策略名分节；切换策略只需改顶部 strategy 字段）
+kronos:
+  symbols: [ETH]
+  amount_per_trade: 1        # 每注金额（USDC）：市价买入按金额换算份额 = 1/盘口价，可小数
+                              # （市价单无 5 股限制；如盘口价 0.2 → 5 股 = 1 USDC）
+  p_up_buy: 0.55             # P(up) 高于此值买 Up；低于 1−此值（0.45）自动买 Down，无需另配
+  cancel_before_end_sec: 60   # 挂单未成交时窗口结束前 N 秒撤单（当前市价模式不产生新挂单，仅兼容旧状态恢复）
+  exit_before_end_sec: 60     # 窗口结束前 N 秒：亏损则市价止损，盈利则持有到结算
+  take_profit: 0.50          # 百分比止盈：入场价 +50% 卖出（如入场 0.50 → 0.75）
+  take_profit_max: 0.90      # 止盈封顶价：算出的止盈价 > 此值则按此价止盈（如入场 0.80 → 1.04 → 0.90）
+  stop_loss: 0.60            # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
+  time_stop_min: 4           # 窗口过 N 分钟未盈利则时间止损（5m 窗口 = 4 分钟）
+  max_consecutive_losses: 5 # 连亏 N 笔熔断
+  max_daily_loss: 10         # 单日亏损 N USDC 熔断
+
+data:
+  # max_klines: 不显式配置时自动跟随 model.variant（mini=2048, small/base=512）
+
+model:
+  variant: kronos-base      # 模型变体：kronos-mini / kronos-small / kronos-base
+  sample_count: 100          # P(up) 采样次数（每次独立推理，取预测涨的占比；100 → 粒度 1%，方向更稳定）

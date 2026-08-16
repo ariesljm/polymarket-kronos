@@ -1,0 +1,424 @@
+"""终端监控面板（只读 TUI）：并行于主循环，每 2 秒刷新运行状态。
+
+用法: uv run python -m pmbot.monitor [--status data/status.json]
+数据只读自 status.json / trades.csv / PredictionLog，不改主循环。
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from pmbot.constants import WINDOW_SECONDS, step_ms_for
+from pmbot.exit_rules import position_exit_levels
+from pmbot.state import StateStore, TradeState
+
+REFRESH_SEC = 1.0
+RECENT_LIMIT = 5
+
+# 平仓原因 → 面板状态文案（trades.csv reason 字段）
+EXIT_LABELS = {
+    "take_profit": "已止盈",
+    "stop_loss": "已止损",
+    "time_stop": "已时间止损",
+    "window_end": "窗口结束平仓",
+    "settle": "已结算",
+    "sell": "已平仓",
+}
+
+
+@dataclass(frozen=True)
+class PanelConfig:
+    """面板展示配置（config 注入项打包，避免 build_view 参数膨胀）。"""
+
+    model_variant: str = "—"
+    thresholds: dict | None = None
+    window_seconds: int = WINDOW_SECONDS
+    config_summary: str = ""
+    tp_sl: dict | None = None
+    uptime_sec: int | None = None
+
+
+def _parse_ts(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _fmt_ts(ts: str) -> str:
+    """ISO 时间 → 本地时区 HH:MM（astimezone(None) = 系统本地时区）。"""
+    return _parse_ts(ts).astimezone(None).strftime("%H:%M")
+
+
+def _today_local(tz=None) -> str:
+    """本地时区（默认系统本地）今日日期串（YYYY-MM-DD），自然日切分。"""
+    return datetime.now(timezone.utc).astimezone(tz).strftime("%Y-%m-%d")
+
+
+def _read_book_prices(max_age_sec: float = 3.0) -> dict | None:
+    """读取 BookSampler 落盘的实时盘口（data/book.json）；过期/缺失返回 None。"""
+    try:
+        p = Path("data/book.json")
+        if not p.is_file():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if time.time() - (data.get("ts", 0) / 1000) > max_age_sec:
+            return None
+        return {k: data[k] for k in ("up_ask", "up_bid", "down_ask", "down_bid") if k in data}
+    except Exception:
+        return None
+
+
+def _view_defaults(accuracy, model_variant, tp_sl, uptime_sec, now_sec, config_summary) -> dict:
+    """视图默认值（build_view 入口骨架）。"""
+    return {
+        "symbol": "—",
+        "window_label": "—",
+        "window_remaining_sec": None,
+        "signal": None,
+        "signal_note": "",
+        "status_note": "",
+        "pending": None,
+        "position": None,
+        "paused": False,
+        "pause_reason": None,
+        "consecutive_losses": 0,
+        "daily_loss": 0.0,
+        "today_pnl": 0.0,
+        "today_trades": 0,
+        "recent_trades": [],
+        "recent_stats": None,
+        "accuracy": accuracy,
+        "model_variant": model_variant,
+        "last_predict_sec": None,
+        "predicting": False,
+        "predict_start_sec": None,
+        "prices": None,
+        "config_summary": "",
+        "tp_sl": tp_sl,
+        "uptime_sec": uptime_sec,
+        "now_sec": now_sec,
+        "last_updated": "",
+    }
+
+
+def _fill_status_note(v: dict, status: TradeState, trades: list[dict]) -> None:
+    """运行状态说明：按持仓/挂单/本窗口平仓/信号状态生成状态文案。"""
+    # 当前窗口是否已有平仓记录（trades.csv 按时间追加，最后一条匹配的即最近）
+    window_trade = None
+    for row in trades:
+        try:
+            if int(row["window_start"]) == status.window_start:
+                window_trade = row
+        except (KeyError, ValueError, TypeError):
+            continue
+    if v["position"] is not None:
+        v["status_note"] = "持仓中"
+    elif v["pending"] is not None:
+        v["status_note"] = "挂单中（等回调）"
+    elif window_trade is not None:
+        # 本窗口已平仓：按实际离场原因显示（止盈/止损/时间止损/结算）
+        v["status_note"] = EXIT_LABELS.get(window_trade.get("reason"), "已平仓")
+    elif v["signal_note"].startswith("买入方向"):
+        v["status_note"] = "挂单已撤（窗口未成交）"
+    elif v["signal_note"]:
+        v["status_note"] = "观望（未达阈值）"
+
+
+def _aggregate_trades(trades: list[dict], match=None) -> dict:
+    """聚合交易统计（笔数/胜败/盈亏/最大亏损）；坏行跳过，不让视图退化。
+
+    match(row) 返回 False 的行不计入（如今日过滤）；None 表示全部交易。
+    """
+    agg = {"n": 0, "wins": 0, "losses": 0, "gain": 0.0, "loss": 0.0,
+           "max_loss": 0.0, "pnl": 0.0}
+    for row in trades:
+        try:  # 坏行（半写/空行/缺字段）跳过
+            if match is not None and not match(row):
+                continue
+            p = float(row["pnl"])
+            agg["n"] += 1
+            agg["pnl"] += p
+            if p > 0:
+                agg["wins"] += 1
+                agg["gain"] += p
+            else:
+                agg["losses"] += 1
+                agg["loss"] += p
+                agg["max_loss"] = min(agg["max_loss"], p)
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+    return agg
+
+
+def _fill_trades(v: dict, trades: list[dict], today: str, tz) -> None:
+    """今日统计/最近交易/全部交易统计（坏行跳过，不让视图退化）。"""
+    today_stats = _aggregate_trades(
+        trades,
+        match=lambda row: _parse_ts(row["ts"]).astimezone(tz).strftime("%Y-%m-%d") == today,
+    )
+    v["today_pnl"] = round(today_stats["pnl"], 4)
+    v["today_trades"] = today_stats["n"]
+    v["today_stats"] = today_stats if today_stats["n"] else None
+    recent = []
+    for row in trades[-RECENT_LIMIT:]:
+        try:
+            recent.append(
+                {
+                    "ts": _fmt_ts(row["ts"]),
+                    "direction": row["direction"],
+                    "entry": float(row["entry_price"]),
+                    "exit": float(row["exit_price"]),
+                    "pnl": round(float(row["pnl"]), 4),
+                    "reason": row["reason"],
+                }
+            )
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+    v["recent_trades"] = recent
+
+
+def build_view(status: TradeState | None, trades: list[dict], accuracy: dict | None,
+               now_sec: int, today: str | None = None, local_tz=None,
+               panel: PanelConfig | None = None) -> dict:
+    """从 TradeState / trades / PredictionLog 构建视图数据（纯函数）。
+
+    today 注入 UTC 日期串（YYYY-MM-DD），测试可固定时钟；
+    local_tz 注入显示时区（默认 None = 系统本地时区）；
+    panel 注入面板展示配置（模型变体/下注阈值/窗口长度/配置摘要/止盈止损/运行时长）。
+    """
+    today = today or _today_local()
+    tz = local_tz  # None → astimezone 用系统本地时区
+    panel = panel or PanelConfig()
+    th = panel.thresholds or {"p_up_buy": 0.60, "p_down_buy": 0.40}
+    v = _view_defaults(accuracy, panel.model_variant, panel.tp_sl, panel.uptime_sec,
+                       now_sec, panel.config_summary)
+    if status:
+        v["symbol"] = status.symbol
+        ws = status.window_start
+        if ws:
+            start = datetime.fromtimestamp(ws, tz=timezone.utc).astimezone(tz)
+            end = start + timedelta(seconds=panel.window_seconds)
+            v["window_label"] = f"{start:%m-%d %H:%M}-{end:%H:%M}"
+            v["window_remaining_sec"] = max(0, int(start.timestamp() + panel.window_seconds - now_sec))
+        if status.signal:
+            s = status.signal
+            v["signal"] = {"direction": s.direction.value, "p_up": s.p_up}
+            p_up = v["signal"]["p_up"]
+            if p_up is not None:
+                if p_up > th["p_up_buy"]:
+                    v["signal_note"] = "买入方向：up"
+                elif p_up < th["p_down_buy"]:
+                    v["signal_note"] = "买入方向：down"
+                else:
+                    v["signal_note"] = "未达阈值，跳过"
+        if status.pending_order:
+            p = status.pending_order
+            v["pending"] = {"direction": p.direction.value, "price": p.price, "size": p.size}
+        if status.position:
+            p = status.position
+            v["position"] = {"direction": p.direction.value, "entry_price": p.entry_price, "size": p.size}
+            if panel.tp_sl:
+                # 持仓动态止盈/止损价（与 engine 同一公式源，防漂移）
+                tp, sl = position_exit_levels(
+                    p.entry_price, panel.tp_sl["pct"], panel.tp_sl["sl"], tp_max=panel.tp_sl["max"],
+                )
+                v["position"]["tp_price"] = tp
+                v["position"]["sl_price"] = sl if sl > 0 else None
+        v["paused"] = bool(status.paused)
+        v["pause_reason"] = status.pause_reason
+        v["consecutive_losses"] = status.consecutive_losses
+        v["daily_loss"] = status.daily_loss
+        v["last_predict_sec"] = status.last_predict_sec
+        v["predicting"] = bool(status.predicting)
+        v["predict_start_sec"] = status.predict_start_sec
+        v["prices"] = status.market_prices
+        v["config_summary"] = panel.config_summary
+        _fill_status_note(v, status, trades)
+
+    _fill_trades(v, trades, today, tz)
+    # 交易记录统计：全部交易（笔数/胜率/盈亏/盈利与亏损分计/最大亏损），非仅最近显示的行
+    total = _aggregate_trades(trades)
+    v["recent_stats"] = total if total["n"] else None
+    v["last_updated"] = datetime.now(timezone.utc).astimezone(tz).strftime("%H:%M:%S")
+    return v
+
+
+def _fmt_uptime(sec: int | None) -> str:
+    """秒 → HH:MM:SS（None → --:--:--）。"""
+    if sec is None:
+        return "--:--:--"
+    h, r = divmod(int(sec), 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def render(v: dict) -> str:
+    """渲染为纯文本面板（rich 负责着色，此处保证结构）。"""
+    lines = ["=" * 62, "PMBOT 运行状态", "=" * 62]
+    if v["config_summary"]:
+        lines.append(f"配置: {v['config_summary']}")
+    lines.append(
+        f"标的: {v['symbol']}    暂停: {'⚠️ 是（' + v['pause_reason'] + '）' if v['paused'] and v['pause_reason'] else ('⚠️ 是' if v['paused'] else '否')}"
+    )
+    if v["predicting"]:
+        secs = v["now_sec"] - v["predict_start_sec"] if v["predict_start_sec"] else 0
+        kronos_state = f"🔄 推理中（已 {max(0, secs)} 秒）"
+    else:
+        inferred = v["last_predict_sec"] or v["signal"] is not None  # 有信号即已推理（兼容旧 status）
+        kronos_state = "✅ 已推理" if inferred else "⏳ 等待首次推理"
+    lines.append(f"模型: {v['model_variant']}    Kronos: {kronos_state}")
+    if v["last_predict_sec"]:
+        t = datetime.fromtimestamp(v["last_predict_sec"], tz=timezone.utc).astimezone(None)
+        lines.append(f"上次预测: {t:%m-%d %H:%M:%S}（本地）")
+    lines.append(f"当前窗口: {v['window_label']}")
+    prices = v["prices"]
+    if prices:
+        def fmt(x):
+            # 美分单位（×100）：与 Polymarket web 盘口 55/45 风格对齐
+            return f"{x * 100:.0f}" if x is not None else "—"
+
+        lines.append(f"盘口 UP: {fmt(prices.get('up_bid'))}/{fmt(prices.get('up_ask'))}  "
+                     f"DOWN: {fmt(prices.get('down_bid'))}/{fmt(prices.get('down_ask'))}（买/卖）")
+    rem = v["window_remaining_sec"]
+    lines.append(f"窗口剩余: {f'{rem // 60}分{rem % 60:02d}秒' if rem is not None else '—'}")
+    sig = v["signal"]
+    if sig:
+        note = f" [{v['signal_note']}]" if v["signal_note"] else ""
+        lines.append(f"信号: {sig['direction'].upper()} (P(up)={sig['p_up']:.2f}){note}")
+    if v["status_note"]:
+        lines.append(f"状态: {v['status_note']}")
+    else:
+        lines.append("信号: —")
+    pend = v["pending"]
+    if pend:
+        lines.append(f"挂单: {pend['direction'].upper()} {pend['size'] or '?'}股 @{pend['price'] * 100:.0f}")
+    else:
+        lines.append("挂单: —")
+    pos = v["position"]
+    if pos:
+        prices = v["prices"] or {}
+        mark = prices.get(f"{pos['direction']}_bid")
+        line = f"持仓: {pos['direction'].upper()} {pos['size']:.2f}股 @{pos['entry_price'] * 100:.0f}"
+        if mark is not None:
+            pnl = (mark - pos["entry_price"]) * pos["size"]
+            line += f"  现价 {mark * 100:.0f}  浮动 {pnl:+.2f}"
+        if pos.get("tp_price"):
+            line += f"  止盈 {pos['tp_price'] * 100:.0f}"
+        if pos.get("sl_price"):
+            line += f"  止损 {pos['sl_price'] * 100:.0f}"
+        lines.append(line)
+    else:
+        lines.append("持仓: —")
+    lines.append(f"连亏: {v['consecutive_losses']} 笔")
+    lines.append("-" * 62)
+    ts = v["today_stats"]
+    if ts:
+        lines.append(
+            f"今日: {ts['pnl']:+.2f} USDC（{ts['n']} 笔 · 胜率 {ts['wins'] / ts['n']:.0%} · "
+            f"盈利 {ts['wins']} 笔 +{ts['gain']:.2f} · 亏损 {ts['losses']} 笔 {ts['loss']:.2f} · "
+            f"最大亏损 {ts['max_loss']:.2f}）"
+        )
+    else:
+        lines.append(f"今日: {v['today_pnl']:+.2f} USDC（{v['today_trades']} 笔）")
+    lines.append("-" * 62)
+    rs = v["recent_stats"]
+    if rs:
+        lines.append(
+            f"交易记录（{rs['n']} 笔 · 胜率 {rs['wins'] / rs['n']:.0%} · 盈亏 {rs['pnl']:+.2f} USDC · "
+            f"盈利 {rs['wins']} 笔 +{rs['gain']:.2f} · 亏损 {rs['losses']} 笔 {rs['loss']:.2f} · "
+            f"最大亏损 {rs['max_loss']:.2f}）:"
+        )
+    else:
+        lines.append("交易记录:")
+    if v["recent_trades"]:
+        for t in v["recent_trades"]:
+            lines.append(
+                f"  {t['ts']}  {t['direction'].upper():4} 入{t['entry'] * 100:.0f} 出{t['exit'] * 100:.0f} "
+                f"{t['pnl']:+.2f}  {EXIT_LABELS.get(t['reason'], t['reason'])}"
+            )
+    else:
+        lines.append("  （暂无）")
+    acc = v["accuracy"]
+    if acc and acc["total"]:
+        lines.append(f"方向准确率: {acc['accuracy']:.1%} ({acc['correct']}/{acc['total']})")
+    else:
+        lines.append("方向准确率: —（暂无评估样本）")
+    lines.append(f"运行时长 {_fmt_uptime(v['uptime_sec'])}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="PMBOT 终端监控面板（只读）")
+    parser.add_argument("--status", default="data/status.json")
+    parser.add_argument("--trades", default="data/trades.csv")
+    parser.add_argument("--symbol", default=None, help="预测日志标的（默认取 status 的 symbol）")
+    parser.add_argument("--log-dir", default="data", help="预测日志目录")
+    parser.add_argument("--refresh", type=float, default=REFRESH_SEC, help="刷新间隔秒（默认 1.0）")
+    args = parser.parse_args(argv)
+
+    from rich.console import Console
+    from rich.live import Live
+
+    console = Console()
+    console.print("[bold cyan]PMBOT 监控面板启动（Ctrl-C 退出）[/]")
+    t_start = time.monotonic()
+    try:
+        with Live(console=console, refresh_per_second=1 / args.refresh, screen=False) as live:
+            while True:
+                try:
+                    st = StateStore(args.status).load()
+                    if st is not None:
+                        book = _read_book_prices()
+                        if book is not None:
+                            st.market_prices = book
+                    trades = []
+                    tp = Path(args.trades)
+                    if tp.is_file():
+                        with open(tp, encoding="utf-8") as f:
+                            trades = list(csv.DictReader(f))
+
+                    symbol = args.symbol or (st.symbol if st else None)
+                    from pmbot.config import load_config
+                    from pmbot.prediction_log import PredictionLog
+
+                    model_variant = "—"
+                    thresholds = None
+                    window_seconds = WINDOW_SECONDS
+                    config_summary = ""
+                    tp_sl = None
+                    try:
+                        cfg = load_config("config.yaml")
+                        model_variant = cfg.model_variant
+                        thresholds = {"p_up_buy": cfg.p_up_buy, "p_down_buy": cfg.p_down_buy}
+                        window_seconds = step_ms_for(cfg.market_interval) // 1000
+                        tp_sl = {"pct": cfg.take_profit, "max": cfg.take_profit_max, "sl": cfg.stop_loss}
+                        config_summary = (
+                            f"{cfg.strategy} | {','.join(cfg.symbols)} | {cfg.market_interval} | "
+                            f"注{cfg.amount_per_trade} | 止盈+{cfg.take_profit * 100:.0f}%（封顶{cfg.take_profit_max:.2f}） | "
+                            f"止损-{cfg.stop_loss * 100:.0f}% | "
+                            f"窗口末平仓{cfg.exit_before_end_sec}s | 时间止损{cfg.time_stop_min}min"
+                        )
+                    except Exception:
+                        pass
+                    acc = PredictionLog(args.log_dir, symbol).accuracy() if symbol else None
+                    v = build_view(st, trades, acc, now_sec=int(time.time()),
+                                   panel=PanelConfig(
+                                       model_variant=model_variant, thresholds=thresholds,
+                                       window_seconds=window_seconds, config_summary=config_summary,
+                                       tp_sl=tp_sl, uptime_sec=int(time.monotonic() - t_start)))
+                    live.update(render(v))
+                except Exception as e:  # 只读面板：任何异常都不崩溃，显示错误继续
+                    live.update(f"读取失败: {e}")
+                time.sleep(args.refresh)
+    except KeyboardInterrupt:
+        console.print("\n[dim]监控退出[/]")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

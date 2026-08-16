@@ -1,0 +1,67 @@
+"""一键启动器测试：主循环子进程 + 面板编排。"""
+
+import subprocess
+
+import pytest
+
+
+def test_start_bot_spawns_run_and_stops(monkeypatch):
+    """start_bot 启动主循环子进程；面板退出（KeyboardInterrupt）后停子进程。"""
+    from pmbot import start_bot
+
+    proc = {"terminated": False}
+
+    class FakeProc:
+        pid = 12345
+
+        def terminate(self):
+            proc["terminated"] = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: (calls.append((a, kw)), FakeProc())[1])
+
+    def fake_monitor(argv=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("pmbot.monitor.main", fake_monitor)
+    monkeypatch.setattr("pmbot.run.main", lambda *a, **kw: None)
+
+    assert start_bot.main(["--dry-run"]) == 0
+    assert calls, "应启动主循环子进程"
+    assert proc["terminated"], "面板退出后应终止主循环"
+
+
+def test_run_with_guard_order_and_cleanup(monkeypatch):
+    """run_with_guard: 杀旧→注册→执行→注销（含异常路径）。"""
+    import pmbot.single_instance as si
+
+    calls = []
+
+    class FakeGuard:
+        def __init__(self, *a, **kw):
+            pass
+
+        def kill_old(self, role):
+            calls.append(f"kill:{role}")
+
+        def register(self, role):
+            calls.append(f"reg:{role}")
+
+        def unregister(self, role):
+            calls.append(f"unreg:{role}")
+
+    monkeypatch.setattr(si, "InstanceGuard", FakeGuard)
+    result = si.run_with_guard("run", lambda: 42)
+    assert result == 42
+    assert calls == ["kill:run", "reg:run", "unreg:run"]
+
+    # 异常路径也注销
+    calls.clear()
+    try:
+        si.run_with_guard("run", lambda: 1 / 0)
+    except ZeroDivisionError:
+        pass
+    assert calls == ["kill:run", "reg:run", "unreg:run"]

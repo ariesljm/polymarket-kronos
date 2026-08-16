@@ -1,0 +1,43 @@
+[project]
+name = "pmbot"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "einops>=0.8.2",
+    "huggingface-hub>=1.27.0",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "py-clob-client-v2>=1.1.0",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+    "safetensors>=0.8.0",
+    "scipy>=1.18.0",
+    "torch>=2.0",
+    "websockets>=17.0.1",
+]
+
+# GPU 推理：torch 走 CUDA 12.6 源（GTX 1060/Pascal 不支持 CUDA 13；
+# cu126 wheel 兼容 sm_50+，含 Pascal）。无 GPU 主机仍可装 cpu 版。
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pmbot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
