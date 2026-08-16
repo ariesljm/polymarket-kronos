@@ -11,9 +11,10 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pmbot.clob_executor import ClobExecutor
+from pmbot.clob_executor import OrderPlacer
 from pmbot.config import Config
 from pmbot.constants import window_end_sec, window_start_sec
+from pmbot.control import read_control
 from pmbot.engine import decide
 from pmbot.market_discovery import MarketDiscovery, MarketInfo
 from pmbot.market_lifecycle import MarketLifecycle, Phase
@@ -33,6 +34,9 @@ from pmbot.user_stream import UserStream
 
 logger = logging.getLogger(__name__)
 
+# 钱包余额刷新间隔（秒）：余额变化慢，低频查询避免无谓 RPC
+BALANCE_REFRESH_SEC = 30
+
 
 class TradingLoop:
     def __init__(
@@ -41,10 +45,11 @@ class TradingLoop:
         symbol: str,
         strategy: Strategy,
         discovery: MarketDiscovery,
-        executor: ClobExecutor,
+        executor: OrderPlacer,
         state: TradeState,
         trades_path: str | Path = "data/trades.csv",
         status_path: str | Path = "data/status.json",
+        control_path: str | Path = "data/control.json",
         dry_run: bool = True,
         settle_timeout_sec: int = 1800,
         poll_sec: int = 10,
@@ -58,12 +63,14 @@ class TradingLoop:
         self.state = state
         self.trades_path = Path(trades_path)
         self.status_path = Path(status_path)
+        self.control_path = Path(control_path)
         self._store = StateStore(status_path, trades_path)
         self.dry_run = dry_run
         self.settle_timeout_sec = settle_timeout_sec
         self.poll_sec = poll_sec
         self.user_stream = user_stream
         self._lifecycle: MarketLifecycle | None = None
+        self._last_balance_sec = 0
 
     # ---- 对外入口 ----
 
@@ -97,9 +104,12 @@ class TradingLoop:
         logger.info("优雅停机完成")
 
     def tick(self, now_ms: int) -> None:
-        """引擎 tick：日界/熔断 → 窗口切换编排 → 当前生命周期推进。"""
+        """引擎 tick：控制指令 → 日界/熔断 → 窗口切换编排 → 当前生命周期推进。"""
+        if self._consume_control():
+            return  # stop 指令：本 tick 不再交易，循环随即优雅停机
         st = self.state
         now_sec = now_ms // 1000
+        self._refresh_balance(now_sec)
         day = datetime.fromtimestamp(now_sec, tz=timezone.utc).strftime("%Y-%m-%d")
         st.roll_day(day)
         self._drain_user_events()
@@ -153,6 +163,49 @@ class TradingLoop:
             lc.start(now_sec, market)
         lc.tick(now_sec, market)
 
+    def _consume_control(self) -> bool:
+        """消费面板控制指令（resume/reset/stop）；返回 True 表示本 tick 应提前结束。"""
+        cmd = read_control(self.control_path)
+        if cmd is None:
+            return False
+        st = self.state
+        if cmd == "resume":
+            st.paused = False
+            st.was_paused = False
+            st.consecutive_losses = 0
+            st.daily_loss = 0.0
+            st.pause_reason = None
+            self.save_status()
+            logger.info("控制指令：恢复运行（熔断计数已清零）")
+            return False
+        if cmd == "reset":
+            if not self.dry_run:
+                # 实盘禁止清除：抹掉交易历史/统计 + 丢弃真实持仓跟踪
+                logger.warning("控制指令 reset：实盘模式拒绝清除数据（保护交易历史与持仓管理）")
+                return False
+            if st.position is not None:
+                # 丢弃持仓跟踪（Polymarket Up/Down 结算自动兑付，不丢资金）：
+                # 防止“停止后持仓不平仓 → 永远无法清除”的死锁
+                logger.warning("控制指令 reset：存在持仓（%s %.2f 股），丢弃持仓跟踪（结算自动兑付）",
+                               st.position.direction.value, st.position.size)
+            reset = getattr(self.strategy, "reset_runtime_data", None)
+            if reset:
+                reset()
+            if self.trades_path.is_file():
+                self.trades_path.unlink()
+            self.state = TradeState(symbol=self.symbol, mode=self.state.mode)  # 保留运行模式标记
+            self.save_status()
+            logger.warning("控制指令：已清除数据并重建状态（symbol=%s）", self.symbol)
+            return False
+        if cmd == "stop":
+            # 防御：--once/测试路径无 run_forever 的 _shutdown 初始化
+            if not hasattr(self, "_shutdown"):
+                self._shutdown = False
+            self._shutdown = True
+            logger.info("控制指令：停止主循环（优雅停机）")
+            return True
+        return False
+
     def shutdown(self, now_sec: int) -> None:
         """优雅停机：撤遗留挂单 → 结算已到期持仓 → 落盘。
 
@@ -202,6 +255,11 @@ class TradingLoop:
         return False
 
     # ---- 内部 ----
+
+    @property
+    def step_sec(self) -> int:
+        """窗口步长（秒），lifecycle 计算剩余时间用。"""
+        return self.discovery.step_ms // 1000
 
     def _window_end_sec(self, now_sec: int) -> int:
         step = self.discovery.step_ms // 1000
@@ -262,7 +320,10 @@ class TradingLoop:
                 logger.info("WS 订单撤销确认：%s", oid)
                 st.pending_order = None
         elif etype == "trade":
-            # 真实模式：卖出持仓成交 → 立即结算（推送级止盈止损响应）
+            # 外部卖出兜底（用户在网页/其他工具卖出持仓）：本地持仓记录清理。
+            # 正常路径 _exec_sell 已同步平仓（position=None），此处不会触发；
+            # 窗口内 outcome_prices 未结算时 _settle 会等待，窗口结束后按
+            # 结算价清理本地记录（余额差 PnL 仍含真实卖出收益）。
             side = data.get("side", "").upper()
             if side == "SELL" and st.position is not None and not self.dry_run:
                 logger.info("WS 卖出成交：%s", data.get("id", ""))
@@ -306,13 +367,31 @@ class TradingLoop:
             size=float(pending.size),
             entered_remaining_sec=self._window_end_sec(now_sec) - now_sec,
             window_start=st.window_start,
+            entry_balance=self._query_balance() if not self.dry_run else None,
         )
         st.pending_order = None
         logger.info("挂单成交：%s @ %.2f，建立持仓", pending.direction, entry)
 
+    def _refresh_balance(self, now_sec: int) -> None:
+        """定时刷新钱包余额快照（面板展示）；查询失败保留旧值。"""
+        if now_sec - self._last_balance_sec < BALANCE_REFRESH_SEC:
+            return
+        self._last_balance_sec = now_sec
+        b = self._query_balance()
+        if b is not None and b != self.state.balance:
+            self.state.balance = b
+            self.save_status()
+
+    def _query_balance(self) -> float | None:
+        """查询钱包余额；无凭证/网络失败返回 None（静默，不刷屏）。"""
+        try:
+            return self.executor.collateral_balance()
+        except Exception:
+            return None
+
     def _subscribe_sampler(self, market: MarketInfo) -> None:
         """BookSampler 订阅当前窗口 token（高频采样线程）。"""
-        sampler = getattr(self.executor, "_sampler", None)
+        sampler = self.executor.sampler
         if sampler is not None:
             sampler.subscribe(
                 [market.yes_token_id, market.no_token_id],
@@ -346,22 +425,29 @@ class TradingLoop:
         if ask is None:
             logger.warning("市价买入跳过：盘口无报价 %s", token[:16])
             return  # 不置 flag，下 tick 重试
-        # 每次买入 1 USDC（份额 = 金额/盘口价，可小数，无 5 股限制）
-        size = action.amount / ask
-        self.executor.market_buy(token, size)
+        # 目标份额 = 金额/盘口价（真实成交以 API 返回为准，本值仅作回退）
+        target_size = action.amount / ask
+        filled = self.executor.market_buy(token, action.amount)
+        if filled is None:
+            logger.warning("市价买入失败（无成交数据）：%s，下 tick 重试", token[:16])
+            return  # 不置 flag、不建仓：防假持仓
+        entry = filled.get("avg_price") or ask
+        size = filled.get("filled_size") or target_size
         st.position = Position(
             direction=action.direction,
-            entry_price=ask,
+            entry_price=entry,
             size=size,
             entered_remaining_sec=self._window_end_sec(now_sec) - now_sec,
             window_start=st.window_start,
+            entry_balance=self._query_balance() if not self.dry_run else None,
         )
         st.window_bet_placed = True
         # 立即落盘：防下单后崩溃导致同窗口重启重复下单
         self.save_status()
+        src = "API" if filled.get("avg_price") and filled.get("filled_size") else "盘口估算"
         logger.info(
-            "市价买入：%s %s %.4f 股 @ %.3f (成本 %.2f USDC)",
-            token[:16], action.direction.value, size, ask, size * ask,
+            "市价买入：%s %s %.4f 股 @ %.3f (成本 %.2f USDC, 数据源 %s)",
+            token[:16], action.direction.value, size, entry, size * entry, src,
         )
 
     def _exec_cancel(self, action: Action) -> None:
@@ -380,18 +466,7 @@ class TradingLoop:
         exit_price = self.executor.market_sell(token, pos.size)
         if exit_price is None:
             exit_price = self.executor.best_bid(token) or 0.0
-        pnl = st.close_position(exit_price)
-        self._store.log_trade(
-            st,
-            window_start=pos.window_start,
-            direction=pos.direction,
-            entry_price=pos.entry_price,
-            exit_price=exit_price,
-            size=pos.size,
-            pnl=pnl,
-            reason=action.reason or "sell",
-        )
-        logger.info("平仓（%s）：@ %.3f，盈亏 %.4f", action.reason, exit_price, pnl)
+        self._close_position(pos, exit_price, action.reason or "sell")
 
     def _exec_pause(self, action: Action) -> None:
         st = self.state
@@ -407,6 +482,17 @@ class TradingLoop:
         pos = st.position
         market = self.discovery.find_window(self.symbol, pos.window_start, require_tradable=False)
         if market is None:
+            # 清除负缓存：首次查询可能网络瞬时失败，让下一 tick 重新查询（防结算死循环）
+            invalidate = getattr(self.discovery, "invalidate", None)
+            if invalidate:
+                invalidate(self.symbol, pos.window_start, require_tradable=False)
+            if now_sec > pos.window_start + self.discovery.step_ms // 1000 + self.settle_timeout_sec:
+                # 超时仍不可达：丢弃持仓跟踪（Polymarket 结算自动兑付，不丢资金）
+                logger.warning("窗口 %d 结算市场持续不可达（超过 %ds），丢弃持仓跟踪",
+                               pos.window_start, self.settle_timeout_sec)
+                st.position = None
+                self.save_status()
+                return
             logger.info("窗口 %d 结算价未就绪，等待下一 tick", pos.window_start)
             return
         settle_price = (
@@ -418,7 +504,13 @@ class TradingLoop:
         if 0 < settle_price < 1 and now_sec <= pos.window_start + self.discovery.step_ms // 1000 + self.settle_timeout_sec:
             logger.info("窗口 %d 尚未结算（价格 %.3f），等待", pos.window_start, settle_price)
             return
-        pnl = st.close_position(settle_price)
+        exit_balance = self._query_balance()
+        actual = (
+            exit_balance - pos.entry_balance
+            if (exit_balance is not None and pos.entry_balance is not None)
+            else None
+        )
+        pnl = st.close_position(settle_price, actual_pnl=actual)
         self._store.log_trade(
             st,
             window_start=pos.window_start,
@@ -429,7 +521,42 @@ class TradingLoop:
             pnl=pnl,
             reason="settle",
         )
-        logger.info("窗口 %d 结算：%s @ %.2f，盈亏 %.4f", pos.window_start, pos.direction.value, settle_price, pnl)
+        logger.info("窗口 %d 结算：%s @ %.2f，盈亏 %.4f%s",
+                    pos.window_start, pos.direction.value, settle_price, pnl,
+                    "（余额差值）" if actual is not None else "（理论价差）")
+
+    def _close_position(self, pos: Position, exit_price: float, reason: str) -> float:
+        """平仓共用路径（卖出/结算）：余额差 PnL 优先（含滑点/手续费），
+
+        查询失败回退理论价差；调用 state.close_position 兑现并更新熔断计数，
+        最后记账 + 日志。两条路径只提供 exit 价来源与 reason。
+
+        dry-run 不真实下单、钱包余额不变，余额差恒为 0——一律用理论价差。
+        """
+        st = self.state
+        actual = None
+        if not self.dry_run:
+            exit_balance = self._query_balance()
+            actual = (
+                exit_balance - pos.entry_balance
+                if (exit_balance is not None and pos.entry_balance is not None)
+                else None
+            )
+        pnl = st.close_position(exit_price, actual_pnl=actual)
+        self._store.log_trade(
+            st,
+            window_start=pos.window_start,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            size=pos.size,
+            pnl=pnl,
+            reason=reason,
+        )
+        logger.info("平仓（%s）：%s @ %.3f，盈亏 %.4f%s",
+                    reason, pos.direction.value, exit_price, pnl,
+                    "（余额差值）" if actual is not None else "（理论价差）")
+        return pnl
 
     def save_status(self) -> None:
         self._store.save(self.state)

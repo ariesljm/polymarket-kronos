@@ -30,6 +30,27 @@ class SamplerProto(Protocol):
     def snapshot(self, token_id: str) -> dict | None: ...
 
 
+class OrderPlacer(Protocol):
+    """执行器公开面：主循环/生命周期唯一依赖的下单能力。
+
+    两个适配器：ClobExecutor（实盘）与 SimExecutor（dry-run 模拟）。
+    """
+
+    def market_buy(self, token_id: str, amount: float) -> dict | None: ...
+    def market_sell(self, token_id: str, size: float) -> float | None: ...
+    def place_limit(self, token_id: str, side: str, price: float, size: float) -> str | None: ...
+    def sell(self, token_id: str, size: float, price: float) -> str | None: ...
+    def cancel(self, order_id: str) -> bool: ...
+    def get_order(self, order_id: str) -> dict | None: ...
+    def best_ask(self, token_id: str) -> float | None: ...
+    def best_bid(self, token_id: str) -> float | None: ...
+    def collateral_balance(self) -> float | None: ...
+    def fetch_book(self, token_id: str) -> dict: ...
+    def api_auth(self) -> dict | None: ...
+    def attach_sampler(self, sampler: SamplerProto) -> None: ...
+    def sampler(self) -> SamplerProto | None: ...
+
+
 def min_shares_for_price(price: float) -> float:
     """满足 Polymarket 订单规则的最小股数：≥5 股且金额 ≥$1。"""
     import math
@@ -38,10 +59,11 @@ def min_shares_for_price(price: float) -> float:
 
 
 class ClobExecutor:
+    """实盘执行器：Polymarket CLOB 下单/撤单/卖出/盘口/余额。"""
+
     def __init__(
         self,
         private_key: str | None = None,
-        dry_run: bool = False,
         creds_cache: str = "data/clob_creds.json",
         chain_id: int = 137,  # Polygon 主网；Amoy 测试网 80002
         proxy_wallet: str | None = None,
@@ -58,7 +80,6 @@ class ClobExecutor:
         load_dotenv()
         self._pk = private_key or os.environ.get("PRIVATE_KEY")
         self._proxy_wallet = proxy_wallet or os.environ.get("PROXY_WALLET")
-        self._dry_run = dry_run
         self._chain_id = chain_id
         self._creds_cache = Path(creds_cache)
         self._client = None
@@ -70,8 +91,9 @@ class ClobExecutor:
         return self._sampler.snapshot(token_id) if self._sampler else None
 
     @property
-    def dry_run(self) -> bool:
-        return self._dry_run
+    def sampler(self) -> SamplerProto | None:
+        """当前采样器引用（主循环订阅市场用；无采样器返回 None）。"""
+        return self._sampler
 
     def attach_sampler(self, sampler: SamplerProto) -> None:
         """挂载 BookSampler（盘口快照优先读内存，REST 兜底）。"""
@@ -173,15 +195,12 @@ class ClobExecutor:
         )
 
     def place_limit(self, token_id: str, side: str, price: float, size: float) -> str | None:
-        """挂限价单。side: 'buy'/'sell'。返回 order_id（dry-run 返回模拟 id）。"""
+        """挂限价单。side: 'buy'/'sell'。返回 order_id。"""
         if size < MIN_ORDER_SIZE or size * price < MIN_ORDER_AMOUNT:
             raise ValueError(
                 f"订单不满足 Polymarket 规则：size={size} (最小 {MIN_ORDER_SIZE} 股)，"
                 f"金额={size * price:.2f} (最小 ${MIN_ORDER_AMOUNT})"
             )
-        if self._dry_run:
-            print(f"[dry-run] 挂单 {side.upper()} {size} @ {price} token={token_id[:16]}...")
-            return f"dry-run-{token_id[:8]}"
         if side.lower() not in ("buy", "sell"):
             raise ValueError(f"side 必须是 buy/sell，实际: {side!r}")
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
@@ -200,17 +219,19 @@ class ClobExecutor:
         """限价卖出持仓（止盈/止损）。"""
         return self.place_limit(token_id, "sell", price, size)
 
-    def market_buy(self, token_id: str, size: float) -> str | None:
-        """市价买入（FOK，按份额立即成交，可小数；无 5 股限制）。返回 order_id。"""
-        if self._dry_run:
-            print(f"[dry-run] 市价买 {size:.4f} 股 token={token_id[:16]}...")
-            return f"dry-run-{token_id[:8]}"
+    def market_buy(self, token_id: str, amount: float) -> dict | None:
+        """市价买入（FOK）。amount 为美元金额（SDK 语义：BUY=$$$）。
+
+        返回真实成交数据 {"order_id", "avg_price", "filled_size"}：优先取订单响应
+        的 averagePrice/matchedAmount，缺省时用 get_order 补查（以 API 为准，
+        不靠本地盘口估算）；仍取不到时字段为 None（调用方回退）。下单失败返回 None。
+        """
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
 
         resp = self._get_client().create_and_post_market_order(
             order_args=MarketOrderArgs(
                 token_id=token_id,
-                amount=size,  # BUY: 股数
+                amount=amount,  # BUY: 美元金额（SDK 语义）
                 side=Side.BUY,
                 order_type=OrderType.FOK,
             ),
@@ -219,14 +240,32 @@ class ClobExecutor:
         if not resp:
             logger.warning("市价买入失败：无响应 token=%s", token_id[:16])
             return None
-        logger.info("市价买入：%s %.4f 股，订单 %s", token_id[:16], size, resp)
-        return resp
+        logger.info("市价买入响应：%s", resp)
+        return self._parse_fill(resp)
+
+    def _parse_fill(self, resp: dict) -> dict:
+        """从订单响应/详情提取真实成交（均价/份额）；缺失字段为 None。"""
+        oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
+        avg = resp.get("averagePrice") or resp.get("avg_price") or resp.get("price")
+        filled = resp.get("matchedAmount") or resp.get("matched_amount")
+        if (avg is None or filled is None) and oid:
+            try:  # 响应缺成交字段 → 订单详情补查（一次 RPC）
+                detail = self.get_order(oid)
+                if isinstance(detail, dict):
+                    avg = avg or detail.get("averagePrice") or detail.get("avg_price")
+                    filled = filled or detail.get("matchedAmount") or detail.get("matched_amount")
+            except Exception:
+                pass
+        def _f(x):
+            try:
+                return float(x) if x is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        return {"order_id": oid, "avg_price": _f(avg), "filled_size": _f(filled)}
 
     def market_sell(self, token_id: str, size: float) -> float | None:
-        """市价卖出持仓（FOK），返回成交价近似；dry-run 返回 best_bid。"""
-        if self._dry_run:
-            print(f"[dry-run] 市价卖 {size:.4f} 股 token={token_id[:16]}...")
-            return self.best_bid(token_id)
+        """市价卖出持仓（FOK），返回成交价近似；取不到由调用方回退 best_bid。"""
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
 
         resp = self._get_client().create_and_post_market_order(
@@ -254,11 +293,6 @@ class ClobExecutor:
         return self._get_client().get_order(order_id)
 
     def cancel(self, order_id: str) -> bool:
-        if self._dry_run:
-            print(f"[dry-run] 撤单 {order_id}")
-            return True
-        if order_id.startswith("dry-run-"):
-            return True
         try:
             from py_clob_client_v2 import OrderPayload
 
@@ -295,3 +329,88 @@ class ClobExecutor:
             except Exception:
                 return None
         return weighted_price(book, "asks", size=5)
+
+
+class SimExecutor:
+    """dry-run 执行器：打印指令、按盘口模拟成交，不碰真实订单。
+
+    盘口/凭证/采样器能力委托内部 live 实例（不暴露下单面）。
+    """
+
+    def __init__(
+        self,
+        private_key: str | None = None,
+        creds_cache: str = "data/clob_creds.json",
+        chain_id: int = 137,
+        proxy_wallet: str | None = None,
+        sampler: SamplerProto | None = None,
+    ):
+        self._live = ClobExecutor(
+            private_key=private_key,
+            creds_cache=creds_cache,
+            chain_id=chain_id,
+            proxy_wallet=proxy_wallet,
+            sampler=sampler,
+        )
+
+    # ---- 委托：盘口 / 凭证 / 采样器 ----
+
+    @property
+    def sampler(self) -> SamplerProto | None:
+        return self._live.sampler
+
+    def attach_sampler(self, sampler: SamplerProto) -> None:
+        self._live.attach_sampler(sampler)
+
+    def fetch_book(self, token_id: str) -> dict:
+        return self._live.fetch_book(token_id)
+
+    def api_auth(self) -> dict | None:
+        return self._live.api_auth()
+
+    def best_ask(self, token_id: str) -> float | None:
+        return self._live.best_ask(token_id)
+
+    def best_bid(self, token_id: str) -> float | None:
+        return self._live.best_bid(token_id)
+
+    # ---- 模拟下单 ----
+
+    def collateral_balance(self) -> float | None:
+        """真实钱包余额（dry-run 仅展示用；主循环 dry-run 下 PnL 不用它）。"""
+        return self._live.collateral_balance()
+
+    def place_limit(self, token_id: str, side: str, price: float, size: float) -> str | None:
+        """模拟挂限价单：规则校验与实盘一致，返回模拟 id。"""
+        if size < MIN_ORDER_SIZE or size * price < MIN_ORDER_AMOUNT:
+            raise ValueError(
+                f"订单不满足 Polymarket 规则：size={size} (最小 {MIN_ORDER_SIZE} 股)，"
+                f"金额={size * price:.2f} (最小 ${MIN_ORDER_AMOUNT})"
+            )
+        print(f"[dry-run] 挂单 {side.upper()} {size} @ {price} token={token_id[:16]}...")
+        return f"dry-run-{token_id[:8]}"
+
+    def sell(self, token_id: str, size: float, price: float) -> str | None:
+        return self.place_limit(token_id, "sell", price, size)
+
+    def market_buy(self, token_id: str, amount: float) -> dict | None:
+        """模拟市价买入：按 best_ask 估算成交（结构与实盘 _parse_fill 一致）。"""
+        ask = self.best_ask(token_id)
+        if ask is None:
+            return {"order_id": f"dry-run-{token_id[:8]}", "avg_price": None, "filled_size": None}
+        return {
+            "order_id": f"dry-run-{token_id[:8]}",
+            "avg_price": ask,
+            "filled_size": amount / ask,
+        }
+
+    def market_sell(self, token_id: str, size: float) -> float | None:
+        print(f"[dry-run] 市价卖 {size:.4f} 股 token={token_id[:16]}...")
+        return self.best_bid(token_id)
+
+    def get_order(self, order_id: str) -> dict | None:
+        return None  # 模拟无真实订单
+
+    def cancel(self, order_id: str) -> bool:
+        print(f"[dry-run] 撤单 {order_id}")
+        return True

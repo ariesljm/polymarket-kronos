@@ -102,6 +102,14 @@ class MarketDiscovery:
         self._cache[key] = result
         return result
 
+    def invalidate(self, symbol: str, window_start: int, require_tradable: bool = True) -> None:
+        """清除指定窗口的查询缓存（含负缓存 None）。
+
+        _settle 首次查询网络失败会把 None 永久缓存导致结算死循环，
+        失败后清除缓存让下一 tick 重新查询。
+        """
+        self._cache.pop((symbol, window_start, require_tradable), None)
+
     def _fetch_window(self, symbol: str, window_start: int, require_tradable: bool):
         """实际查询 gamma（被 find_window 缓存包裹，同窗口只查一次）。"""
         slug = self._slug_for(symbol, window_start)

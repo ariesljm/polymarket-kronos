@@ -21,6 +21,7 @@ import logging
 from enum import Enum
 from typing import Protocol
 
+from pmbot.config import Config
 from pmbot.market_discovery import MarketInfo
 from pmbot.state import TradeState
 from pmbot.strategy import Strategy
@@ -52,6 +53,8 @@ class LifecycleDeps(Protocol):
     state: TradeState
     strategy: Strategy
     executor: CancelExecutor
+    config: Config
+    step_sec: int  # 窗口步长（秒）
 
     def refresh_pending(self, market: MarketInfo, now_sec: int) -> None: ...
     def build_view(self, market: MarketInfo, now_sec: int) -> MarketView: ...
@@ -75,6 +78,12 @@ class MarketLifecycle:
         """INIT → RUNNING：生成窗口信号（若本窗口尚未生成）。"""
         st = self.deps.state
         if st.signal is None:
+            remaining = self.window_start + self.deps.step_sec - now_sec
+            if remaining <= self.deps.config.no_entry_before_end_sec:
+                # 窗口末禁入：中途启动时剩余不足不推理，保持 INIT 等窗口切换
+                logger.info("窗口 %d 剩余 %ds ≤ 禁入阈值 %ds，跳过推理等待下一窗口",
+                            self.window_start, remaining, self.deps.config.no_entry_before_end_sec)
+                return
             st.predicting = True
             st.predict_start_sec = now_sec
             self.deps.save_status()  # 推理开始即落盘（面板可实时显示）

@@ -1,7 +1,7 @@
 """CLI：生成验证报告。
 
-用法: uv run python -m pmbot.report [--config config.yaml]
-从 data/trades.csv 与方向准确率记录生成三指标验证报告。
+用法: uv run python -m pmbot.report [--config config.yaml] [--data-dir data]
+从 trades.csv 与方向准确率记录生成三指标验证报告（实盘用 --data-dir data_live）。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成验证报告")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    parser.add_argument("--data-dir", default="data", help="数据目录（实盘用 data_live）")
     parser.add_argument("--out", default="data/report.md", help="报告输出路径")
     args = parser.parse_args(argv)
 
@@ -22,8 +23,8 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     symbol = cfg.symbols[0]
-    acc = PredictionLog("data", symbol).accuracy()
-    stats = compute_stats("data/trades.csv", acc)
+    acc = PredictionLog(args.data_dir, symbol).accuracy()
+    stats = compute_stats(f"{args.data_dir}/trades.csv", acc)
     params = {
         "amount_per_trade": cfg.amount_per_trade,
         "p_up_buy": cfg.p_up_buy,

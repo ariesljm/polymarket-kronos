@@ -7,7 +7,7 @@ import pytest
 
 from datetime import datetime, timedelta, timezone
 
-from pmbot.monitor import PanelConfig, build_view
+from pmbot.monitor import PanelConfig, SpotPrice, build_view
 from pmbot.state import Position, TradeState
 from pmbot.types import Direction, PendingOrder, Signal
 
@@ -78,64 +78,64 @@ TODAY = "2026-08-14"
 def test_view_extracts_status_fields():
     v = build_view(status_dict(), trades_rows(), {"correct": 35, "total": 60, "accuracy": 0.583},
                    now_sec=WINDOW_START + 60, today=TODAY, local_tz=timezone.utc, panel=PanelConfig(model_variant="kronos-small"))
-    assert v["symbol"] == "BTC"
-    assert v["window_label"] == "08-14 03:30-03:45"
-    assert v["window_remaining_sec"] == 900 - 60
-    assert v["signal"] == {"direction": "up", "p_up": 0.63}
-    assert v["pending"] == {"direction": "up", "price": 0.45, "size": 5.0}
-    assert v["position"] == {"direction": "up", "entry_price": 0.45, "size": 5.0}
-    assert v["paused"] is False
-    assert v["consecutive_losses"] == 2
-    assert v["daily_loss"] == 4.5
-    assert v["last_predict_sec"] == WINDOW_START + 30
-    assert v["model_variant"] == "kronos-small"  # 注入
+    assert v.symbol == "BTC"
+    assert v.window_label == "08-14 03:30-03:45"
+    assert v.window_remaining_sec == 900 - 60
+    assert v.signal == {"direction": "up", "p_up": 0.63}
+    assert v.pending == {"direction": "up", "price": 0.45, "size": 5.0}
+    assert v.position == {"direction": "up", "entry_price": 0.45, "size": 5.0}
+    assert v.paused is False
+    assert v.consecutive_losses == 2
+    assert v.daily_loss == 4.5
+    assert v.last_predict_sec == WINDOW_START + 30
+    assert v.model_variant == "kronos-small"  # 注入
 
 
 def test_view_missing_status_safe():
     v = build_view(None, trades_rows(), None, now_sec=WINDOW_START)
-    assert v["symbol"] == "—"
-    assert v["window_label"] == "—"
-    assert v["window_remaining_sec"] is None
-    assert v["signal"] is None
-    assert v["position"] is None
-    assert v["paused"] is False
-    assert v["consecutive_losses"] == 0
+    assert v.symbol == "—"
+    assert v.window_label == "—"
+    assert v.window_remaining_sec is None
+    assert v.signal is None
+    assert v.position is None
+    assert v.paused is False
+    assert v.consecutive_losses == 0
 
 
 def test_view_partial_status_no_position():
     st = status_dict(position=None, pending_order=None, signal=None)
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START)
-    assert v["position"] is None
-    assert v["pending"] is None
-    assert v["signal"] is None
+    assert v.position is None
+    assert v.pending is None
+    assert v.signal is None
 
 
 def test_today_stats_and_recent_trades():
     rows = trades_rows(n=4, pnl=0.55) + trades_rows(n=1, pnl=-2.25)
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)  # noqa: E501
     # 4×0.55 - 2.25 = -0.05
-    assert v["today_pnl"] == -0.05
-    assert v["today_trades"] == 5
-    assert len(v["recent_trades"]) == 5  # 截断 5 条
+    assert v.today_pnl == -0.05
+    assert v.today_trades == 5
+    assert len(v.recent_trades) == 5  # 截断 5 条
 
 
 def test_recent_trades_truncated():
     rows = trades_rows(n=8)
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START)
-    assert len(v["recent_trades"]) == 5
-    assert v["recent_trades"][0]["pnl"] == 0.55
+    assert len(v.recent_trades) == 5
+    assert v.recent_trades[0]["pnl"] == 0.55
 
 
 def test_accuracy_passthrough():
     acc = {"correct": 35, "total": 60, "accuracy": 0.583}
     v = build_view(status_dict(), trades_rows(), acc, now_sec=WINDOW_START)
-    assert v["accuracy"] == acc
+    assert v.accuracy == acc
 
 
 def test_paused_flag():
     v = build_view(status_dict(paused=True), trades_rows(), None, now_sec=WINDOW_START)
-    assert v["paused"] is True
-    assert v["pause_reason"] is None
+    assert v.paused is True
+    assert v.pause_reason is None
 
 
 def test_pause_reason_shown():
@@ -170,8 +170,8 @@ def test_bad_rows_skipped():
     """坏行（缺字段）不影响视图，只跳过。"""
     rows = trades_rows(n=2) + [{"ts": None, "direction": "up", "pnl": "x"}, {"bad": "row"}]
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)
-    assert v["today_trades"] == 2  # 坏行被跳过
-    assert len(v["recent_trades"]) == 2
+    assert v.today_trades == 2  # 坏行被跳过
+    assert len(v.recent_trades) == 2
 
 
 def test_signal_note_thresholds():
@@ -180,15 +180,15 @@ def test_signal_note_thresholds():
     # 中间地带 → 跳过
     v = build_view(status_dict(signal={"direction": "up", "p_up": 0.55}), trades_rows(), None,
                    now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(model_variant="kronos-small", thresholds=th))
-    assert v["signal_note"] == "未达阈值，跳过"
+    assert v.signal_note == "未达阈值，跳过"
     # 高信心看涨 → 买入方向：up
     st = status_dict(signal={"direction": "up", "p_up": 0.63})
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(thresholds=th))
-    assert v["signal_note"] == "买入方向：up"
+    assert v.signal_note == "买入方向：up"
     # 高信心看跌 → 买入方向：down
     st = status_dict(signal={"direction": "down", "p_up": 0.35})
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(thresholds=th))
-    assert v["signal_note"] == "买入方向：down"
+    assert v.signal_note == "买入方向：down"
 
 
 def test_render_shows_signal_note():
@@ -218,23 +218,23 @@ def test_waiting_for_pullback_note():
     v = build_view(status_dict(pending_order=None, position=None), [], None,
                    now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(thresholds={"p_up_buy": 0.60, "p_down_buy": 0.40}))
-    assert v["status_note"] == "挂单已撤（窗口未成交）"
+    assert v.status_note == "挂单已撤（窗口未成交）"
     # 候选 + 有挂单 → 挂单中
     v = build_view(status_dict(position=None), trades_rows(), None,
                    now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(thresholds={"p_up_buy": 0.60, "p_down_buy": 0.40}))
-    assert v["status_note"] == "挂单中（等回调）"
+    assert v.status_note == "挂单中（等回调）"
     # 持仓 → 持仓中
     v = build_view(status_dict(pending_order=None, position={"direction": "up", "entry_price": 0.37, "size": 5.0,
                   "entered_remaining_sec": 300, "window_start": WINDOW_START}), trades_rows(), None,
                    now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(thresholds={"p_up_buy": 0.60, "p_down_buy": 0.40}))
-    assert v["status_note"] == "持仓中"
+    assert v.status_note == "持仓中"
     # 未达阈值 → 观望
     v = build_view(status_dict(signal={"direction": "up", "p_up": 0.55}, position=None, pending_order=None),
                    [], None, now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(thresholds={"p_up_buy": 0.60, "p_down_buy": 0.40}))
-    assert v["status_note"] == "观望（未达阈值）"
+    assert v.status_note == "观望（未达阈值）"
 
 
 def test_status_note_shows_actual_exit_reason():
@@ -247,7 +247,7 @@ def test_status_note_shows_actual_exit_reason():
         rows[-1]["reason"] = reason
         v = build_view(status_dict(pending_order=None, position=None), rows, None,
                        now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(thresholds=th))
-        assert v["status_note"] == label, reason
+        assert v.status_note == label, reason
 
 
 def test_status_note_other_window_trade_does_not_apply():
@@ -257,7 +257,7 @@ def test_status_note_other_window_trade_does_not_apply():
     v = build_view(status_dict(pending_order=None, position=None), rows, None,
                    now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(thresholds={"p_up_buy": 0.60, "p_down_buy": 0.40}))
-    assert v["status_note"] == "挂单已撤（窗口未成交）"
+    assert v.status_note == "挂单已撤（窗口未成交）"
 
 
 def test_view_market_prices():
@@ -265,7 +265,7 @@ def test_view_market_prices():
 
     st = status_dict(market_prices={"up_ask": 0.16, "up_bid": 0.15, "down_ask": 0.86, "down_bid": 0.85})
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY)
-    assert v["prices"]["up_ask"] == 0.16
+    assert v.prices["up_ask"] == 0.16
     text = render(v)
     assert "盘口 UP: 15/16" in text
     assert "DOWN: 85/86" in text
@@ -273,7 +273,7 @@ def test_view_market_prices():
 
 def test_view_market_prices_missing_safe():
     v = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START, today=TODAY)
-    assert v["prices"] is None
+    assert v.prices is None
 
 
 def test_position_line_shows_mark_and_floating_pnl():
@@ -366,26 +366,26 @@ def test_trade_records_stats_all_trades():
 
     rows = trades_rows(8, pnl=0.55)  # 8 笔 > 显示上限 5 行
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)
-    assert v["recent_stats"]["n"] == 8  # 全量，非最近 5 行
-    assert v["recent_stats"]["wins"] == 8
-    assert v["recent_stats"]["losses"] == 0
-    assert v["recent_stats"]["gain"] == pytest.approx(4.40)
-    assert v["recent_stats"]["loss"] == pytest.approx(0.0)
-    assert v["recent_stats"]["max_loss"] == pytest.approx(0.0)
-    assert v["recent_stats"]["pnl"] == pytest.approx(4.40)
-    assert len(v["recent_trades"]) == 5  # 显示行仍取最近 5 条
+    assert v.recent_stats["n"] == 8  # 全量，非最近 5 行
+    assert v.recent_stats["wins"] == 8
+    assert v.recent_stats["losses"] == 0
+    assert v.recent_stats["gain"] == pytest.approx(4.40)
+    assert v.recent_stats["loss"] == pytest.approx(0.0)
+    assert v.recent_stats["max_loss"] == pytest.approx(0.0)
+    assert v.recent_stats["pnl"] == pytest.approx(4.40)
+    assert len(v.recent_trades) == 5  # 显示行仍取最近 5 条
     text = render(v)
     assert "交易记录（8 笔 · 胜率 100% · 盈亏 +4.40 USDC · 盈利 8 笔 +4.40 · 亏损 0 笔 0.00 · 最大亏损 0.00）:" in text
 
     rows = trades_rows(3, pnl=0.55) + trades_rows(1, pnl=-0.25)
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)
-    assert v["recent_stats"]["n"] == 4
-    assert v["recent_stats"]["wins"] == 3
-    assert v["recent_stats"]["losses"] == 1
-    assert v["recent_stats"]["gain"] == pytest.approx(1.65)
-    assert v["recent_stats"]["loss"] == pytest.approx(-0.25)
-    assert v["recent_stats"]["max_loss"] == pytest.approx(-0.25)
-    assert v["recent_stats"]["pnl"] == pytest.approx(1.40)  # 3×0.55 − 0.25
+    assert v.recent_stats["n"] == 4
+    assert v.recent_stats["wins"] == 3
+    assert v.recent_stats["losses"] == 1
+    assert v.recent_stats["gain"] == pytest.approx(1.65)
+    assert v.recent_stats["loss"] == pytest.approx(-0.25)
+    assert v.recent_stats["max_loss"] == pytest.approx(-0.25)
+    assert v.recent_stats["pnl"] == pytest.approx(1.40)  # 3×0.55 − 0.25
     text = render(v)
     assert "交易记录（4 笔 · 胜率 75% · 盈亏 +1.40 USDC · 盈利 3 笔 +1.65 · 亏损 1 笔 -0.25 · 最大亏损 -0.25）:" in text
 
@@ -398,7 +398,7 @@ def test_today_line_shows_win_loss_breakdown():
     rows += trades_rows(1, pnl=-0.30)  # 1 笔亏损 -0.30
     rows += trades_rows(1, pnl=-0.10)  # 1 笔亏损 -0.10
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)
-    ts = v["today_stats"]
+    ts = v.today_stats
     assert ts["n"] == 7
     assert ts["wins"] == 5
     assert ts["losses"] == 2
@@ -415,7 +415,7 @@ def test_today_line_plain_when_no_trades():
     from pmbot.monitor import render
 
     v = build_view(status_dict(), [], None, now_sec=WINDOW_START, today=TODAY)
-    assert v["today_stats"] is None
+    assert v.today_stats is None
     text = render(v)
     assert "今日: +0.00 USDC（0 笔）" in text
 
@@ -425,7 +425,7 @@ def test_recent_trades_stats_hidden_when_empty():
     from pmbot.monitor import render
 
     v = build_view(status_dict(), [], None, now_sec=WINDOW_START, today=TODAY)
-    assert v["recent_stats"] is None
+    assert v.recent_stats is None
     text = render(v)
     assert "交易记录:" in text
     assert "胜率" not in text
@@ -471,8 +471,8 @@ def test_window_label_uses_injected_interval():
     """5m 窗口标签与剩余秒按注入的窗口长度计算。"""
     v = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START + 60,
                    today=TODAY, local_tz=timezone.utc, panel=PanelConfig(window_seconds=300))
-    assert v["window_label"] == "08-14 03:30-03:35"
-    assert v["window_remaining_sec"] == 300 - 60
+    assert v.window_label == "08-14 03:30-03:35"
+    assert v.window_remaining_sec == 300 - 60
 
 
 def test_render_shows_config_summary():
@@ -523,3 +523,77 @@ def test_read_book_prices_stale_or_missing(tmp_path, monkeypatch):
     assert _read_book_prices() is None
     p.unlink()
     assert _read_book_prices() is None
+
+
+def test_recent_limit_none_returns_all_trades():
+    rows = trades_rows(n=8)
+    v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, recent_limit=None)
+    assert len(v.recent_trades) == 8  # Web 控制台全量
+
+
+def test_recent_limit_default_truncated():
+    rows = trades_rows(n=8)
+    v = build_view(status_dict(), rows, None, now_sec=WINDOW_START)
+    assert len(v.recent_trades) == 5
+
+
+def test_recent_trade_has_chinese_label():
+    rows = trades_rows(n=1)
+    rows[0]["reason"] = "take_profit"
+    v = build_view(status_dict(), rows, None, now_sec=WINDOW_START)
+    assert v.recent_trades[0]["label"] == "已止盈"
+
+
+def test_fmt_cents_low_price_keeps_precision():
+    """0.1 美分价格不得显示为 0（如 entry=0.001 → 0.10 美分）。"""
+    from pmbot.monitor import _fmt_cents
+
+    assert _fmt_cents(0.001) == "0.10"
+    assert _fmt_cents(0.008) == "0.80"
+    assert _fmt_cents(0.01) == "1"
+    assert _fmt_cents(0.45) == "45"
+    assert _fmt_cents(0.8) == "80"
+
+
+def test_render_trade_low_entry_shows_fractional_cents():
+    """交易行低入场价显示小数美分（入0.10 而非入0）。"""
+    from pmbot.monitor import render
+
+    rows = trades_rows(n=1)
+    rows[0].update({"entry_price": 0.001, "exit_price": 0.8, "pnl": 799.0, "reason": "take_profit"})
+    v = build_view(status_dict(), rows, None, now_sec=WINDOW_START)
+    text = render(v)
+    assert "入0.10 出80" in text
+    assert "入0 " not in text
+
+
+def test_position_carries_tp_sl_percent_source():
+    """持仓止盈止损同时携带百分比来源（web 显示标注用）。"""
+    v = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START,
+                   panel=PanelConfig(tp_sl={"pct": 0.50, "max": 0.90, "sl": 0.60}))
+    pos = v.position
+    assert pos["tp_price"] == 0.45 * 1.50
+    assert pos["tp_pct"] == 0.50
+    assert pos["sl_pct"] == 0.60
+
+
+def test_view_carries_spot_price():
+    """视图携带交易品种实时价快照（web 顶栏渲染用）。"""
+    v = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START,
+                   panel=PanelConfig(spot={"price": 2345.67, "delta": 12.3}))
+    assert v.spot == {"price": 2345.67, "delta": 12.3}
+    v2 = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START)
+    assert v2.spot is None
+
+
+def test_spot_price_snapshot_and_delta():
+    """SpotPrice 快照与涨跌差值（首次拉取后无 delta，之后有）。"""
+    sp = SpotPrice()
+    assert sp.snapshot() is None  # 尚未拉取
+    sp._price = 2000.0
+    sp._delta = 0.0
+    assert sp.snapshot() == {"price": 2000.0, "delta": 0.0}
+    sp._tick = lambda: None  # 防线程启动干扰
+    sp._price = 2010.0
+    sp._delta = 10.0
+    assert sp.snapshot() == {"price": 2010.0, "delta": 10.0}

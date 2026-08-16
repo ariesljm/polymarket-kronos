@@ -33,7 +33,13 @@ class KronosStrategy(Strategy):
         max_klines: int = 2048,
         variant: str = "kronos-mini",
         interval: str = "15m",
+        thresholds: dict | None = None,
     ):
+        """thresholds: {"p_up_buy", "p_down_buy"} 交易阈值；提供时只有达到阈值
+
+        的信号（引擎会交易的）才记录进方向准确率评估——中间带信号接近
+        抛硬币，不交易也不计样本；None 时全部记录（回测/测试兼容）。
+        """
         self.data_source = data_source or BinanceDataSource(
             KlineStore(log_dir, timeframe=interval), max_klines=max_klines, timeframe=interval
         )
@@ -44,6 +50,7 @@ class KronosStrategy(Strategy):
         self.symbol = symbol
         self.sample_count = sample_count
         self.variant = variant
+        self.thresholds = thresholds
 
     def generate_signal(self, context: SignalContext | None = None) -> Signal:
         now_ms = (context or {}).get("now_ms") or int(time.time() * 1000)
@@ -62,10 +69,23 @@ class KronosStrategy(Strategy):
         current = float(df["close"].iloc[-1])
         p_up = sum(1 for p in preds if p > current) / len(preds)
         direction = Direction.UP if p_up > 0.5 else Direction.DOWN
-        # 记录"预测目标 K 线"的时间戳（= 最后闭合 + 步长），即预测窗口开始时间
-        target_ts = int(df["timestamp"].iloc[-1]) + step_ms_for(self.data_source.timeframe)
-        self.log.record(target_ts, direction, p_up, current)
+        # 只有达交易阈值的信号才记录（引擎会用它交易）：中间带信号接近
+        # 抛硬币，计入评估会持续拉低方向准确率（与交易无关的噪声样本）。
+        tradeable = (
+            self.thresholds is None
+            or p_up > self.thresholds["p_up_buy"]
+            or p_up < self.thresholds["p_down_buy"]
+        )
+        if tradeable:
+            # 记录"预测目标 K 线"的时间戳（= 最后闭合 + 步长），即预测窗口开始时间
+            target_ts = int(df["timestamp"].iloc[-1]) + step_ms_for(self.data_source.timeframe)
+            self.log.record(target_ts, direction, p_up, current)
         return Signal(direction=direction, p_up=p_up)
+
+    def reset_runtime_data(self) -> None:
+        """清除本策略的 K 线与预测记录（下次信号生成自动回填）。"""
+        self.log.reset()
+        self.data_source.store.reset(self.symbol)
 
     def _get_real_predictor(self):
         if self._real_predictor is None:

@@ -40,7 +40,7 @@ def decide(config: Config, state: StateView, market: MarketView, signal: Signal)
         # 每窗口每标的最多一注
         return Action(ActionType.SKIP)
 
-    return _maybe_enter(config, signal, market.best_ask)
+    return _maybe_enter(config, signal, market.best_ask, market.remaining_sec)
 
 
 def _manage_position(config: Config, position: Position, best_bid: float | None, remaining_sec: int) -> Action:
@@ -53,10 +53,12 @@ def _manage_position(config: Config, position: Position, best_bid: float | None,
     )
     if best_bid >= tp:
         return Action(ActionType.SELL, reason="take_profit")
-    if remaining_sec <= config.exit_before_end_sec:
-        # 窗口结束前：盈利持仓 → 持有到结算；亏损 → 市价止损
-        if best_bid <= position.entry_price:
-            return Action(ActionType.SELL, reason="window_end")
+    # 窗口末两条独立规则:
+    # 1) 亏损：窗口结束前 exit_loss_before_end_sec 内浮亏 → 市价离场
+    if remaining_sec <= config.exit_loss_before_end_sec and best_bid <= position.entry_price:
+        return Action(ActionType.SELL, reason="window_end")
+    # 2) 盈利：窗口结束前 hold_until_end_sec 内浮盈 → 持有到结算
+    if remaining_sec <= config.hold_until_end_sec and best_bid > position.entry_price:
         return Action(ActionType.SKIP)
     if best_bid <= sl:
         return Action(ActionType.SELL, reason="stop_loss")
@@ -66,8 +68,11 @@ def _manage_position(config: Config, position: Position, best_bid: float | None,
     return Action(ActionType.SKIP)
 
 
-def _maybe_enter(config: Config, signal: Signal, best_ask: float | None) -> Action:
+def _maybe_enter(config: Config, signal: Signal, best_ask: float | None, remaining_sec: int) -> Action:
     if signal.direction is Direction.SKIP:
+        return Action(ActionType.SKIP)
+    # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓）
+    if remaining_sec <= config.no_entry_before_end_sec:
         return Action(ActionType.SKIP)
     # 市价入场：预测后立即按 1 USDC 目标买入（份额=金额/盘口价，可小数，无 5 股限制）
     if signal.direction is Direction.UP and signal.p_up > config.p_up_buy:

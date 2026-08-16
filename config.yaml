@@ -10,10 +10,12 @@ kronos:
                               # （市价单无 5 股限制；如盘口价 0.2 → 5 股 = 1 USDC）
   p_up_buy: 0.55             # P(up) 高于此值买 Up；低于 1−此值（0.45）自动买 Down，无需另配
   cancel_before_end_sec: 60   # 挂单未成交时窗口结束前 N 秒撤单（当前市价模式不产生新挂单，仅兼容旧状态恢复）
-  exit_before_end_sec: 60     # 窗口结束前 N 秒：亏损则市价止损，盈利则持有到结算
-  take_profit: 0.50          # 百分比止盈：入场价 +50% 卖出（如入场 0.50 → 0.75）
+  exit_loss_before_end_sec: 30   # 窗口结束前 N 秒内浮亏 → 市价平仓离场（0 = 关闭）
+  hold_until_end_sec: 80         # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
+  no_entry_before_end_sec: 60  # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓；0 = 关闭）
+  take_profit: 0.5          # 百分比止盈：入场价 +50% 卖出（如入场 0.50 → 0.75）
   take_profit_max: 0.90      # 止盈封顶价：算出的止盈价 > 此值则按此价止盈（如入场 0.80 → 1.04 → 0.90）
-  stop_loss: 0.60            # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
+  stop_loss: 0            # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
   time_stop_min: 4           # 窗口过 N 分钟未盈利则时间止损（5m 窗口 = 4 分钟）
   max_consecutive_losses: 5 # 连亏 N 笔熔断
   max_daily_loss: 10         # 单日亏损 N USDC 熔断

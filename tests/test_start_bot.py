@@ -21,9 +21,27 @@ def test_start_bot_spawns_run_and_stops(monkeypatch):
             return 0
 
     calls = []
+    monitor_calls = []
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: (calls.append((a, kw)), FakeProc())[1])
 
+    # 单实例守护隔离：不检测/不杀真实运行中的 bot（避免测试碰真实 bot.pids 与进程）
+    class FakeGuard:
+        def __init__(self, *a, **kw):
+            pass
+
+        def kill_old(self, role):
+            pass
+
+        def register(self, role):
+            pass
+
+        def unregister(self, role):
+            pass
+
+    monkeypatch.setattr("pmbot.single_instance.InstanceGuard", FakeGuard)
+
     def fake_monitor(argv=None):
+        monitor_calls.append(argv)
         raise KeyboardInterrupt
 
     monkeypatch.setattr("pmbot.monitor.main", fake_monitor)
@@ -32,6 +50,8 @@ def test_start_bot_spawns_run_and_stops(monkeypatch):
     assert start_bot.main(["--dry-run"]) == 0
     assert calls, "应启动主循环子进程"
     assert proc["terminated"], "面板退出后应终止主循环"
+    # 面板以 web-only 模式启动（不渲染终端面板，浏览器打开 Web 控制台）
+    assert monitor_calls == [["--dry-run", "--config", "config.yaml", "--web-only", "--data-dir", "data"]]
 
 
 def test_run_with_guard_order_and_cleanup(monkeypatch):

@@ -45,6 +45,8 @@ class TradeState:
     predicting: bool = False
     predict_start_sec: int | None = None
     market_prices: dict | None = None
+    balance: float | None = None  # 钱包余额快照（主循环定时刷新，供面板显示）
+    mode: str = ""  # 运行模式标记："dry-run"/"live"（空 = 旧数据，不校验）
 
     def roll_window(self, window_start: int) -> None:
         """窗口切换：重置本窗口下注标记与挂单（持仓不应跨窗口，结算兜底）。"""
@@ -61,12 +63,15 @@ class TradeState:
             self.daily_loss = 0.0
             self.last_day = day
 
-    def close_position(self, settle_price: float) -> float:
-        """按结算/平仓价兑现持仓，返回盈亏；更新熔断计数。"""
+    def close_position(self, settle_price: float, actual_pnl: float | None = None) -> float:
+        """按结算/平仓价兑现持仓，返回盈亏；更新熔断计数。
+
+        actual_pnl 非 None 时用它（实盘余额差值，含滑点/手续费）；否则理论价差。
+        """
         pos = self.position
         if pos is None:
             return 0.0
-        pnl = pos.size * (settle_price - pos.entry_price)
+        pnl = actual_pnl if actual_pnl is not None else pos.size * (settle_price - pos.entry_price)
         self.position = None
         if pnl < 0:
             self.consecutive_losses += 1
@@ -102,10 +107,14 @@ class StateStore:
             "暂停/熔断后恢复：把 paused 改为 false 并重启 start_bot.bat。"
             "字段含义：paused=熔断暂停；daily_loss=当日累计亏损；"
             "consecutive_losses=连亏笔数；window_bet_placed=当前窗口已下注；"
-            "signal=最近一次 Kronos 信号；position=当前持仓（无持仓为 null）。"
+            "signal=最近一次 Kronos 信号；position=当前持仓（无持仓为 null）；"
+            "balance=钱包余额快照（实盘时定时刷新）；mode=运行模式（dry-run/live）。"
         )
-        self.status_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        from pmbot.fileio import atomic_write_text
+
+        atomic_write_text(
+            self.status_path,
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
         )
 
     def load(self) -> TradeState | None:
@@ -118,12 +127,14 @@ class StateStore:
         if "symbol" not in data:
             return None
         if data.get("position"):
+            pos = data["position"]
             data["position"] = Position(
-                direction=Direction(data["position"]["direction"]),
-                entry_price=float(data["position"]["entry_price"]),
-                size=float(data["position"]["size"]),
-                entered_remaining_sec=int(data["position"]["entered_remaining_sec"]),
-                window_start=int(data["position"]["window_start"]),
+                direction=Direction(pos["direction"]),
+                entry_price=float(pos["entry_price"]),
+                size=float(pos["size"]),
+                entered_remaining_sec=int(pos["entered_remaining_sec"]),
+                window_start=int(pos["window_start"]),
+                entry_balance=float(pos["entry_balance"]) if pos.get("entry_balance") is not None else None,
             )
         if data.get("pending_order"):
             po = data["pending_order"]

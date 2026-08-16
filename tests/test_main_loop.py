@@ -26,7 +26,8 @@ CFG = Config(
     p_up_buy=0.60,
     p_down_buy=0.40,
     cancel_before_end_sec=180,
-    exit_before_end_sec=30,
+    exit_loss_before_end_sec=30,
+    hold_until_end_sec=60,
     take_profit=0.30,
     take_profit_max=0.95,
     stop_loss=0.20,
@@ -56,12 +57,16 @@ class FakeDiscovery:
     def __init__(self, market=None, settled=None):
         self.market = market
         self.settled = settled
+        self.invalidated = []
 
     def find_current_window(self, symbol, now_ms):
         return self.market
 
     def find_window(self, symbol, window_start, require_tradable=True):
         return self.settled
+
+    def invalidate(self, symbol, window_start, require_tradable=True):
+        self.invalidated.append((symbol, window_start, require_tradable))
 
 
 class FakeExecutor:
@@ -70,6 +75,14 @@ class FakeExecutor:
         self.filled = False
         self.best_bid_value = None
         self.best_ask_value = 0.42
+        self._sampler = None
+
+    @property
+    def sampler(self):
+        return self._sampler
+
+    def attach_sampler(self, sampler):
+        self._sampler = sampler
 
     def place_limit(self, token_id, side, price, size):
         self.calls.append(("place", token_id, side, price, size))
@@ -83,9 +96,12 @@ class FakeExecutor:
         self.calls.append(("sell", token_id, size))
         return self.best_bid_value
 
-    def market_buy(self, token_id, size):
-        self.calls.append(("market_buy", token_id, size))
-        return "dry-run-mk"
+    def market_buy(self, token_id, amount):
+        self.calls.append(("market_buy", token_id, amount))
+        ask = self.best_ask(token_id)
+        if ask is None:
+            return None
+        return {"order_id": "dry-run-mk", "avg_price": ask, "filled_size": amount / ask}
 
     def best_bid(self, token_id):
         return self.best_bid_value
@@ -113,10 +129,10 @@ def make_market(price=0.5):
 
 
 def make_loop(tmp_path, *, state=None, strategy=None, discovery=None, executor=None,
-              user_stream=None):
+              user_stream=None, config=None, dry_run=True):
     st = state or TradeState(symbol="BTC", window_start=None)
     return TradingLoop(
-        config=CFG,
+        config=config or CFG,
         symbol="BTC",
         strategy=strategy or FakeStrategy(Signal(Direction.UP, 0.70)),
         discovery=discovery or FakeDiscovery(make_market()),
@@ -124,7 +140,7 @@ def make_loop(tmp_path, *, state=None, strategy=None, discovery=None, executor=N
         state=st,
         trades_path=Path(tmp_path) / "trades.csv",
         status_path=Path(tmp_path) / "status.json",
-        dry_run=True,
+        dry_run=dry_run,
         user_stream=user_stream,
     )
 
@@ -144,9 +160,9 @@ def test_strong_signal_buys_market(tmp_path):
     loop = make_loop(tmp_path, executor=ex)
     loop.tick(now_ms=1_000_000_000)
     assert ex.calls and ex.calls[0][0] == "market_buy"
-    _, token, size = ex.calls[0]
+    _, token, amount = ex.calls[0]
     assert token == "YES"  # up 方向买 yes
-    assert abs(size - 1 / 0.42) < 1e-9  # 1 USDC / ask
+    assert abs(amount - 1.0) < 1e-9  # 市价单金额语义：1 USDC（SDK: BUY=$$$）
     assert loop.state.window_bet_placed is True
     assert loop.state.pending_order is None  # 市价单立即成交，无挂单
     assert loop.state.position is not None
@@ -161,9 +177,9 @@ def test_low_ask_enlarges_shares_to_1usdc_target(tmp_path):
     loop = make_loop(tmp_path, executor=ex)
     loop.tick(now_ms=1_000_000_000)
     assert ex.calls and ex.calls[0][0] == "market_buy"
-    _, token, size = ex.calls[0]
+    _, token, amount = ex.calls[0]
     assert token == "YES"
-    assert abs(size - 10) < 1e-9  # 1/0.1 = 10 股 ≈ 1 USDC
+    assert abs(amount - 1.0) < 1e-9  # 金额 1 USDC，份额由 API 成交返回
     assert loop.state.position is not None
     assert loop.state.position.entry_price == 0.10
     assert abs(loop.state.position.size - 10) < 1e-9
@@ -827,10 +843,221 @@ def test_market_buy_020_holds_1usdc_with_5_shares(tmp_path):
     ex.best_ask_value = 0.20
     loop = make_loop(tmp_path, executor=ex)
     loop.tick(now_ms=1_000_000_000)
-    _, token, size = ex.calls[0]
+    _, token, amount = ex.calls[0]
     assert token == "YES"
-    assert abs(size - 5) < 1e-9  # 1/0.2 = 5 股
+    assert abs(amount - 1.0) < 1e-9  # 1 USDC 金额
     assert loop.state.position is not None
     assert loop.state.position.entry_price == 0.20
-    assert abs(loop.state.position.size - 5) < 1e-9
+    assert abs(loop.state.position.size - 5) < 1e-9  # API 成交份额 1/0.2 = 5 股
     assert abs(loop.state.position.size * loop.state.position.entry_price - 1.0) < 1e-9
+
+
+# ---- 面板控制指令（control.json）----
+
+def _patch_control(tmp_path, monkeypatch, cmd):
+    """把主循环的 read_control 指向 tmp 下的指令文件并写入 cmd。"""
+    import pmbot.control as control_mod
+    from pmbot.main_loop import read_control as _rc
+
+    p = tmp_path / "control.json"
+    control_mod.write_control(cmd, p)
+    monkeypatch.setattr("pmbot.main_loop.read_control",
+                        lambda path: _rc(p))
+    return p
+
+
+def test_control_resume_clears_circuit_breaker(tmp_path, monkeypatch):
+    st = TradeState(symbol="BTC", window_start=999_900, paused=True,
+                    pause_reason="连亏熔断", consecutive_losses=5, daily_loss=3.0)
+    loop = make_loop(tmp_path, state=st)
+    _patch_control(tmp_path, monkeypatch, "resume")
+    loop.tick(now_ms=1_000_000_000)
+    assert st.paused is False
+    assert st.pause_reason is None
+    assert st.consecutive_losses == 0
+    assert st.daily_loss == 0.0
+    assert st.was_paused is False
+
+
+def test_control_reset_without_position_wipes_state(tmp_path, monkeypatch):
+    st = TradeState(symbol="BTC", window_start=999_900, daily_loss=4.0,
+                    consecutive_losses=2, window_bet_placed=True, last_day="2026-08-14")
+    loop = make_loop(tmp_path, state=st)
+    trades = tmp_path / "trades.csv"
+    trades.write_text("ts\nx\n", encoding="utf-8")
+    _patch_control(tmp_path, monkeypatch, "reset")
+    loop.tick(now_ms=1_000_000_000)
+    assert loop.state is not st, "reset 应重建状态对象"
+    assert loop.state.symbol == "BTC"
+    assert loop.state.daily_loss == 0.0
+    assert loop.state.consecutive_losses == 0
+    assert not trades.exists(), "trades.csv 应被删除"
+
+
+def test_control_reset_with_position_drops_tracking(tmp_path, monkeypatch):
+    """有持仓时 reset 也执行：丢弃持仓跟踪（结算自动兑付），防止死锁。"""
+    st = TradeState(symbol="BTC", window_start=999_900, daily_loss=4.0,
+                    position=make_position(), last_day="2026-08-14")
+    loop = make_loop(tmp_path, state=st)
+    _patch_control(tmp_path, monkeypatch, "reset")
+    loop.tick(now_ms=1_000_000_000)
+    assert loop.state is not st, "reset 应重建状态对象"
+    assert loop.state.daily_loss == 0.0
+    # 旧持仓（entry=0.45）被丢弃；tick 继续执行后按新信号重新入场（entry=ask=0.42）
+    assert loop.state.position is not None
+    assert loop.state.position.entry_price == 0.42, "旧持仓跟踪应被丢弃，持仓为新入场"
+
+
+def test_control_stop_sets_shutdown_and_skips_tick(tmp_path, monkeypatch):
+    loop = make_loop(tmp_path)
+    _patch_control(tmp_path, monkeypatch, "stop")
+    loop.tick(now_ms=1_000_000_000)
+    assert loop._shutdown is True
+
+
+def test_control_consumed_file_removed(tmp_path, monkeypatch):
+    loop = make_loop(tmp_path)
+    p = _patch_control(tmp_path, monkeypatch, "resume")
+    loop.tick(now_ms=1_000_000_000)
+    assert not p.exists(), "指令消费后文件应被删除"
+
+
+def test_settle_invalidates_negative_cache(tmp_path):
+    """结算市场查询失败时清除负缓存（下 tick 重查），防止永久卡死。"""
+    disc = FakeDiscovery(settled=None)  # 市场查询持续失败
+    st = TradeState(symbol="BTC", window_start=999_900, position=make_position())
+    loop = make_loop(tmp_path, state=st, discovery=disc)
+    loop.tick(now_ms=1_000_860_000)  # 窗口结束 60s 后（结算 tick）
+    assert disc.invalidated == [("BTC", 999_900, False)], "失败应清除缓存供重查"
+    assert st.position is not None, "未超时：持仓保留等待重试"
+
+
+def test_settle_timeout_drops_stale_position(tmp_path):
+    """结算市场持续不可达超过超时 → 丢弃持仓跟踪（Polymarket 结算自动兑付）。"""
+    disc = FakeDiscovery(settled=None)
+    st = TradeState(symbol="BTC", window_start=999_900,
+                    position=make_position(window=997_000))
+    loop = make_loop(tmp_path, state=st, discovery=disc)
+    loop.tick(now_ms=1_000_000_000)
+    assert st.position is None, "超时后应丢弃卡死的持仓跟踪"
+
+
+def test_no_inference_mid_window_start(tmp_path):
+    """窗口中期启动（剩余 ≤ no_entry_before_end_sec）→ 不推理，等窗口切换后才推理。"""
+    from dataclasses import replace
+
+    from pmbot.market_lifecycle import Phase
+    cfg = replace(CFG, no_entry_before_end_sec=60)
+    st = TradeState(symbol="BTC", window_start=999_900)  # 窗口 999900–1000800
+    loop = make_loop(tmp_path, state=st, config=cfg)
+    # 窗口剩 59s（1000741）：不推理，保持 INIT
+    loop.tick(now_ms=1_000_741_000)
+    assert st.signal is None, "窗口末不应推理"
+    assert loop._lifecycle.phase is Phase.INIT
+    # 窗口切换（1000800 新窗口开始）：推理
+    loop.tick(now_ms=1_000_800_000)
+    assert st.signal is not None, "窗口切换后应推理"
+    assert st.signal.direction is Direction.UP
+
+
+# ---- 钱包余额：快照刷新与实盘盈亏（余额差值） ----
+
+class BalanceExecutor(FakeExecutor):
+    """带余额查询的 fake：collateral_balance 返回可配置值/异常。"""
+
+    def __init__(self, balance=10.0):
+        super().__init__()
+        self.balance = balance
+        self.queries = 0
+
+    def collateral_balance(self):
+        self.queries += 1
+        if isinstance(self.balance, Exception):
+            raise self.balance
+        return self.balance
+
+
+def test_balance_refreshes_into_state(tmp_path):
+    """余额定时刷新进状态；30s 闸内不重复查询。"""
+    ex = BalanceExecutor(balance=12.34)
+    loop = make_loop(tmp_path, executor=ex,
+                     strategy=FakeStrategy(Signal(Direction.UP, 0.50)))  # 弱信号：无交易干扰
+    loop.tick(now_ms=1_000_000_000)
+    assert loop.state.balance == 12.34
+    q = ex.queries
+    loop.tick(now_ms=1_000_000_000 + 5_000)  # <30s：不查
+    assert ex.queries == q
+    loop.tick(now_ms=1_000_000_000 + 31_000)  # ≥30s：再查
+    assert ex.queries == q + 1
+
+
+def test_balance_query_failure_keeps_old_and_trades(tmp_path):
+    """余额查询失败（无凭证/网络）静默保留旧值，不影响入场。"""
+    ex = BalanceExecutor(balance=RuntimeError("no creds"))
+    loop = make_loop(tmp_path, executor=ex)
+    loop.tick(now_ms=1_000_000_000)
+    assert loop.state.balance is None
+    assert loop.state.position is not None  # 交易不受影响
+    assert loop.state.position.entry_balance is None  # 无快照 → 平仓回退理论价差
+
+
+def test_market_entry_records_balance_snapshot(tmp_path):
+    """实盘模式：入场捕获余额快照（供平仓余额差 PnL）。"""
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)
+    assert loop.state.position.entry_balance == 20.0
+
+
+def test_sell_pnl_uses_balance_diff(tmp_path):
+    """实盘平仓盈亏 = 平仓后余额 − 入场时余额（含滑点/手续费），而非理论价差。"""
+    ex = BalanceExecutor(balance=20.0)
+    loop = make_loop(tmp_path, executor=ex, dry_run=False)
+    loop.tick(now_ms=1_000_000_000)  # 入场：entry_balance=20.0
+    pos = loop.state.position
+    # 实际成交比理论差：余额只涨 size*0.45（理论应为 size*0.48）
+    ex.best_bid_value = 0.9
+    ex.balance = 20.0 + pos.size * 0.45
+    loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
+    assert loop.state.position is None
+    expect = pos.size * 0.45  # 余额差值
+    assert loop.state.consecutive_losses == 0
+    import csv
+
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    assert rows and abs(float(rows[-1]["pnl"]) - expect) < 1e-5  # CSV 落盘 round(pnl,6)
+
+
+def test_dry_run_pnl_uses_theoretical_not_balance_diff(tmp_path):
+    """dry-run 不真实下单、钱包余额不变：即使余额可查，盈亏也必须是理论价差。
+
+    回归：曾因余额差恒为 0（exit_balance == entry_balance）把正确的理论
+    价差覆盖成 0.00（Web 历史交易显示 +0.00）。
+    """
+    ex = BalanceExecutor(balance=20.0)  # 余额可查（dry-run 仅面板展示用）
+    loop = make_loop(tmp_path, executor=ex)  # dry_run=True（默认）
+    loop.tick(now_ms=1_000_000_000)  # 入场
+    pos = loop.state.position
+    assert pos.entry_balance is None  # dry-run 不记余额快照
+    ex.best_bid_value = 0.9  # 触发止盈
+    loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
+    assert loop.state.position is None
+    import csv
+
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    expect = pos.size * (0.9 - pos.entry_price)  # 理论价差（非 0）
+    assert expect > 0
+    assert rows and abs(float(rows[-1]["pnl"]) - expect) < 1e-5
+
+
+def test_control_reset_rejected_in_live_mode(tmp_path, monkeypatch):
+    """实盘模式拒绝 reset 指令：不丢持仓跟踪、不删交易历史。"""
+    st = TradeState(symbol="BTC", window_start=999_900, daily_loss=4.0, last_day="1970-01-12")
+    trades = tmp_path / "trades.csv"
+    trades.write_text("ts\n2026-01-01T00:00:00+00:00\n", encoding="utf-8")
+    loop = make_loop(tmp_path, state=st, dry_run=False)
+    _patch_control(tmp_path, monkeypatch, "reset")
+    loop.tick(now_ms=1_000_000_000)
+    assert st.daily_loss == 4.0  # 状态未清
+    assert st.window_start == 999_900
+    assert trades.is_file()  # 交易历史未删

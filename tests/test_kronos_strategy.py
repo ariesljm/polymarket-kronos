@@ -24,7 +24,7 @@ def make_df(closes):
     )
 
 
-def make_strategy(tmp_path, closes, pred_closes, symbol="BTC"):
+def make_strategy(tmp_path, closes, pred_closes, symbol="BTC", **kw):
     df = make_df(closes)
 
     class FakeDataSource:
@@ -38,6 +38,7 @@ def make_strategy(tmp_path, closes, pred_closes, symbol="BTC"):
         predict_fn=lambda d, sample_count: pred_closes,
         log_dir=Path(tmp_path),
         symbol=symbol,
+        **kw,
     )
 
 
@@ -97,3 +98,32 @@ def test_empty_predictions_skip(tmp_path):
 def test_registered_as_kronos(tmp_path):
     strat = create_strategy("kronos")
     assert isinstance(strat, KronosStrategy)
+
+
+def test_midband_signal_not_recorded(tmp_path):
+    """中间带信号（未达交易阈值）不进入方向准确率评估。
+
+    回归：p_up≈0.53 的 down 信号接近抛硬币，曾无条件记录，
+    持续稀释方向准确率。
+    """
+    strat = make_strategy(tmp_path, [100.0] * 10, [101.0] * 7 + [99.0] * 8,
+                          thresholds={"p_up_buy": 0.6, "p_down_buy": 0.4})
+    signal = strat.generate_signal()
+    assert signal.direction is Direction.DOWN  # p_up = 7/15 ≈ 0.467 < 0.5
+    # p_up ≈ 0.467 在 (0.4, 0.6) 中间带 → 不记录
+    assert len(strat.log._load()) == 0
+
+
+def test_tradeable_signal_recorded(tmp_path):
+    """达阈值信号正常记录（进入准确率评估）。"""
+    strat = make_strategy(tmp_path, [100.0] * 10, [101.0] * 10,
+                          thresholds={"p_up_buy": 0.6, "p_down_buy": 0.4})
+    strat.generate_signal()
+    assert len(strat.log._load()) == 1
+
+
+def test_no_thresholds_records_all(tmp_path):
+    """thresholds=None（回测/兼容）：全部信号记录。"""
+    strat = make_strategy(tmp_path, [100.0] * 10, [101.0] * 7 + [99.0] * 8)
+    strat.generate_signal()
+    assert len(strat.log._load()) == 1

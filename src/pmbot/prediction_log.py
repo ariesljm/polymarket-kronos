@@ -29,6 +29,11 @@ class PredictionLog:
     def _save(self, df: pd.DataFrame) -> None:
         atomic_write_text(self._path, df_to_csv_text(df, COLUMNS))
 
+    def reset(self) -> None:
+        """删除预测记录文件（下次预测自动重建）。"""
+        if self._path.is_file():
+            self._path.unlink()
+
     def record(
         self,
         ts: int,

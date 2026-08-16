@@ -122,6 +122,12 @@ class KlineStore:
             path = self._path(symbol)
             atomic_write_text(path, df_to_csv_text(df, COLUMNS))
 
+    def reset(self, symbol: str) -> None:
+        """删除该标的的 K 线文件（下次 update 自动重新回填）。"""
+        path = self._path(symbol)
+        if path.is_file():
+            path.unlink()
+
 
 class BinanceDataSource:
     """Binance 数据源：首次全量回填，之后增量拉取，持久化到 KlineStore。"""

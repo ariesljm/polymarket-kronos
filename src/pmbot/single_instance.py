@@ -48,7 +48,7 @@ class InstanceGuard:
         atomic_write_text(self.path, json.dumps(data))
 
     @staticmethod
-    def _alive(pid: int) -> bool:
+    def alive(pid: int) -> bool:
         if sys.platform == "win32":
             import ctypes
 
@@ -78,7 +78,7 @@ class InstanceGuard:
         except OSError:
             return
         for _ in range(6):  # 最多等 3 秒优雅退出
-            if not cls._alive(pid):
+            if not cls.alive(pid):
                 return
             time.sleep(0.5)
         try:
@@ -91,7 +91,7 @@ class InstanceGuard:
     def kill_old(self, name: str) -> None:
         """杀掉 pid 文件中该角色记录的旧进程（不存在/已死则跳过）。"""
         pid = self._read().get(name)
-        if pid and self._alive(pid):
+        if pid and self.alive(pid):
             logger.warning("检测到旧 %s 实例（PID %d），正在终止", name, pid)
             self._kill(pid)
 

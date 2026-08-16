@@ -20,7 +20,9 @@ DEFAULTS: dict = {
     "amount_per_trade": 1,
     "p_up_buy": 0.60,
     "cancel_before_end_sec": 180,
-    "exit_before_end_sec": 60,
+    "exit_loss_before_end_sec": 60,  # 窗口结束前 N 秒内浮亏 → 市价离场（0 = 关闭）
+    "hold_until_end_sec": 60,        # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
+    "no_entry_before_end_sec": 60,
     "take_profit": 0.30,
     "take_profit_max": 0.95,
     "stop_loss": 0.20,
@@ -43,7 +45,8 @@ class Config:
     p_up_buy: float
     p_down_buy: float
     cancel_before_end_sec: int
-    exit_before_end_sec: int
+    exit_loss_before_end_sec: int  # 窗口结束前 N 秒内浮亏 → 市价离场（0 = 关闭）
+    hold_until_end_sec: int        # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
     take_profit: float
     take_profit_max: float
     stop_loss: float
@@ -53,6 +56,8 @@ class Config:
     max_klines: int
     model_variant: str
     sample_count: int
+    # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓，0 = 关闭）
+    no_entry_before_end_sec: int = 0
 
 
 def load_config(path: str | Path) -> Config:
@@ -105,10 +110,16 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError("take_profit_max 必须在 (0,1) 之间")
 
     cbe = _as_int(s["cancel_before_end_sec"], "cancel_before_end_sec")
-    ebe = _as_int(s.get("exit_before_end_sec", DEFAULTS["exit_before_end_sec"]), "exit_before_end_sec")
+    elbe = _as_int(s.get("exit_loss_before_end_sec", DEFAULTS["exit_loss_before_end_sec"]), "exit_loss_before_end_sec")
+    hte = _as_int(s.get("hold_until_end_sec", DEFAULTS["hold_until_end_sec"]), "hold_until_end_sec")
+    nebs = _as_int(s.get("no_entry_before_end_sec", DEFAULTS["no_entry_before_end_sec"]), "no_entry_before_end_sec")
     tsm = _as_int(s["time_stop_min"], "time_stop_min")
-    if cbe <= 0 or ebe < 0 or tsm <= 0:
-        raise ConfigError("cancel_before_end_sec / exit_before_end_sec / time_stop_min 必须 > 0")
+    if cbe <= 0 or elbe < 0 or hte < 0 or nebs < 0 or tsm <= 0:
+        raise ConfigError(
+            "cancel_before_end_sec / time_stop_min 必须 > 0；"
+            "exit_loss_before_end_sec / hold_until_end_sec / "
+            "no_entry_before_end_sec 必须 ≥ 0（0 表示关闭）"
+        )
 
     mcl = _as_int(s["max_consecutive_losses"], "max_consecutive_losses")
     mdl = _as_float(s["max_daily_loss"], "max_daily_loss")
@@ -137,7 +148,9 @@ def load_config(path: str | Path) -> Config:
         p_up_buy=buy,
         p_down_buy=sell,
         cancel_before_end_sec=cbe,
-        exit_before_end_sec=ebe,
+        exit_loss_before_end_sec=elbe,
+        hold_until_end_sec=hte,
+        no_entry_before_end_sec=nebs,
         take_profit=tp,
         take_profit_max=tpm,
         stop_loss=sl,

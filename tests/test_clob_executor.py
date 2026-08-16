@@ -1,13 +1,13 @@
-"""ClobExecutor 测试：dry-run 路径与盘口解析（不碰网络/真钱）。"""
+"""执行器测试：SimExecutor（dry-run 模拟）与盘口解析（不碰网络/真钱）。"""
 
 import pytest
 
 from pmbot.book_price import best_price as _best_price
-from pmbot.clob_executor import ClobExecutor
+from pmbot.clob_executor import ClobExecutor, SimExecutor
 
 
 def test_dry_run_place_and_sell():
-    ex = ClobExecutor(private_key="0x" + "0" * 64, dry_run=True)
+    ex = SimExecutor(private_key="0x" + "0" * 64)
     oid = ex.place_limit("111", "buy", 0.45, 5.0)
     assert oid and oid.startswith("dry-run-")
     oid2 = ex.sell("111", 5.0, 0.80)
@@ -16,7 +16,7 @@ def test_dry_run_place_and_sell():
 
 def test_dry_run_market_buy_sell():
     """市价单不受 5 股/金额限制（服务端按金额换算份额，可小数）。"""
-    ex = ClobExecutor(private_key="0x" + "0" * 64, dry_run=True)
+    ex = SimExecutor(private_key="0x" + "0" * 64)
     assert ex.market_buy("111", 2.38) is not None  # 小数份额
     assert ex.market_buy("111", 0.5) is not None   # 低于 5 股也放行
     assert ex.market_sell("111", 2.38) == ex.best_bid("111")  # dry-run 按 best_bid 成交
@@ -24,7 +24,7 @@ def test_dry_run_market_buy_sell():
 
 def test_order_rules_enforced():
     """Polymarket 规则：最少 5 股、最低 $1（实测验证）。"""
-    ex = ClobExecutor(private_key="0x" + "0" * 64, dry_run=True)
+    ex = SimExecutor(private_key="0x" + "0" * 64)
     # 少于 5 股 → 拒绝
     with pytest.raises(ValueError, match="5 股"):
         ex.place_limit("111", "buy", 0.45, 2.0)
@@ -37,7 +37,7 @@ def test_order_rules_enforced():
 
 
 def test_dry_run_cancel():
-    ex = ClobExecutor(private_key="0x" + "0" * 64, dry_run=True)
+    ex = SimExecutor(private_key="0x" + "0" * 64)
     assert ex.cancel("dry-run-abc") is True
     assert ex.cancel("anything") is True
 
@@ -46,7 +46,7 @@ def test_missing_key_raises_on_real_call(monkeypatch):
     monkeypatch.delenv("PRIVATE_KEY", raising=False)
     # 屏蔽真实 .env 的自动加载，模拟无私钥环境
     monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
-    ex = ClobExecutor(dry_run=False)
+    ex = ClobExecutor()
     with pytest.raises(RuntimeError, match="私钥"):
         ex._get_l1()
 

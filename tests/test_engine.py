@@ -4,6 +4,8 @@
 所有输入为纯数据（fake 适配器），不碰网络/真钱/真实时间。
 """
 
+from dataclasses import replace
+
 from pmbot.config import Config
 from pmbot.engine import decide
 from pmbot.types import ActionType, Direction, MarketView, PendingOrder, Position, Signal, StateView
@@ -17,7 +19,8 @@ CFG = Config(
     p_up_buy=0.60,
     p_down_buy=0.40,
     cancel_before_end_sec=180,
-    exit_before_end_sec=30,
+    exit_loss_before_end_sec=30,
+    hold_until_end_sec=60,
     take_profit=0.30,
     take_profit_max=0.95,
     stop_loss=0.20,
@@ -224,7 +227,7 @@ def test_no_time_stop_before_ten_minutes():
 # ---- 窗口结束前强制平仓 ----
 
 def test_window_end_forces_exit_when_lossing():
-    # 剩余 30s ≤ exit_before_end_sec=30，未到止盈且未触止损线（bid 0.40 > SL 0.30）→ 无条件平仓
+    # 剩余 30s ≤ exit_loss_before_end_sec=30，未到止盈且未触止损线（bid 0.40 > SL 0.30）→ 亏损离场
     market = make_market(
         remaining_sec=30,
         best_bid=0.40,
@@ -295,7 +298,7 @@ def test_window_end_take_profit_wins_first():
 
 
 def test_no_window_end_before_threshold():
-    # 剩余 90s > exit_before_end_sec=60，且未到时间止损（elapsed 210 < 600）→ 继续持有
+    # 剩余 90s > exit_loss_before_end_sec=30 且 > hold_until_end_sec=60，未到时间止损 → 继续持有
     market = make_market(
         remaining_sec=90,
         best_bid=0.40,
@@ -350,3 +353,62 @@ def test_no_second_bet_in_same_window():
     state = make_state(window_bet_placed=True)
     action = decide(CFG, state, market, make_signal("up", 0.70))
     assert action.type is ActionType.SKIP
+
+
+def test_no_entry_near_window_end():
+    """窗口结束前 no_entry_before_end_sec 秒内禁止买入（中途启动场景）。"""
+    cfg = replace(CFG, no_entry_before_end_sec=60)
+    market = make_market(remaining_sec=59)  # 不足 60s → 不买
+    a = decide(cfg, make_state(), market, make_signal(Direction.UP, p_up=0.95))
+    assert a.type is ActionType.SKIP
+    market = make_market(remaining_sec=61)  # 足够 → 正常买入
+    a = decide(cfg, make_state(), market, make_signal(Direction.UP, p_up=0.95))
+    assert a.type is ActionType.PLACE_MARKET
+
+
+def test_no_entry_gate_off_when_zero():
+    """no_entry_before_end_sec=0 时关闭禁买（任何剩余时间都可买入）。"""
+    cfg = replace(CFG, no_entry_before_end_sec=0)
+    a = decide(cfg, make_state(), make_market(remaining_sec=1), make_signal(Direction.UP, p_up=0.95))
+    assert a.type is ActionType.PLACE_MARKET
+
+
+# ---- 窗口末拆分：亏损离场 / 盈利持有 两个独立阈值 ----
+
+def test_exit_loss_and_hold_until_are_independent():
+    """exit_loss_before_end_sec 与 hold_until_end_sec 独立配置。"""
+    # 亏损但未到亏损离场阈值（remaining 45 > exit_loss 30）→ 不强制离场
+    action = decide(CFG, make_state(), make_market(
+        remaining_sec=45, best_bid=0.40, position=make_position(entry_price=0.45, entered_remaining_sec=100)),
+        make_signal("skip", 0.5))
+    assert action.type is ActionType.SKIP
+    # 亏损且到阈值（remaining 30 ≤ exit_loss 30）→ 离场
+    action = decide(CFG, make_state(), make_market(
+        remaining_sec=30, best_bid=0.40, position=make_position(entry_price=0.45, entered_remaining_sec=100)),
+        make_signal("skip", 0.5))
+    assert action.type is ActionType.SELL
+    assert action.reason == "window_end"
+
+
+def test_hold_until_end_sec_holds_profitable_earlier():
+    """盈利持有阈值更大：remaining 40（≤ hold_until 60、> exit_loss 30）盈利 → 持有到结算。"""
+    action = decide(CFG, make_state(), make_market(
+        remaining_sec=40, best_bid=0.50, position=make_position(entry_price=0.45, entered_remaining_sec=100)),
+        make_signal("skip", 0.5))
+    assert action.type is ActionType.SKIP  # 盈利：持有，不主动平仓
+
+
+def test_exit_loss_disabled_holds_loss_to_settlement():
+    """exit_loss_before_end_sec=0（关闭）时：窗口末亏损也不平仓，持有到结算。"""
+    cfg = replace(CFG, exit_loss_before_end_sec=0)
+    # 亏损（0.40 < 0.45）但在止损线上方（sl=0.45×0.8=0.36）→ 持有到结算
+    action = decide(cfg, make_state(), make_market(
+        remaining_sec=10, best_bid=0.40, position=make_position(entry_price=0.45, entered_remaining_sec=100)),
+        make_signal("skip", 0.5))
+    assert action.type is ActionType.SKIP
+    # 跌破止损线 → 仍触发 stop_loss
+    action = decide(cfg, make_state(), make_market(
+        remaining_sec=10, best_bid=0.15, position=make_position(entry_price=0.45, entered_remaining_sec=100)),
+        make_signal("skip", 0.5))
+    assert action.type is ActionType.SELL
+    assert action.reason == "stop_loss"

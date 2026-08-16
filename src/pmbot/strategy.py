@@ -20,6 +20,10 @@ class Strategy(ABC):
     @abstractmethod
     def generate_signal(self, context: SignalContext | None = None) -> Signal: ...
 
+    def reset_runtime_data(self) -> None:
+        """清空策略运行时数据（K线/预测记录）；无持久化状态的策略无需覆写。"""
+
+
 
 def register(name: str) -> Callable[[type[Strategy]], type[Strategy]]:
     """注册策略类到工厂（装饰器用法）。"""
