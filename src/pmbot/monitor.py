@@ -147,6 +147,7 @@ class PanelView:
     status_note: str = ""
     pending: dict | None = None
     position: dict | None = None
+    settle_pending: dict | None = None  # 窗口结束后待结算的旧持仓（结算完成自动清空）
     paused: bool = False
     pause_reason: str | None = None
     consecutive_losses: int = 0
@@ -300,6 +301,14 @@ def build_view(status: TradeState | None, trades: list["TradeRecord"], accuracy:
                 )
                 v.position["take_profit_price"] = tp
                 v.position["stop_loss_price"] = sl
+        if status.settle_pending:
+            p = status.settle_pending
+            v.settle_pending = {
+                "direction": p.direction.value,
+                "entry_price": p.entry_price,
+                "size": p.size,
+                "window_start": p.window_start,
+            }
         v.paused = bool(status.paused)
         v.pause_reason = status.pause_reason
         v.consecutive_losses = status.consecutive_losses
@@ -385,6 +394,11 @@ def render(v: PanelView) -> str:
         lines.append(f"持仓: {pos['direction'].upper()} {pos['size']:.2f}股 @{_fmt_cents(pos['entry_price'])}")
     else:
         lines.append("持仓: —")
+    if v.settle_pending:
+        sp = v.settle_pending
+        lines.append(
+            f"待结算: {sp['direction'].upper()} {sp['size']:.2f}股 @{_fmt_cents(sp['entry_price'])}（窗口已结束，结算后自动入账）"
+        )
     if v.live_positions:
         lines.append("实时持仓（Polymarket）:")
         for p in v.live_positions[:5]:

@@ -133,14 +133,22 @@ class Settler:
             self._on_settle(pos, settle_price, None)
             return
         # 结算价已就绪（赢）：优先真实兑付记账（data-api /activity REDEEM 的 usdcSize
-        # = 实际到账含本金）。未确认（结算延迟/网络）→ 不记账不回退，下一 tick 重试。
+        # = 实际到账含本金）。未确认（结算延迟/网络）→ 不记账不回退，下一 tick 重试；
+        # 持续未确认超时 → 按结算价兜底记账（兑付记录长期不出现，持仓不能永久占用
+        # → 否则新窗口无法开仓，回归事故与「输的仓死等 REDEEM」同构）。
         if not self.dry_run:
             proceeds = self._settle_proceeds(market.condition_id)
             if proceeds is None:
-                self.phase = SettlePhase.REDEEM_WAIT
-                logger.info("窗口 %d 结算价已就绪（%.3f）但真实兑付未确认，等待 REDEEM 记录（下一 tick 重试）",
-                            pos.window_start, settle_price)
-                return
+                if now_sec <= timeout_at:
+                    self.phase = SettlePhase.REDEEM_WAIT
+                    logger.info(
+                        "窗口 %d 结算价已就绪（%.3f）但真实兑付未确认，等待 REDEEM 记录（下一 tick 重试）",
+                        pos.window_start, settle_price)
+                    return
+                logger.warning(
+                    "窗口 %d 结算价已就绪（%.3f）但真实兑付持续未确认（超过 %ds），按结算价兜底记账",
+                    pos.window_start, settle_price, self.settle_timeout_sec)
+                proceeds = None  # 兜底：走理论价差记账（依旧记入交易历史/熔断计数）
         else:
             proceeds = None
         self.phase = SettlePhase.DONE

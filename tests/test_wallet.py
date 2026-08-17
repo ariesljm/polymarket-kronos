@@ -265,15 +265,15 @@ def test_adopts_untracked_position():
     assert st.live_positions == [_eth_pos()]
 
 
-def test_adopt_down_position_and_old_window():
-    """接管 DOWN 方向；持仓窗口早于当前窗口时不置 window_bet_placed（不误伤新窗口下注）。"""
+def test_adopt_skips_old_window_position():
+    """窗口已结束的仓不接管：结算中/待兑付由链上完成后余额到账（余额差口径兜底），
+    占用活跃槽会卡新窗口开仓（回归：结算残留仓让系统永久停摆）。"""
     r, src, st, saved = _make(dry_run=False, wallet_kw={
         "positions": [_eth_pos(outcome="Down", slug="btc-updown-15m-999900")]})
     st.window_start = 1_000_800  # 当前窗口晚于持仓窗口
     r.reconcile(1_001_031, st)
-    assert st.position is not None
-    assert st.position.direction is Direction.DOWN
-    assert st.window_bet_placed is False  # 旧窗口仓位不影响新窗口下注
+    assert st.position is None  # 旧窗口仓不接管
+    assert st.window_bet_placed is False  # 新窗口下注不受影响
 
 
 def test_adopt_skips_slug_without_window():

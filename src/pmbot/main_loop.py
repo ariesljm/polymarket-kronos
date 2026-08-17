@@ -174,9 +174,17 @@ class TradingLoop:
         self.wallet_sync.reconcile(now_sec, st)
         self._drain_user_events()
 
-        # 1. 窗口结束后结算持仓（gamma 结算有延迟；引擎级兜底，跨生命周期）
-        if self.settler.should_run(now_sec, st.position):
-            self.settler.settle(now_sec, st.position)
+        # 1. 窗口结束后结算持仓（gamma 结算有延迟；引擎级兜底，跨生命周期）。
+        #    结算对象是 settle_pending；窗口结束瞬间活跃持仓先转入该槽（释放
+        #    position → 新窗口开仓不阻塞），结算在后台推进、出结果后记账清空。
+        if st.position is not None and now_sec >= st.position.window_start + self.step_sec:
+            st.defer_to_settle()
+            sp = st.settle_pending
+            logger.info(
+                "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
+                sp.window_start, sp.direction.value, sp.size, sp.entry_price)
+        if self.settler.should_run(now_sec, st.settle_pending):
+            self.settler.settle(now_sec, st.settle_pending)
 
         # 2. 熔断/暂停：不交易（生命周期暂停推进，恢复后继续）
         if self._check_circuit_breaker(now_sec):
@@ -186,6 +194,14 @@ class TradingLoop:
         step = self.discovery.step_ms // 1000
         new_window = window_start_sec(now_ms // 1000, step)
         if st.window_start != new_window:
+            # 旧窗口持仓转入待结算（立即释放 position → 新市场开仓不阻塞）：
+            # 结算由 Settler 在后台推进（等结算价/兑付），出结果后记账清空。
+            if st.position is not None:
+                st.defer_to_settle()
+                logger.info(
+                    "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
+                    st.window_start, st.settle_pending.direction.value,
+                    st.settle_pending.size, st.settle_pending.entry_price)
             # 跨窗口遗留挂单先撤单（基于 state 判断，兼容预置旧挂单场景）
             if st.pending_order is not None:
                 self.trade.cancel(st.pending_order.order_id)
@@ -291,8 +307,10 @@ class TradingLoop:
         if self._lifecycle is not None:
             self._lifecycle.stop(now_sec)
             self._lifecycle = None
-        if self.settler.should_run(now_sec, st.position):
-            self.settler.settle(now_sec, st.position)
+        if st.position is not None and now_sec >= st.position.window_start + self.step_sec:
+            st.defer_to_settle()
+        if self.settler.should_run(now_sec, st.settle_pending):
+            self.settler.settle(now_sec, st.settle_pending)
         self.save_status()
         if self.history_sync is not None:
             self.history_sync.stop()
@@ -542,9 +560,10 @@ class TradingLoop:
         logger.warning("收到暂停指令（%s）", st.pause_reason)
 
     def _abandon_position(self) -> None:
-        """结算超时丢弃持仓跟踪（Polymarket 结算自动兑付，不丢资金）。"""
+        """结算放弃持仓跟踪（结算超时/市场不可达/无法结算；Polymarket 自动兑付，不丢资金）。"""
         st = self.state
         st.position = None
+        st.settle_pending = None
         self.save_status()
 
     def _close_position(self, pos: Position, exit_price: float, reason: str,
@@ -560,7 +579,7 @@ class TradingLoop:
         pnl = None
         if proceeds is not None:
             pnl = proceeds - pos.size * pos.entry_price
-        result = st.close_position(exit_price, actual_pnl=pnl)
+        result = st.close_position(exit_price, actual_pnl=pnl, pos=pos)
         self._store.log_trade(
             st,
             window_start=pos.window_start,
@@ -575,6 +594,9 @@ class TradingLoop:
                     reason, pos.direction.value, exit_price, result,
                     "（真实兑付）" if (pnl is not None and reason == "settle")
                     else "（真实成交）" if pnl is not None else "（理论价差）")
+        if reason == "settle":
+            # 结算完成：settle_pending 已清，立即落盘（防面板残留旧持仓）
+            self.save_status()
         return result
 
     def save_status(self) -> None:

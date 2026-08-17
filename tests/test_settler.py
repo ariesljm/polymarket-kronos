@@ -145,6 +145,39 @@ def test_settle_win_waits_redeem_then_settles():
     assert s.phase is SettlePhase.DONE
 
 
+def test_settle_win_redeem_never_comes_times_out_to_settle():
+    """赢：REDEEM 持续未确认超时 → 按结算价兑底记账（不永久占用持仓）。
+
+    兑付记录长期不出现（data-api 延迟/网络失败）时持仓曾永久残留，
+    新窗口 decide 见持仓 → 永不开新仓（回归事故）。超时必须兑底清仓。
+    """
+    src = FakeSource(price=1.0)
+    s, calls = make_settler(src, dry_run=False, timeout=600,
+                            proceeds_fn=lambda cid: None)
+    pos = make_pos()
+    s.settle(1_000_000, pos)  # 未超时（timeout_at=999900+300+600）
+    assert s.phase is SettlePhase.REDEEM_WAIT
+    assert calls["settle"] == []
+    s.settle(1_001_000, pos)  # 超时
+    assert len(calls["settle"]) == 1
+    pos2, exit_price, p = calls["settle"][0]
+    assert exit_price == 1.0 and p is None  # 兑底：理论价差记账
+    assert s.phase is SettlePhase.DONE
+
+
+def test_settle_win_redeem_never_comes_after_restart_settles_immediately():
+    """重启后残留持仓：窗口早结束 + REDEEM 不来 → 首个 settle 即兑底（不卡窗口）。"""
+    src = FakeSource(price=1.0)
+    s, calls = make_settler(src, dry_run=False, timeout=600,
+                            proceeds_fn=lambda cid: None)
+    pos = make_pos()
+    # 重启时窗口已结束 1000s（远超 timeout_at），赢的仓 REDEEM 仍不来
+    s.settle(1_001_200, pos)
+    assert len(calls["settle"]) == 1
+    assert calls["settle"][0][2] is None
+    assert s.phase is SettlePhase.DONE
+
+
 def test_settle_win_dry_run_settles_immediately():
     """dry-run 赢：不查兑付，直接按结算价记账。"""
     src = FakeSource(price=1.0)

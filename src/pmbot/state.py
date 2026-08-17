@@ -26,6 +26,9 @@ class TradeState:
     window_bet_placed: bool = False
     signal: Signal | None = None
     position: Position | None = None
+    # 窗口结束时旧持仓转此槽（立即释放 position → 新窗口不阻塞开仓）；
+    # 结算继续在后台推进（Settler），出结果后记账并清空。
+    settle_pending: Position | None = None
     pending_order: PendingOrder | None = None
     consecutive_losses: int = 0
     daily_loss: float = 0.0
@@ -59,23 +62,36 @@ class TradeState:
             self.day_start_balance = None
             self.last_day = day
 
-    def close_position(self, settle_price: float, actual_pnl: float | None = None) -> float:
+    def close_position(self, settle_price: float, actual_pnl: float | None = None,
+                       pos: Position | None = None) -> float:
         """按结算/平仓价兑现持仓，返回盈亏；更新熔断计数。
 
         actual_pnl 非 None 时用它（Polymarket 真实成交盈亏：卖出收入 − 买入成本）；
-        否则理论价差（dry-run / 结算兑付）。
+        否则理论价差（dry-run / 结算兑付）。pos 为被清算的持仓对象
+        （活跃 position 或待结算 settle_pending——两个槽都从这里清空）；
+        缺省取当前活跃持仓。
         """
-        pos = self.position
-        if pos is None:
+        target = pos if pos is not None else self.position
+        if target is None:
             return 0.0
-        pnl = actual_pnl if actual_pnl is not None else pos.size * (settle_price - pos.entry_price)
-        self.position = None
+        pnl = actual_pnl if actual_pnl is not None else target.size * (settle_price - target.entry_price)
+        if self.position is target:
+            self.position = None
+        elif self.settle_pending is target:
+            self.settle_pending = None
         if pnl < 0:
             self.consecutive_losses += 1
             self.daily_loss += -pnl  # 当日累计亏损（正数），与 decide 熔断语义一致
         else:
             self.consecutive_losses = 0  # 连续亏损在盈利后重置
         return pnl
+
+    def defer_to_settle(self) -> None:
+        """窗口结束：活跃持仓转入待结算槽（释放开仓位，新窗口不阻塞）。"""
+        if self.position is None or self.settle_pending is not None:
+            return
+        self.settle_pending = self.position
+        self.position = None
 
 
 class StateStore:
@@ -105,6 +121,7 @@ class StateStore:
             "字段含义：paused=熔断暂停；daily_loss=当日累计亏损；"
             "consecutive_losses=连亏笔数；window_bet_placed=当前窗口已下注；"
             "signal=最近一次 Kronos 信号；position=当前持仓（无持仓为 null）；"
+            "settle_pending=窗口结束后待结算的旧持仓（结算完成自动清空）；"
             "balance=钱包余额快照（实盘时定时刷新）；day_start_balance=今日起始余额基准"
             "（今日盈亏 = 现余额 − 基准，跨天重置）；mode=运行模式（dry-run/live）。"
         )
@@ -113,6 +130,18 @@ class StateStore:
         atomic_write_text(
             self.status_path,
             json.dumps(data, ensure_ascii=False, indent=2, default=str),
+        )
+
+    @staticmethod
+    def _load_position(p: dict) -> Position | None:
+        if not p:
+            return None
+        return Position(
+            direction=Direction(p["direction"]),
+            entry_price=float(p["entry_price"]),
+            size=float(p["size"]),
+            entered_remaining_sec=int(p["entered_remaining_sec"]),
+            window_start=int(p["window_start"]),
         )
 
     def load(self) -> TradeState | None:
@@ -125,14 +154,9 @@ class StateStore:
         if "symbol" not in data:
             return None
         if data.get("position"):
-            pos = data["position"]
-            data["position"] = Position(
-                direction=Direction(pos["direction"]),
-                entry_price=float(pos["entry_price"]),
-                size=float(pos["size"]),
-                entered_remaining_sec=int(pos["entered_remaining_sec"]),
-                window_start=int(pos["window_start"]),
-            )
+            data["position"] = self._load_position(data["position"])
+        if data.get("settle_pending"):
+            data["settle_pending"] = self._load_position(data["settle_pending"])
         if data.get("pending_order"):
             po = data["pending_order"]
             try:

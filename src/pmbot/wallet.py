@@ -208,12 +208,18 @@ class WalletReconciler:
         方向/股数/均价来自官方 /positions 实际数据；时间止损从接管时刻重新计时。
         返回是否接管。
         """
+        if state.settle_pending is not None:
+            # 已有待结算持仓跟进后台结算（defer_to_settle 转入）：
+            # 远端若同仓仍残留 /positions 会再次接管 → 双跟踪占活跃槽 → 新窗口不开仓
+            return False
         for p in mine:
             if self._is_dead_position(p, now_sec):
                 continue  # 已结算归零的死仓：不接管（无价值，占用槽位导致新窗口不开仓）
             window_start = window_start_from_slug(p.get("slug"))
             if window_start is None:
                 continue  # slug 无窗口起点：非 bot 市场格式，不接管
+            if window_start + self._step_sec <= now_sec:
+                continue  # 窗口已结束：结算中/待兑付，交给 settle 记账（占用活跃槽会卡新窗口）
             size = float(p.get("size") or 0)
             entry = float(p.get("avgPrice") or 0)
             if size <= 0 or entry <= 0:

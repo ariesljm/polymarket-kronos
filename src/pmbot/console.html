@@ -432,6 +432,11 @@ async function refresh() {
     posSub = "止盈 " + centsStr(p.take_profit_price) + " · 止损 " +
       (p.stop_loss_price > 0 ? centsStr(p.stop_loss_price) : "关闭");
   }
+  const spd = d.settle_pending;
+  if (spd) {
+    posSub = (posSub ? posSub + " · " : "") +
+      "待结算 " + spd.direction.toUpperCase() + " " + spd.size.toFixed(2) + "股（窗口已结束，结算后自动入账）";
+  }
   document.getElementById("pos-cell").innerHTML = cell("持仓",
     p ? "<span class='dir'>" + p.direction.toUpperCase() + "</span> <span class='mono'>" + p.size.toFixed(2) +
         " 股 @ " + centsStr(p.entry_price) + "</span>" : null,

@@ -145,6 +145,25 @@ def test_status_roundtrip(tmp_path):
     assert loaded.skip_until_sec == 1_234_567
 
 
+def test_status_roundtrip_settle_pending(tmp_path):
+    """settle_pending（窗口结束转待结算的旧仓）持久化：重启恢复继续结算。"""
+    st = make_state(window_start=1_000_800)
+    st.position = None  # 活跃槽已释放（新窗口开仓不阻塞）
+    st.settle_pending = make_position()  # 旧窗口仓转入待结算
+    store = StateStore(Path(tmp_path) / "status.json")
+    store.save(st)
+    loaded = store.load()
+    assert loaded.position is None
+    assert loaded.settle_pending is not None
+    assert loaded.settle_pending.window_start == 1_000_000
+    assert loaded.settle_pending.direction is Direction.UP
+    # 关闭活跃槽不影响待结算（两个槽独立持久化）
+    store2 = StateStore(Path(tmp_path) / "status.json")
+    st2 = store2.load()
+    assert st2.settle_pending is not None
+    assert st2.position is None
+
+
 def test_close_position_uses_actual_pnl():
     """真实成交盈亏（卖出收入 − 买入成本）优先于理论价差。"""
     st = make_state(position=make_position(entry_price=0.42, size=2.0))

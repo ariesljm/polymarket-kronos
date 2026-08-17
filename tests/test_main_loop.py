@@ -364,7 +364,8 @@ def test_settle_waits_when_market_not_settled(tmp_path):
         executor=ex,
     )
     loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
-    assert loop.state.position is not None  # 等待结算
+    assert loop.state.position is None  # 活跃仓位已释放（新窗口不阻塞开仓）
+    assert loop.state.settle_pending is not None  # 待结算在等中间价
 
 
 # ---- 熔断 ----
@@ -984,7 +985,8 @@ def test_settle_invalidates_negative_cache(tmp_path):
     loop = make_loop(tmp_path, state=st, discovery=disc)
     loop.tick(now_ms=1_000_860_000)  # 窗口结束 60s 后（结算 tick）
     assert disc.invalidated == [("BTC", 999_900, False)], "失败应清除缓存供重查"
-    assert st.position is not None, "未超时：持仓保留等待重试"
+    assert st.settle_pending is not None, "未超时：待结算保留等待重试"
+    assert st.position is None, "活跃仓位已释放"
 
 
 def test_settle_timeout_drops_stale_position(tmp_path):
@@ -1326,7 +1328,10 @@ def test_run_forever_startup_keeps_real_position(tmp_path, monkeypatch):
     finally:
         loop._shutdown = True
         t.join(timeout=5)
-    assert st.position is not None  # 真实持仓保留
+    # 窗口 999900 已结束（time=1_001_100 > 999900+900）→ 真实持仓转入待结算
+    # （活跃槽释放；结算后台推进；启动核对不误清、不接管重复跟踪）
+    assert st.position is None
+    assert st.settle_pending is not None  # 真实持仓保留在待结算
     assert st.live_positions is not None  # 启动核对已执行
 
 
@@ -1350,12 +1355,12 @@ def test_settle_timeout_scales_with_window_step(tmp_path):
     assert st.position is None
 
 
-def test_stale_position_blocks_next_window_until_timeout(tmp_path):
-    """窗口结束未平仓（结算价迟迟不来）→ 下一窗口期间持仓占用、不开新仓；
-    超过 settle 超时（自适应 15m→1800s）后按当前价兜底结算 → 恢复开仓。
+def test_next_window_opens_immediately_after_window_end(tmp_path):
+    """窗口结束未平仓 → 持仓转待结算，新窗口立即开仓（不被旧仓结算阻塞）。
 
-    回归确认：结算等待是"有限阻塞"（最长 settle_timeout），不是永久占用；
-    窗口结束到结算完成前不主动市价卖（已结束窗口 token 盘口失效，卖出必失败）。
+    回归：结算价迟迟不来时旧逻辑持仓残留占用活跃槽 → 新窗口永不开仓；
+    新语义：位置释放只影响结算记账（后台 settle_pending 继续等/兜底），
+    交易不阻塞。结算超时后旧仓兜底记账（trades 有 settle 记录）。
     """
     ex = FakeExecutor()
     settled = make_market(price=0.55)  # 结算价永远在中间（gamma 未结算/不可达）
@@ -1366,23 +1371,21 @@ def test_stale_position_blocks_next_window_until_timeout(tmp_path):
         discovery=FakeDiscovery(make_market(price=0.5), settled=settled),
         executor=ex,
     )
-    # W1（999900–1000800）结束 +60s：进入结算等待
+    # W1（999900–1000800）结束 +60s（now=1_000_860 已在 W2 内）：
+    # 旧仓转待结算（活跃槽立即释放）+ W2 立即开仓（本 bug 核心：不被旧仓阻塞）
     loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
-    assert loop.state.position is not None  # 等待结算
-    # W2 开始：持仓仍占用 → 新窗口不开仓
-    loop.tick(now_ms=1_000_800_000)
-    assert loop.state.window_start == 1_000_800  # 已切换到新窗口
-    assert loop.state.position is not None  # 持仓保留（等待结算，非永久）
-    assert sum(1 for c in ex.calls if c[0] == "market_buy") == 0  # 新窗口未开仓
-    # 超过超时（W1 结束 +1800s = 1_002_600 之后）：按当前价兜底结算 → 旧持仓清除，
-    # 且系统立即在新窗口（1_002_600）重新开仓——证明占用是有限的，不是永久
-    loop.tick(now_ms=1_000_800_000 + 1_900_000)
     assert loop.state.position is not None
-    assert loop.state.position.window_start == 1_002_600  # 新窗口的新仓（旧仓已兜底结算）
-    assert loop.state.window_start == 1_002_600
+    assert loop.state.position.window_start == 1_000_800  # W2 的新仓
+    assert loop.state.settle_pending is not None  # 旧仓在后台结算（价未就绪）
+    assert sum(1 for c in ex.calls if c[0] == "market_buy") == 1  # W2 立即开仓
+    # W2 内后续 tick：不重复买入
+    loop.tick(now_ms=1_001_200_000)
+    assert sum(1 for c in ex.calls if c[0] == "market_buy") == 1
+    # 超过超时（W1 结束 +1800s = 1_002_600 之后）：W1 旧仓在后台兜底结算记账
+    # （trades 出现 settle 记录；settle_pending 槽此时为刚结束的 W2 仓，下一 tick 续结算）
+    loop.tick(now_ms=1_000_800_000 + 1_900_000)
     trades = Path(tmp_path, "trades.csv").read_text(encoding="utf-8")
     assert "settle" in trades  # 旧持仓有兜底结算记录
-    assert sum(1 for c in ex.calls if c[0] == "market_buy") == 1  # 新窗口恢复开仓
 
 
 def test_settle_uses_real_redeem_proceeds(tmp_path):
@@ -1426,11 +1429,12 @@ def test_settle_waits_for_redeem_confirmation(tmp_path):
         dry_run=False,
     )
     loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
-    assert loop.state.position is not None  # 未记账，持仓保留等待重试
+    assert loop.state.position is None  # 活跃仓位已释放
+    assert loop.state.settle_pending is not None  # 未记账：待结算等待重试
     assert not (Path(tmp_path) / "trades.csv").exists()  # 无 settle 记录
     ex.settle_proceeds_value = 1.9  # REDEEM 记录出现
     loop.tick(now_ms=999_900_000 + WINDOW_MS + 120_000)
-    assert loop.state.position is None  # 确认后结算
+    assert loop.state.settle_pending is None  # 确认后结算清空
     rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
     assert rows and rows[-1]["reason"] == "settle"
     assert float(rows[-1]["pnl"]) == pytest.approx(1.0)  # 1.9 − 2.0×0.45（真实兑付）
