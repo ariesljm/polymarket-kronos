@@ -23,10 +23,10 @@ DEFAULTS: dict = {
     "exit_loss_before_end_sec": 60,  # 窗口结束前 N 秒内浮亏 → 市价离场（0 = 关闭）
     "hold_until_end_sec": 60,        # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
     "no_entry_before_end_sec": 60,
+    "open_delay_sec": 0,          # 市场开始后 N 秒内不开仓（观察早期波动；0 = 关闭）
     "take_profit": 0.30,
     "take_profit_max": 0.95,
     "stop_loss": 0.20,
-    "time_stop_min": 10,
     "max_consecutive_losses": 10,
     "max_daily_loss": 10,
 }
@@ -50,7 +50,6 @@ class Config:
     take_profit: float
     take_profit_max: float
     stop_loss: float
-    time_stop_min: int
     max_consecutive_losses: int
     max_daily_loss: float
     max_klines: int
@@ -58,6 +57,8 @@ class Config:
     sample_count: int
     # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓，0 = 关闭）
     no_entry_before_end_sec: int = 0
+    # 市场开始后 N 秒内不开仓（0-300，0 = 关闭）
+    open_delay_sec: int = 0
 
 
 def load_config(path: str | Path) -> Config:
@@ -113,13 +114,15 @@ def load_config(path: str | Path) -> Config:
     elbe = _as_int(s.get("exit_loss_before_end_sec", DEFAULTS["exit_loss_before_end_sec"]), "exit_loss_before_end_sec")
     hte = _as_int(s.get("hold_until_end_sec", DEFAULTS["hold_until_end_sec"]), "hold_until_end_sec")
     nebs = _as_int(s.get("no_entry_before_end_sec", DEFAULTS["no_entry_before_end_sec"]), "no_entry_before_end_sec")
-    tsm = _as_int(s["time_stop_min"], "time_stop_min")
-    if cbe <= 0 or elbe < 0 or hte < 0 or nebs < 0 or tsm <= 0:
+    ods = _as_int(s.get("open_delay_sec", DEFAULTS["open_delay_sec"]), "open_delay_sec")
+    if cbe <= 0 or elbe < 0 or hte < 0 or nebs < 0:
         raise ConfigError(
-            "cancel_before_end_sec / time_stop_min 必须 > 0；"
+            "cancel_before_end_sec 必须 > 0；"
             "exit_loss_before_end_sec / hold_until_end_sec / "
             "no_entry_before_end_sec 必须 ≥ 0（0 表示关闭）"
         )
+    if not 0 <= ods <= 300:
+        raise ConfigError("open_delay_sec 必须在 0-300 秒之间（0 表示关闭开仓延迟）")
 
     mcl = _as_int(s["max_consecutive_losses"], "max_consecutive_losses")
     mdl = _as_float(s["max_daily_loss"], "max_daily_loss")
@@ -151,10 +154,10 @@ def load_config(path: str | Path) -> Config:
         exit_loss_before_end_sec=elbe,
         hold_until_end_sec=hte,
         no_entry_before_end_sec=nebs,
+        open_delay_sec=ods,
         take_profit=tp,
         take_profit_max=tpm,
         stop_loss=sl,
-        time_stop_min=tsm,
         max_consecutive_losses=mcl,
         max_daily_loss=mdl,
         max_klines=mk,

@@ -8,26 +8,6 @@ executor（成交）与 book_sampler（面板落盘）共用此处实现，避�
 from __future__ import annotations
 
 
-def best_price(book: dict | None, side: str, want_max: bool) -> float | None:
-    """从 CLOB orderbook 取最优价（极值）。
-
-    注意：asks/bids 内部排序不定（升/降序均见），且可能存在微小量垃圾挂单
-    污染极值——展示/成交应使用 weighted_price（按可成交量加权均价）。
-    """
-    if not book:
-        return None
-    levels = book.get(side) or []
-    prices = []
-    for level in levels:
-        try:
-            prices.append(float(level.get("price")))
-        except (TypeError, ValueError):
-            continue
-    if not prices:
-        return None
-    return max(prices) if want_max else min(prices)
-
-
 def weighted_price(book: dict | None, side: str, size: float = 5.0) -> float | None:
     """按可成交量加权均价：从最优档（asks 最低价 / bids 最高价）累计到 size 股。
 

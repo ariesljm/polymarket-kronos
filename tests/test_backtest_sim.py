@@ -22,15 +22,6 @@ def test_simulate_path_stop_loss():
     assert r["exit"] == pytest.approx(0.40)
 
 
-def test_simulate_path_time_stop():
-    """超时未盈利 → time_stop（以当时价格退出）。"""
-    # TIME_STOP_MIN=4 → 240s；价格 ≤ entry
-    path = [(0, 0.50), (300, 0.45)]
-    r = bs.simulate_path(path, entry_price=0.5, size=5, is_taker=False)
-    assert r["reason"] == "time_stop"
-    assert r["exit"] == pytest.approx(0.45)
-
-
 def test_simulate_path_window_end():
     """全程未触发 → 窗口结束以最后价退出。"""
     path = [(0, 0.50), (100, 0.55), (299, 0.58)]

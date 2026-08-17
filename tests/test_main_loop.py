@@ -16,7 +16,7 @@ import pytest
 from pmbot.config import Config
 from pmbot.main_loop import TradingLoop
 from pmbot.state import Position, StateStore, TradeState
-from pmbot.types import Direction, PendingOrder, Signal
+from pmbot.types import Direction, Fill, PendingOrder, Signal
 
 WINDOW_MS = 900_000
 
@@ -33,7 +33,6 @@ CFG = Config(
     take_profit=0.30,
     take_profit_max=0.95,
     stop_loss=0.20,
-    time_stop_min=10,
     max_consecutive_losses=10,
     max_daily_loss=10,
     max_klines=2048,
@@ -79,6 +78,7 @@ class FakeExecutor:
         self.best_bid_value = None
         self.best_ask_value = 0.42
         self.sell_proceeds_value = None
+        self.settle_proceeds_value = None
         self.live_positions_value = None
         self._sampler = None
 
@@ -99,17 +99,20 @@ class FakeExecutor:
 
     def market_sell(self, token_id, size):
         self.calls.append(("sell", token_id, size))
-        return {"order_id": "sell-oid", "price": self.best_bid_value}
+        return Fill(order_id="sell-oid", avg_price=self.best_bid_value)
 
     def sell_proceeds(self, order_id, token_id):
         return self.sell_proceeds_value
+
+    def settle_proceeds(self, condition_id):
+        return self.settle_proceeds_value
 
     def market_buy(self, token_id, amount):
         self.calls.append(("market_buy", token_id, amount))
         ask = self.best_ask(token_id)
         if ask is None:
             return None
-        return {"order_id": "dry-run-mk", "avg_price": ask, "filled_size": amount / ask}
+        return Fill(order_id="sim-mk", avg_price=ask, filled_size=amount / ask)
 
     def best_bid(self, token_id):
         return self.best_bid_value
@@ -140,7 +143,7 @@ def make_market(price=0.5):
 
 
 def make_loop(tmp_path, *, state=None, strategy=None, discovery=None, executor=None,
-              user_stream=None, config=None, dry_run=True):
+              user_stream=None, config=None, dry_run=True, poll_sec=1):
     st = state or TradeState(symbol="BTC", window_start=None)
     return TradingLoop(
         config=config or CFG,
@@ -153,6 +156,7 @@ def make_loop(tmp_path, *, state=None, strategy=None, discovery=None, executor=N
         status_path=Path(tmp_path) / "status.json",
         dry_run=dry_run,
         user_stream=user_stream,
+        poll_sec=poll_sec,
     )
 
 
@@ -231,7 +235,9 @@ def test_pending_order_fill_creates_position(tmp_path):
         symbol="BTC", window_start=999_900, window_bet_placed=True,
         pending_order=make_pending(order_id="oid-1"),
     )
-    loop = make_loop(tmp_path, executor=ex, state=st)
+    loop = make_loop(tmp_path, executor=ex, state=st,
+        dry_run=False,
+    )
     loop.tick(now_ms=1_000_000_000)
     assert loop.state.pending_order is not None  # live 未成交
     ex.filled = True  # 下一 tick 订单已成交
@@ -248,7 +254,9 @@ def test_pending_not_filled_keeps_pending(tmp_path):
         symbol="BTC", window_start=999_900, window_bet_placed=True,
         pending_order=make_pending(order_id="oid-1"),
     )
-    loop = make_loop(tmp_path, executor=ex, state=st)
+    loop = make_loop(tmp_path, executor=ex, state=st,
+        dry_run=False,
+    )
     loop.tick(now_ms=1_000_000_000)
     loop.tick(now_ms=1_000_100_000)  # 未成交
     assert loop.state.pending_order is not None
@@ -621,34 +629,16 @@ def test_settle_timeout_fallback(tmp_path):
     assert "settle" in trades
 
 
-def test_tick_records_market_prices(tmp_path):
-    """每个 tick 把 UP/DOWN 盘口价写入状态（面板展示用）。"""
+def test_tick_no_longer_writes_market_prices(tmp_path):
+    """tick 不再写 status.market_prices：面板盘口单一来源 book.json（候选 4）。
+
+    回归：tick 的 4 次盘口写入是死工作（monitor 实际读 book.json 覆盖 status）。
+    """
     ex = FakeExecutor()
-    ex.best_bid_value = 0.40
     loop = make_loop(tmp_path, executor=ex,
                      state=TradeState(symbol="BTC", window_start=999_900))
     loop.tick(now_ms=1_000_000_000)
-    p = loop.state.market_prices
-    assert p is not None
-    assert p["up_ask"] == 0.42
-    assert p["up_bid"] == 0.40
-    assert p["down_ask"] == 0.42
-    assert p["down_bid"] == 0.40
-
-
-def test_market_prices_errors_do_not_break_tick(tmp_path):
-    """盘口查询失败不影响 tick（跳过写入，_build_view 不查 bid 故不受影响）。"""
-    ex = FakeExecutor()
-    ex.best_bid_value = 0.40
-
-    def boom(*a, **k):
-        raise RuntimeError("query failed")
-
-    ex.best_bid = boom
-    loop = make_loop(tmp_path, executor=ex,
-                     state=TradeState(symbol="BTC", window_start=999_900))
-    loop.tick(now_ms=1_000_000_000)  # 不抛异常即可
-    assert loop.state.market_prices is None  # 查询失败 → 跳过写入
+    assert loop.state.market_prices is None  # 不再写入（保留字段供 monitor 回退）
 
 
 def test_dry_run_fills_immediately_on_place_when_ask_below_limit(tmp_path):
@@ -672,9 +662,9 @@ def test_market_buy_uses_latest_ask_even_if_volatile(tmp_path):
 
         def best_ask(self, token_id):
             self.ask_calls += 1
-            # market_prices(up_ask, down_ask) + _build_view 共 3 次 → 0.42；
-            # _execute 市价查询（第 4 次）→ 0.50（盘口已涨回）→ 按 0.50 成交
-            return 0.42 if self.ask_calls <= 3 else 0.50
+            # tick 不再预写 market_prices：_build_view（第 1 次）→ 0.42；
+            # _execute 市价查询（第 2 次）→ 0.50（盘口已涨回）→ 按 0.50 成交
+            return 0.42 if self.ask_calls == 1 else 0.50
 
     ex = VolatileAskExecutor()
     st = TradeState(symbol="BTC", window_start=999_900)
@@ -826,7 +816,9 @@ def test_user_event_other_order_ignored(tmp_path):
     )
     stream = FakeUserStream([("order", {"event_type": "order", "id": "other-id",
                                         "status": "filled"})])
-    loop = make_loop(tmp_path, executor=ex, state=st, user_stream=stream)
+    loop = make_loop(tmp_path, executor=ex, state=st, user_stream=stream,
+        dry_run=False,
+    )
     loop.tick(now_ms=1_000_000_000)
     assert st.pending_order is not None
     assert st.position is None
@@ -867,7 +859,8 @@ def test_ws_connected_skips_get_order_polling(tmp_path):
         symbol="BTC", window_start=999_900, window_bet_placed=True,
         pending_order=make_pending(order_id="real-oid-1"),
     )
-    loop = make_loop(tmp_path, executor=ex, state=st, user_stream=ConnectedStream())
+    loop = make_loop(tmp_path, executor=ex, state=st, dry_run=False,
+                     user_stream=ConnectedStream())
     loop.refresh_pending(make_market(), 1_000_000)
     assert ex.get_order_calls == 0
     assert st.pending_order is not None  # WS 无事件 → 挂单保持
@@ -882,7 +875,7 @@ def test_ws_disconnected_falls_back_to_polling(tmp_path):
     )
     stream = ConnectedStream()
     stream.connected = False
-    loop = make_loop(tmp_path, executor=ex, state=st, user_stream=stream)
+    loop = make_loop(tmp_path, executor=ex, state=st, user_stream=stream, dry_run=False)
     loop.refresh_pending(make_market(), 1_000_000)
     assert ex.get_order_calls == 1  # 轮询兜底
 
@@ -892,7 +885,9 @@ def test_ws_disconnected_falls_back_to_polling(tmp_path):
         symbol="BTC", window_start=999_900, window_bet_placed=True,
         pending_order=make_pending(order_id="real-oid-3"),
     )
-    loop2 = make_loop(tmp_path, executor=ex2, state=st2)
+    loop2 = make_loop(tmp_path, executor=ex2, state=st2,
+        dry_run=False,
+    )
     loop2.refresh_pending(make_market(), 1_000_000)
     assert ex2.get_order_calls == 1
 
@@ -1250,24 +1245,240 @@ def test_start_skips_in_progress_window(tmp_path):
 
 
 def test_settle_pnl_uses_settle_price(tmp_path):
-    """结算（窗口到期自动兑付）盈亏 = 理论价差（结算价 − 入场价）× 股数。
-
-    V2 无手续费：兑付额 = size×1.0，成本 = size×entry_price，理论价差即净盈亏。
-    """
+    """结算（窗口到期自动兑付）盈亏 = 真实兑付到账 − 成本（V2 无手续费：兑付额 = size×1.0）。"""
     class FeeExecutor(BalanceExecutor):
         def market_buy(self, token_id, amount):
-            return {"order_id": "mk-1", "avg_price": 0.57, "filled_size": 1.754384}
+            return Fill(order_id="mk-1", avg_price=0.57, filled_size=1.754384)
 
     ex = FeeExecutor(balance=8.788843)
+    ex.settle_proceeds_value = 1.754384  # REDEEM 兑付到账 = size×1.0
     settled = make_market(price=1.0)  # 结算后 Up=1 → 兑付 1.754384
     loop = make_loop(tmp_path, executor=ex, dry_run=False,
                      discovery=FakeDiscovery(make_market(), settled=settled))
     loop.tick(now_ms=1_000_000_000)  # 入场
     pos = loop.state.position
     assert pos.size == 1.754384  # 实际成交股数
-    # 窗口结束结算：无卖出订单，走理论价差
+    # 窗口结束结算：真实兑付记账
     loop.tick(now_ms=1_000_000_000 + WINDOW_MS + 60_000)  # 跨窗口：结算旧持仓 → 新窗口重新入场
     rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
     assert rows and rows[-1]["reason"] == "settle"
     pnl = float(rows[-1]["pnl"])
-    assert pnl == pytest.approx(1.754384 * (1 - 0.57))  # 兑付 − 成本（理论价差）
+    assert pnl == pytest.approx(1.754384 * (1 - 0.57))  # 兑付到账 − 成本
+
+
+# ---- 启动序列（run_forever）：启动即核对链上持仓，清除幽灵持仓 ----
+
+
+def test_run_forever_startup_clears_ghost_position(tmp_path):
+    """run_forever 启动序列：本地残留幽灵持仓（链上已无）→ 启动瞬间清除并落盘。
+
+    回归：意外退出（杀进程/关终端）后 status.json 残留旧 position，重启后
+    占用持仓槽位导致新窗口不开仓——启动核对当场纠正，不等 30s 轮询/180s 宽限。
+    """
+    import json
+    import threading
+    import time as _time
+
+    ex = FakeExecutor()
+    ex.live_positions_value = []  # 链上已无本标的持仓（已结算兑付）
+    st = TradeState(symbol="BTC", window_start=999_900, mode="live")
+    st.position = make_position(window=999_900)  # 旧窗口幽灵持仓
+    loop = make_loop(tmp_path, state=st, executor=ex, dry_run=False, poll_sec=1)
+
+    t = threading.Thread(target=loop.run_forever, daemon=True)
+    t.start()
+    try:
+        deadline = _time.time() + 5
+        while _time.time() < deadline and st.position is not None:
+            _time.sleep(0.05)
+    finally:
+        loop._shutdown = True
+        t.join(timeout=5)
+    assert st.position is None  # 幽灵持仓被启动核对清除
+    saved = json.loads((Path(tmp_path) / "status.json").read_text(encoding="utf-8"))
+    assert saved["position"] is None  # 落盘一致
+
+
+def test_run_forever_startup_keeps_real_position(tmp_path, monkeypatch):
+    """run_forever 启动序列：链上仍有真实持仓 → 保留并继续管理（防误清）。"""
+    import threading
+    import time as _time
+
+    # 窗口 999900 已结束（>1_000_800）但未到 30s 结算超时（<1_002_600）：
+    # tick 的 _settle 只等待不丢弃，持仓保留由启动核对决定
+    monkeypatch.setattr(_time, "time", lambda: 1_001_100)
+    ex = FakeExecutor()
+    ex.live_positions_value = [{
+        "asset": "tok1", "size": 5.0, "avgPrice": 0.5, "title": "Bitcoin Up or Down - Aug 16",
+        "outcome": "Up", "slug": "btc-updown-15m-999900",
+    }]
+    st = TradeState(symbol="BTC", window_start=999_900, mode="live")
+    st.position = make_position(window=999_900)
+    loop = make_loop(tmp_path, state=st, executor=ex, dry_run=False, poll_sec=1)
+
+    t = threading.Thread(target=loop.run_forever, daemon=True)
+    t.start()
+    try:
+        for _ in range(50):
+            if st.live_positions is not None:
+                break  # 启动核对已执行（live_positions 快照刷新）
+            _time.sleep(0.05)
+    finally:
+        loop._shutdown = True
+        t.join(timeout=5)
+    assert st.position is not None  # 真实持仓保留
+    assert st.live_positions is not None  # 启动核对已执行
+
+
+def test_settle_timeout_scales_with_window_step(tmp_path):
+    """结算超时按窗口步长自适应：5m 窗口 = 10 分钟，不是固定 1800s。
+
+    回归：5m 市场 gamma 结算几分钟即出结果，固定 30 分钟兜底会让残留持仓
+    卡 6 个窗口不交易。
+    """
+    class ShortDiscovery(FakeDiscovery):
+        step_ms = 300_000  # 5m 窗口
+        interval = "5m"
+
+    disc = ShortDiscovery(settled=None)
+    st = TradeState(symbol="BTC", window_start=999_900,
+                    position=make_position(window=997_000))
+    loop = make_loop(tmp_path, state=st, discovery=disc)
+    assert loop.settle_timeout_sec == 600  # max(2*300, 300)
+    # 窗口结束 + 601s（> 超时 600s）→ 丢弃
+    loop.tick(now_ms=1_000_000_000)
+    assert st.position is None
+
+
+def test_stale_position_blocks_next_window_until_timeout(tmp_path):
+    """窗口结束未平仓（结算价迟迟不来）→ 下一窗口期间持仓占用、不开新仓；
+    超过 settle 超时（自适应 15m→1800s）后按当前价兜底结算 → 恢复开仓。
+
+    回归确认：结算等待是"有限阻塞"（最长 settle_timeout），不是永久占用；
+    窗口结束到结算完成前不主动市价卖（已结束窗口 token 盘口失效，卖出必失败）。
+    """
+    ex = FakeExecutor()
+    settled = make_market(price=0.55)  # 结算价永远在中间（gamma 未结算/不可达）
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(symbol="BTC", window_start=999_900, window_bet_placed=True,
+                         position=make_position()),
+        discovery=FakeDiscovery(make_market(price=0.5), settled=settled),
+        executor=ex,
+    )
+    # W1（999900–1000800）结束 +60s：进入结算等待
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
+    assert loop.state.position is not None  # 等待结算
+    # W2 开始：持仓仍占用 → 新窗口不开仓
+    loop.tick(now_ms=1_000_800_000)
+    assert loop.state.window_start == 1_000_800  # 已切换到新窗口
+    assert loop.state.position is not None  # 持仓保留（等待结算，非永久）
+    assert sum(1 for c in ex.calls if c[0] == "market_buy") == 0  # 新窗口未开仓
+    # 超过超时（W1 结束 +1800s = 1_002_600 之后）：按当前价兜底结算 → 旧持仓清除，
+    # 且系统立即在新窗口（1_002_600）重新开仓——证明占用是有限的，不是永久
+    loop.tick(now_ms=1_000_800_000 + 1_900_000)
+    assert loop.state.position is not None
+    assert loop.state.position.window_start == 1_002_600  # 新窗口的新仓（旧仓已兜底结算）
+    assert loop.state.window_start == 1_002_600
+    trades = Path(tmp_path, "trades.csv").read_text(encoding="utf-8")
+    assert "settle" in trades  # 旧持仓有兜底结算记录
+    assert sum(1 for c in ex.calls if c[0] == "market_buy") == 1  # 新窗口恢复开仓
+
+
+def test_settle_uses_real_redeem_proceeds(tmp_path):
+    """实盘结算：读取链上 REDEEM 真实兑付（usdcSize）记账 → 到账 − 成本。
+
+    usdcSize 1.9（≠ 理论 2.0×1.0）：若走理论价差会是 1.1，断言 1.0 证明用了真实兑付。
+    """
+    ex = FakeExecutor()
+    ex.settle_proceeds_value = 1.9  # 实际兑付到账（含本金）
+    settled = make_market(price=1.0)
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(symbol="BTC", window_start=999_900, window_bet_placed=True,
+                         position=make_position()),  # UP 2.0 股 @ 0.45
+        discovery=FakeDiscovery(None, settled=settled),
+        executor=ex,
+        dry_run=False,
+    )
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
+    assert loop.state.position is None
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    assert rows and rows[-1]["reason"] == "settle"
+    assert float(rows[-1]["pnl"]) == pytest.approx(1.0)  # 1.9 − 2.0×0.45（真实兑付）
+
+
+def test_settle_waits_for_redeem_confirmation(tmp_path):
+    """实盘结算：真实兑付未确认（None）→ 不记账不回退，继续重试；确认后按真实到账记账。
+
+    回归：REDEEM 记录可能晚于结算价出现（链上兑付延迟/网络瞬时失败），
+    此时若回退理论价差会与钱包真实口径不一致——等待重试直到确认。
+    """
+    ex = FakeExecutor()
+    ex.settle_proceeds_value = None  # 第一次查询：兑付未确认
+    settled = make_market(price=1.0)
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(symbol="BTC", window_start=999_900, window_bet_placed=True,
+                         position=make_position()),  # UP 2.0 股 @ 0.45
+        discovery=FakeDiscovery(None, settled=settled),
+        executor=ex,
+        dry_run=False,
+    )
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
+    assert loop.state.position is not None  # 未记账，持仓保留等待重试
+    assert not (Path(tmp_path) / "trades.csv").exists()  # 无 settle 记录
+    ex.settle_proceeds_value = 1.9  # REDEEM 记录出现
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 120_000)
+    assert loop.state.position is None  # 确认后结算
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    assert rows and rows[-1]["reason"] == "settle"
+    assert float(rows[-1]["pnl"]) == pytest.approx(1.0)  # 1.9 − 2.0×0.45（真实兑付）
+
+
+def test_settle_loss_settled_price_zero_clears_immediately(tmp_path):
+    """实盘结算：结算价归零（输的仓）→ 立即按成本记账清仓，不等待 REDEEM。
+
+    回归：输的仓永远不会有 REDEEM 兑付记录，若与赢的仓一样等 REDEEM 确认，
+    持仓会永久占用 → 新窗口无法开仓（事故：01:20 窗口 DOWN 输后卡死 2+ 窗口）。
+    """
+    ex = FakeExecutor()
+    ex.settle_proceeds_value = None  # 输的仓：REDEEM 永不会出现
+    settled = make_market(price=0.005)  # 结算价接近 0（gamma 显示残值）
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(symbol="BTC", window_start=999_900, window_bet_placed=True,
+                         position=make_position()),  # UP 2.0 股 @ 0.45
+        discovery=FakeDiscovery(None, settled=settled),
+        executor=ex,
+        dry_run=False,
+    )
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
+    assert loop.state.position is None  # 立即清仓，不等待
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    assert rows and rows[-1]["reason"] == "settle"
+    assert float(rows[-1]["pnl"]) == pytest.approx(0.005 * 2.0 - 2.0 * 0.45)  # 残值×股数 − 成本
+
+
+def test_settle_mid_price_after_timeout_forces_close(tmp_path):
+    """实盘结算：结算价长时间停在中间（市场迟迟不结算）→ 超时后按当前价兜底记账。
+
+    回归：原逻辑超时后仍等待 REDEEM 确认（永远 None）→ 持仓永久占用。
+    """
+    ex = FakeExecutor()
+    ex.settle_proceeds_value = None  # REDEEM 永不会出现
+    settled = make_market(price=0.55)  # 结算价一直停在中间
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(symbol="BTC", window_start=999_900, window_bet_placed=True,
+                         position=make_position()),
+        discovery=FakeDiscovery(None, settled=settled),
+        executor=ex,
+        dry_run=False,
+    )
+    # 超过 settle_timeout（15m 窗口 = 1800s）：tick 在窗口结束 2000s 后
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 2_000_000)
+    assert loop.state.position is None  # 兜底记账清仓
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    assert rows and rows[-1]["reason"] == "settle"
+    assert float(rows[-1]["pnl"]) == pytest.approx(2.0 * 0.55 - 2.0 * 0.45)  # 按当前价

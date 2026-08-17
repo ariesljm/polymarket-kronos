@@ -2,26 +2,34 @@
 
 import pytest
 
-from pmbot.book_price import best_price as _best_price
 from pmbot.clob_executor import ClobExecutor, SimExecutor
 
 
 def test_dry_run_place_and_sell():
     ex = SimExecutor(private_key="0x" + "0" * 64)
     oid = ex.place_limit("111", "buy", 0.45, 5.0)
-    assert oid and oid.startswith("dry-run-")
+    assert oid and oid.startswith("sim-")
     oid2 = ex.sell("111", 5.0, 0.80)
-    assert oid2 and oid2.startswith("dry-run-")
+    assert oid2 and oid2.startswith("sim-")
 
 
-def test_dry_run_market_buy_sell():
+def test_dry_run_market_buy_sell(monkeypatch):
     """市价单不受 5 股/金额限制（服务端按金额换算份额，可小数）。"""
     ex = SimExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "best_ask", lambda t: 0.50)  # 无盘口时注入报价
+    monkeypatch.setattr(ex, "best_bid", lambda t: 0.30)
     assert ex.market_buy("111", 2.38) is not None  # 小数份额
     assert ex.market_buy("111", 0.5) is not None   # 低于 5 股也放行
     r = ex.market_sell("111", 2.38)
-    assert r is not None and r["price"] == ex.best_bid("111")  # dry-run 按 best_bid 成交
-    assert r["order_id"] is None and ex.sell_proceeds("x", "111") is None  # 无真实订单
+    assert r is not None and r.avg_price == 0.30  # dry-run 按 best_bid 成交
+    assert r.order_id is None and ex.sell_proceeds("x", "111") is None  # 无真实订单
+
+
+def test_dry_run_market_buy_without_book_returns_none(monkeypatch):
+    """dry-run 无盘口报价 → 不建仓（与实盘“缺成交数据放弃建仓”同语义）。"""
+    ex = SimExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "best_ask", lambda t: None)
+    assert ex.market_buy("111", 2.38) is None
 
 
 def test_order_rules_enforced():
@@ -40,7 +48,7 @@ def test_order_rules_enforced():
 
 def test_dry_run_cancel():
     ex = SimExecutor(private_key="0x" + "0" * 64)
-    assert ex.cancel("dry-run-abc") is True
+    assert ex.cancel("sim-abc") is True
     assert ex.cancel("anything") is True
 
 
@@ -51,25 +59,6 @@ def test_missing_key_raises_on_real_call(monkeypatch):
     ex = ClobExecutor()
     with pytest.raises(RuntimeError, match="私钥"):
         ex._get_l1()
-
-
-def test_best_price_ascending_bids():
-    # bids 升序（CLOB 约定），best bid = max
-    book = {"bids": [{"price": "0.30"}, {"price": "0.35"}, {"price": "0.40"}]}
-    assert _best_price(book, "bids", want_max=True) == 0.40
-
-
-def test_best_price_descending_asks():
-    # asks 降序（CLOB 约定），best ask = min
-    book = {"asks": [{"price": "0.60"}, {"price": "0.55"}, {"price": "0.50"}]}
-    assert _best_price(book, "asks", want_max=False) == 0.50
-
-
-def test_best_price_handles_missing_and_bad_levels():
-    assert _best_price(None, "bids", want_max=True) is None
-    book = {"bids": [{"price": "bad"}, {"price": "0.31"}]}
-    assert _best_price(book, "bids", want_max=True) == 0.31
-    assert _best_price({"bids": []}, "bids", want_max=True) is None
 
 
 def test_min_shares_for_price():
@@ -128,9 +117,9 @@ def test_parse_fill_uses_order_detail(monkeypatch):
         "status": "MATCHED", "side": "BUY",
     })
     fill = ex._parse_fill({"orderID": "0x953b", "status": "matched"})
-    assert fill["order_id"] == "0x953b"
-    assert fill["filled_size"] == pytest.approx(1.754384)  # 实际股数（网页 1.8）
-    assert fill["avg_price"] == pytest.approx(0.57)  # 实际成交价（不含费）
+    assert fill.order_id == "0x953b"
+    assert fill.filled_size == pytest.approx(1.754384)  # 实际股数（网页 1.8）
+    assert fill.avg_price == pytest.approx(0.57)  # 实际成交价（不含费）
 
 
 def test_parse_fill_taking_amount_fallback(monkeypatch):
@@ -139,8 +128,8 @@ def test_parse_fill_taking_amount_fallback(monkeypatch):
     monkeypatch.setattr(ex, "get_order", lambda oid: None)
     fill = ex._parse_fill({"orderID": "0x953b", "takingAmount": "1.754384",
                            "status": "matched", "success": True})
-    assert fill["filled_size"] == pytest.approx(1.754384)
-    assert fill["avg_price"] is None  # 无价格字段 → 调用方回退盘口价
+    assert fill.filled_size == pytest.approx(1.754384)
+    assert fill.avg_price is None  # 无价格字段 → 调用方回退盘口价
 
 
 def test_parse_fill_making_taking_actual_price(monkeypatch):
@@ -154,8 +143,8 @@ def test_parse_fill_making_taking_actual_price(monkeypatch):
     monkeypatch.setattr(ex, "get_order", lambda oid: {"price": "0.16", "size_matched": "6.666665"})
     fill = ex._parse_fill({"orderID": "0x953b", "makingAmount": "0.999999",
                            "takingAmount": "6.666665", "status": "matched"})
-    assert fill["avg_price"] == pytest.approx(0.999999 / 6.666665)  # 0.15（网页口径）
-    assert fill["filled_size"] == pytest.approx(6.666665)
+    assert fill.avg_price == pytest.approx(0.999999 / 6.666665)  # 0.15（网页口径）
+    assert fill.filled_size == pytest.approx(6.666665)
 
 
 def test_parse_fill_sell_making_taking_direction(monkeypatch):
@@ -168,5 +157,40 @@ def test_parse_fill_sell_making_taking_direction(monkeypatch):
     monkeypatch.setattr(ex, "get_order", lambda oid: None)
     fill = ex._parse_fill({"orderID": "0xabc", "makingAmount": "1.9608",
                            "takingAmount": "0.549", "status": "matched"}, side="sell")
-    assert fill["avg_price"] == pytest.approx(0.549 / 1.9608)  # 0.28（网页口径）
-    assert fill["filled_size"] == pytest.approx(1.9608)  # 卖单股数 = makingAmount
+    assert fill.avg_price == pytest.approx(0.549 / 1.9608)  # 0.28（网页口径）
+    assert fill.filled_size == pytest.approx(1.9608)  # 卖单股数 = makingAmount
+
+
+class _FakeClient:
+    """最小 clob 客户端替身：可配置市价单响应。"""
+
+    def __init__(self, resp):
+        self.resp = resp
+
+    def create_and_post_market_order(self, *a, **k):
+        return self.resp
+
+
+def test_market_buy_missing_data_returns_none(monkeypatch):
+    """实盘市价买入成交但 API 缺实际成交数据（avg/size 缺）→ 放弃建仓（None）。
+
+    对应架构深化候选 3：该分支曾藏在 main_loop._exec_place_market 且经现有
+    interface 不可测（FakeExecutor 永远返回完整 dict）；已收进执行器成为
+    成交语义的一部分，可注入缺字段响应直测。
+    """
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "_get_client",
+                        lambda: _FakeClient({"orderID": "oid-1", "status": "matched"}))
+    assert ex.market_buy("111", 1.0) is None
+
+
+def test_market_sell_falls_back_to_best_bid(monkeypatch):
+    """卖单价取不到 → 执行器回退 best_bid（不再由调用方各自回退）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "_get_client",
+                        lambda: _FakeClient({"orderID": "oid-2", "status": "matched"}))
+    monkeypatch.setattr(ex, "best_bid", lambda t: 0.40)
+    fill = ex.market_sell("111", 2.0)
+    assert fill is not None
+    assert fill.order_id == "oid-2"
+    assert fill.avg_price == pytest.approx(0.40)

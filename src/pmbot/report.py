@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,7 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     symbol = cfg.symbols[0]
     acc = PredictionLog(args.data_dir, symbol).accuracy()
-    stats = compute_stats(f"{args.data_dir}/trades.csv", acc)
+    # 统一读面（账本）：实盘 API 流水优先，缺回退引擎业务记录
+    from pmbot.ledger import load_records
+
+    stats = compute_stats(load_records(args.data_dir), acc)
     params = {
         "amount_per_trade": cfg.amount_per_trade,
         "p_up_buy": cfg.p_up_buy,

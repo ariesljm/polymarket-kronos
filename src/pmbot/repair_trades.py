@@ -27,7 +27,6 @@ from datetime import datetime
 from pathlib import Path
 
 from pmbot.clob_executor import ClobExecutor
-from py_clob_client_v2.clob_types import TradeParams
 
 SELL_REASONS = {"take_profit", "stop_loss", "sell"}  # 有卖出订单的交易
 BOOK_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*book\?token_id=(\d{20,})")
@@ -59,13 +58,7 @@ def _extract_token(log_path: Path, before_ts: float) -> str | None:
 def _fetch_window_trades(executor: ClobExecutor, asset_id: str,
                          after: float, before: float) -> list[dict]:
     """拉取某 token 在 [after, before] 内的成交（CLOB 时间窗过滤）。"""
-    try:
-        return executor._get_client().get_trades(
-            TradeParams(asset_id=asset_id, after=int(after), before=int(before)),
-            only_first_page=True,
-        ) or []
-    except Exception:
-        return []
+    return executor.fetch_token_trades(asset_id, int(after), int(before))
 
 
 def repair_row(executor: ClobExecutor, log_path: Path, row: dict) -> dict | None:

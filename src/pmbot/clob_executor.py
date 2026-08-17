@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 
 from pmbot.book_price import weighted_price
+from pmbot.types import Fill
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +51,10 @@ class TradeExecutor(Protocol):
     （CancelExecutor，见 market_lifecycle）。
     """
 
-    def market_buy(self, token_id: str, amount: float) -> dict | None: ...
-    def market_sell(self, token_id: str, size: float) -> dict | None: ...
+    def market_buy(self, token_id: str, amount: float) -> "Fill | None": ...
+    def market_sell(self, token_id: str, size: float) -> "Fill | None": ...
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None: ...
+    def settle_proceeds(self, condition_id: str) -> float | None: ...
     def place_limit(self, token_id: str, side: str, price: float, size: float) -> str | None: ...
     def sell(self, token_id: str, size: float, price: float) -> str | None: ...
     def cancel(self, order_id: str) -> bool: ...
@@ -231,6 +233,90 @@ class ClobExecutor:
         except Exception:
             return None
 
+    def settle_proceeds(self, condition_id: str) -> float | None:
+        """结算兑付真实到账（data-api /activity REDEEM）：匹配 conditionId 的 REDEEM 记录 usdcSize。
+        市场结算后赢的持仓自动兑付为 USDC（链上 REDEEM 交易），usdcSize 为实际到账
+        金额（含本金）；结算记账用 到账 − 成本 替代理论价差，口径与钱包一致。
+        查询失败/无匹配记录返回 None——调用方回退理论价差（与 sell_proceeds 同模式）。
+        """
+        import requests
+
+        addr = self._proxy_wallet
+        if not addr or not condition_id:
+            return None
+        try:
+            r = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": addr, "type": "REDEEM", "limit": 200},
+                proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if not isinstance(data, list):
+                return None
+            want = str(condition_id).lower()
+            for a in data:
+                if str(a.get("conditionId") or "").lower() == want:
+                    usdc = a.get("usdcSize")
+                    if usdc is not None:
+                        return float(usdc)
+            return None  # 有响应但该市场尚未 REDEEM（结算延迟/未兑付）
+        except Exception:
+            return None
+
+    @property
+    def wallet_address(self) -> str | None:
+        """代理钱包地址（交易历史同步用）。"""
+        return self._proxy_wallet
+
+    def fetch_trade_page(self, offset: int = 0, limit: int = 500) -> list[dict]:
+        """成交流水分页（data-api /activity?type=TRADE，倒序最新在前）；失败返回 []。
+
+        用 /activity 而非 /trades：前者带 usdcSize（含手续费的美元金额），
+        统计/报表切 API 口径需要它。失败返回 []（同步器静默跳过）。
+        """
+        import requests
+
+        addr = self._proxy_wallet
+        if not addr:
+            return []
+        try:
+            r = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": addr, "type": "TRADE", "limit": limit, "offset": offset},
+                proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def fetch_redeem_page(self, offset: int = 0, limit: int = 500) -> list[dict]:
+        """结算兑付分页（data-api /activity?type=REDEEM，倒序最新在前）；失败返回 []。"""
+        import requests
+
+        addr = self._proxy_wallet
+        if not addr:
+            return []
+        try:
+            r = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": addr, "type": "REDEEM", "limit": limit, "offset": offset},
+                proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
     def _load_creds(self) -> ApiCreds | None:
         """从本地缓存读取 ApiCreds（避免每次重新派生/400 噪音）。"""
         from py_clob_client_v2 import ApiCreds
@@ -285,12 +371,14 @@ class ClobExecutor:
         """限价卖出持仓（止盈/止损）。"""
         return self.place_limit(token_id, "sell", price, size)
 
-    def market_buy(self, token_id: str, amount: float) -> dict | None:
+    def market_buy(self, token_id: str, amount: float) -> Fill | None:
         """市价买入（FOK）。amount 为美元金额（SDK 语义：BUY=$$$）。
 
-        返回真实成交数据 {"order_id", "avg_price", "filled_size"}：优先取订单响应
-        的 averagePrice/matchedAmount，缺省时用 get_order 补查（以 API 为准，
-        不靠本地盘口估算）；仍取不到时字段为 None（调用方回退）。下单失败返回 None。
+        返回 Fill（order_id/avg_price/filled_size）：优先取订单响应的
+        averagePrice/matchedAmount，缺省时用 get_order 补查（以 API 为准，
+        不靠本地盘口估算）。下单失败，或下单成功但 API 未返回实际成交数据
+        （avg/size 缺）→ 返回 None：放弃建仓追踪，资金由 Polymarket 结算自动
+        兑付（回归：盘口估算曾导致持仓股数记错 1.9231 vs 实际 1.7544）。
         """
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
 
@@ -307,9 +395,15 @@ class ClobExecutor:
             logger.warning("市价买入失败：无响应 token=%s", token_id[:16])
             return None
         logger.info("市价买入响应：%s", resp)
-        return self._parse_fill(resp, side="buy")
+        fill = self._parse_fill(resp, side="buy")
+        if fill.avg_price is None or fill.filled_size is None:
+            # 订单已成交但 API 未返回实际成交数据：放弃建仓追踪（防假持仓）。
+            logger.warning("市价买入成交但缺实际成交数据（avg=%s size=%s），放弃建仓追踪",
+                           fill.avg_price, fill.filled_size)
+            return None
+        return fill
 
-    def _parse_fill(self, resp: dict, side: str = "buy") -> dict:
+    def _parse_fill(self, resp: dict, side: str = "buy") -> Fill:
         """从订单响应/详情提取真实成交（均价/份额）；缺失字段为 None。
 
         优先订单详情（get_order：price/size_matched 为服务端实际成交）；
@@ -355,14 +449,14 @@ class ClobExecutor:
             except (TypeError, ValueError):
                 return None
 
-        return {"order_id": oid, "avg_price": _f(avg), "filled_size": _f(filled)}
+        return Fill(order_id=oid, avg_price=_f(avg), filled_size=_f(filled))
 
-    def market_sell(self, token_id: str, size: float) -> dict | None:
-        """市价卖出持仓（FOK），返回 {"order_id", "price"}（成交价取不到为 None）。
+    def market_sell(self, token_id: str, size: float) -> Fill | None:
+        """市价卖出持仓（FOK），返回 Fill（order_id/avg_price）。
 
-        price 为成交均价近似（响应字段 → 订单详情 price）；取不到由调用方回退 best_bid。
-        order_id 供 sell_proceeds 聚合真实到账（卖出收入）。成交解析与买入共用
-        _parse_fill（单一事实源：making/taking → get_order 补查）。
+        avg_price 为成交均价近似（响应字段 → 订单详情 price，卖单 making/taking
+        方向反算）；取不到时回退 best_bid（0.0 为最后防御）。order_id 供
+        sell_proceeds 聚合真实到账。成交解析与买入共用 _parse_fill（单一事实源）。
         """
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
 
@@ -379,7 +473,10 @@ class ClobExecutor:
         if not isinstance(resp, dict):
             return None
         fill = self._parse_fill(resp, side="sell")  # 卖单 making/taking 方向与买单相反
-        return {"order_id": fill["order_id"], "price": fill["avg_price"]}
+        if fill.avg_price is None:
+            # 价格回退在成交语义内（调用方不再各自 best_bid）
+            fill = Fill(order_id=fill.order_id, avg_price=self.best_bid(token_id) or 0.0)
+        return fill
 
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None:
         """卖出订单的真实到账（Polymarket 成交聚合）：Σ(price×size×(1−fee_bps/10000))。
@@ -410,6 +507,18 @@ class ClobExecutor:
     def get_order(self, order_id: str) -> dict | None:
         """查询订单状态（成交检测）。"""
         return self._get_client().get_order(order_id)
+
+    def fetch_token_trades(self, asset_id: str, after: int, before: int) -> list[dict]:
+        """CLOB 时间窗成交查询（repair_trades 历史对账用，公开方法替代 _get_client 穿透）。"""
+        from py_clob_client_v2 import TradeParams
+
+        try:
+            return self._get_client().get_trades(
+                TradeParams(asset_id=asset_id, after=after, before=before),
+                only_first_page=True,
+            ) or []
+        except Exception:
+            return []
 
     def cancel(self, order_id: str) -> bool:
         try:
@@ -503,29 +612,29 @@ class SimExecutor:
         """真实钱包持仓（dry-run 仅展示用，不参与模拟交易决策）。"""
         return self._live.live_positions(user)
 
+    def settle_proceeds(self, condition_id: str) -> float | None:
+        """真实兑付查询（dry-run 模拟仓与真实钱包无对应 conditionId → None 走理论价差）。"""
+        return self._live.settle_proceeds(condition_id)
+
     def place_limit(self, token_id: str, side: str, price: float, size: float) -> str | None:
         """模拟挂限价单：规则校验与实盘一致（共用 validate_limit_order），返回模拟 id。"""
         validate_limit_order(size, price)
         print(f"[dry-run] 挂单 {side.upper()} {size} @ {price} token={token_id[:16]}...")
-        return f"dry-run-{token_id[:8]}"
+        return f"sim-{token_id[:8]}"
 
     def sell(self, token_id: str, size: float, price: float) -> str | None:
         return self.place_limit(token_id, "sell", price, size)
 
-    def market_buy(self, token_id: str, amount: float) -> dict | None:
-        """模拟市价买入：按 best_ask 估算成交（结构与实盘 _parse_fill 一致）。"""
+    def market_buy(self, token_id: str, amount: float) -> Fill | None:
+        """模拟市价买入：按 best_ask 估算成交（结构与实盘一致：缺报价放弃建仓）。"""
         ask = self.best_ask(token_id)
         if ask is None:
-            return {"order_id": f"dry-run-{token_id[:8]}", "avg_price": None, "filled_size": None}
-        return {
-            "order_id": f"dry-run-{token_id[:8]}",
-            "avg_price": ask,
-            "filled_size": amount / ask,
-        }
+            return None  # 无报价：不建仓（与实盘“缺成交数据放弃建仓”同语义）
+        return Fill(order_id=f"sim-{token_id[:8]}", avg_price=ask, filled_size=amount / ask)
 
-    def market_sell(self, token_id: str, size: float) -> dict | None:
+    def market_sell(self, token_id: str, size: float) -> Fill | None:
         print(f"[dry-run] 市价卖 {size:.4f} 股 token={token_id[:16]}...")
-        return {"order_id": None, "price": self.best_bid(token_id)}
+        return Fill(order_id=None, avg_price=self.best_bid(token_id))
 
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None:
         return None  # 模拟无真实订单

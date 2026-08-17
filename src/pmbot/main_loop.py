@@ -15,11 +15,13 @@ from pmbot.clob_executor import MarketBook, OrderPlacer, TradeExecutor, WalletVi
 from pmbot.config import Config
 from pmbot.constants import window_end_sec, window_start_sec
 from pmbot.control import read_control
-from pmbot.engine import decide
+from pmbot.engine import decide, circuit_breaker
 from pmbot.market_discovery import MarketDiscovery, MarketInfo
 from pmbot.market_lifecycle import MarketLifecycle, Phase
+from pmbot.settler import Settler
 from pmbot.state import StateStore, TradeState
 from pmbot.strategy import Strategy
+from pmbot.trade_history import TradeHistorySource
 from pmbot.types import (
     Action,
     ActionType,
@@ -28,6 +30,7 @@ from pmbot.types import (
     PendingOrder,
     Position,
     StateView,
+    rebuilt_position,
     token_for,
 )
 from pmbot.user_stream import UserStream
@@ -49,7 +52,7 @@ class TradingLoop:
         status_path: str | Path = "data/status.json",
         control_path: str | Path = "data/control.json",
         dry_run: bool = True,
-        settle_timeout_sec: int = 1800,
+        settle_timeout_sec: int | None = None,
         poll_sec: int = 10,
         user_stream: UserStream | None = None,
     ):
@@ -68,14 +71,44 @@ class TradingLoop:
         self.control_path = Path(control_path)
         self._store = StateStore(status_path, trades_path)
         self.dry_run = dry_run
+        # 结算超时按窗口步长自适应：5m 窗口 10 分钟，15m 窗口 30 分钟。
+        # 固定 1800s 对 5m 市场过长（gamma 结算几分钟即出结果）——残留持仓
+        # 最多卡 6 个窗口不交易，不符合常理；下限 300s 防小步长配置过激。
+        if settle_timeout_sec is None:
+            settle_timeout_sec = Settler.default_timeout_sec(self.step_sec)
         self.settle_timeout_sec = settle_timeout_sec
         self.poll_sec = poll_sec
         self.user_stream = user_stream
+        # 结算状态机（持仓窗口结束后的结算等待/兑付）：深模块，规则独立可测。
+        # 窄接口注入：市场查询（find_window/invalidate）+ 兑付查询 + 平仓/丢弃回调。
+        self.settler = Settler(
+            symbol=symbol,
+            source=discovery,
+            settle_proceeds=self.trade.settle_proceeds,
+            on_settle=lambda pos, exit_price, proceeds: self._close_position(
+                pos, exit_price, "settle", proceeds=proceeds
+            ),
+            on_abandon=self._abandon_position,
+            step_sec=self.step_sec,
+            settle_timeout_sec=settle_timeout_sec,
+            dry_run=dry_run,
+        )
         # 钱包核对（余额/实时持仓/幽灵持仓）：外部世界同步关注点，独立可测
         self.wallet_sync = WalletReconciler(
             self.wallet, self.save_status, dry_run=dry_run,
             step_sec=self.step_sec,  # 幽灵判定/接管计时需知持仓窗口何时结束
         )
+        # 交易历史同步（live only）：data-api 真实流水增量缓存 api_trades.csv，
+        # 后台线程不阻塞 tick；dry-run 无真实流水不启用
+        self.history_sync = None
+        if not dry_run and isinstance(executor, TradeHistorySource):
+            from pmbot.trade_history import TradeHistorySyncer
+
+            self.history_sync = TradeHistorySyncer(
+                Path(status_path).parent / "api_trades.csv",
+                executor.fetch_trade_page,
+                executor.fetch_redeem_page,
+            )
         self._lifecycle: MarketLifecycle | None = None
         self._skip_window_until = 0  # 启动跳过窗口终点（秒；0=不跳过，run_forever 启动时设置）
 
@@ -106,6 +139,13 @@ class TradingLoop:
             self.state.predict_start_sec = None
             self.save_status()
             logger.info("启动重置残留推理状态（predicting/predict_start_sec）")
+        # 启动立即核对链上持仓（live）：意外退出（杀进程/关终端）残留的幽灵持仓
+        # （本地有、链上已无）当场清除；链上真实持仓保留继续管理。
+        # 不清熔断计数/交易历史——只纠正持仓视图，不洗白风控与统计。
+        self.wallet_sync.startup_reconcile(int(time.time()), self.state)
+        # 启动交易历史同步线程（live）：data-api 真实流水增量落盘 api_trades.csv
+        if self.history_sync is not None:
+            self.history_sync.start()
         # 启动跳过进行中的窗口：不推理不交易，下一窗口起点才开始（避免中途启动做半窗决策）
         step = self.discovery.step_ms // 1000
         self._skip_window_until = window_start_sec(int(time.time()), step) + step
@@ -135,8 +175,8 @@ class TradingLoop:
         self._drain_user_events()
 
         # 1. 窗口结束后结算持仓（gamma 结算有延迟；引擎级兜底，跨生命周期）
-        if st.position is not None and now_sec >= st.position.window_start + self.discovery.step_ms // 1000:
-            self._settle(now_sec)
+        if self.settler.should_run(now_sec, st.position):
+            self.settler.settle(now_sec, st.position)
 
         # 2. 熔断/暂停：不交易（生命周期暂停推进，恢复后继续）
         if self._check_circuit_breaker(now_sec):
@@ -180,18 +220,10 @@ class TradingLoop:
             self.save_status()
             return
 
-        # 4.5 盘口价格（面板展示；查询失败不中断）
+        # 4.5 盘口采样器订阅（高频 WS 线程；面板盘口展示单一来源 book.json，
+        # 由采样器每 1s 落盘——tick 不再写 status.market_prices（双写死工作，
+        # monitor 实际读 book.json 覆盖 status 同名字段）
         self._subscribe_sampler(market)
-        try:
-            st.market_prices = {
-                "up_ask": self.book.best_ask(market.yes_token_id),
-                "up_bid": self.book.best_bid(market.yes_token_id),
-                "down_ask": self.book.best_ask(market.no_token_id),
-                "down_bid": self.book.best_bid(market.no_token_id),
-            }
-        except Exception:
-            logger.exception("盘口查询失败，跳过写入")
-            st.market_prices = None
 
         # 5. 生命周期推进：INIT（信号）→ RUNNING（成交/决策/执行）
         lc = self._lifecycle
@@ -259,9 +291,11 @@ class TradingLoop:
         if self._lifecycle is not None:
             self._lifecycle.stop(now_sec)
             self._lifecycle = None
-        if st.position is not None and now_sec >= st.position.window_start + self.discovery.step_ms // 1000:
-            self._settle(now_sec)
+        if self.settler.should_run(now_sec, st.position):
+            self.settler.settle(now_sec, st.position)
         self.save_status()
+        if self.history_sync is not None:
+            self.history_sync.stop()
 
     def _check_circuit_breaker(self, now_sec: int) -> bool:
         """熔断/暂停检查；返回 True 表示本 tick 不交易。"""
@@ -277,18 +311,14 @@ class TradingLoop:
             st.daily_loss = 0.0
             st.pause_reason = None
             logger.info("人工恢复：熔断计数已清零，继续运行")
-        if st.consecutive_losses >= self.config.max_consecutive_losses:
+        # 判定与文案单一事实源（engine.circuit_breaker：tick/decide 共用）
+        trip = circuit_breaker(self.state_view(), self.config)
+        if trip is not None:
+            key, message = trip
             st.paused = True
-            st.pause_reason = f"连亏 {st.consecutive_losses} 笔（上限 {self.config.max_consecutive_losses}）"
-            logger.warning("熔断触发：连亏 %d 笔，已暂停。恢复：编辑 %s 将 paused 改为 false",
-                           st.consecutive_losses, self.status_path)
-            self.save_status()
-            return True
-        if st.daily_loss >= self.config.max_daily_loss:
-            st.paused = True
-            st.pause_reason = f"日亏 {st.daily_loss:.2f} USDC（上限 {self.config.max_daily_loss}）"
-            logger.warning("熔断触发：当日亏损 %.2f USDC，已暂停。恢复：编辑 %s 将 paused 改为 false",
-                           st.daily_loss, self.status_path)
+            st.pause_reason = message
+            logger.warning("熔断触发：%s。恢复：编辑 %s 将 paused 改为 false",
+                           message, self.status_path)
             self.save_status()
             return True
         return False
@@ -314,9 +344,10 @@ class TradingLoop:
         best_bid = None
         if st.position is not None:
             # 持仓窗口已结束（结算等待期）→ 不报价不卖出：Polymarket 后端可能已结算
-            # （token 失效），卖出必失败（balance 0 → tick 异常死循环），只等 _settle 结算记账。
+            # （token 失效），卖出必失败（balance 0 → tick 异常死循环），只等结算记账。
             # 回归：18:47 窗口结束止盈卖出报错 → 每 2s tick 异常持续数分钟 → 结算超时丢跟踪。
-            if st.position.window_start + self.step_sec > now_sec:
+            # 窗口结束判定与结算状态机同源（settler.should_run）。
+            if not self.settler.should_run(now_sec, st.position):
                 pos_token = token_for(market, st.position.direction)
                 best_bid = self.book.best_bid(pos_token)
         return MarketView(
@@ -325,6 +356,8 @@ class TradingLoop:
             best_bid=best_bid,
             position=st.position,
             pending_order=st.pending_order,
+            # 窗口已进行秒数（开仓延迟判断：now − 窗口起点）
+            elapsed_sec=max(0, now_sec - (self._window_end_sec(now_sec) - self.discovery.step_ms // 1000)),
         )
 
     def state_view(self) -> StateView:
@@ -369,7 +402,7 @@ class TradingLoop:
             side = data.get("side", "").upper()
             if side == "SELL" and st.position is not None and not self.dry_run:
                 logger.info("WS 卖出成交：%s", data.get("id", ""))
-                self._settle(self._now_sec())
+                self.settler.settle(self._now_sec(), st.position)
 
     def _now_sec(self) -> int:
         import time
@@ -380,7 +413,7 @@ class TradingLoop:
         pending = st.pending_order
         if pending is None:
             return
-        is_simulated = str(pending.order_id).startswith("dry-run-")
+        is_simulated = self.dry_run  # 模拟语义由引擎注入的 mode 判据承担（不再靠 order_id 前缀魔法串）
         if is_simulated:
             # dry-run 模拟成交：真实盘口 ask ≤ 限价即视为成交（与真实限价单吃单一致）
             token = token_for(market, pending.direction)
@@ -403,12 +436,8 @@ class TradingLoop:
         st = self.state
         pending = st.pending_order
         entry = entry_price if entry_price is not None else float(pending.price)
-        st.position = Position(
-            direction=pending.direction,
-            entry_price=entry,
-            size=float(pending.size),
-            entered_remaining_sec=self._window_end_sec(now_sec) - now_sec,
-            window_start=st.window_start,
+        st.position = rebuilt_position(
+            pending.direction, entry, float(pending.size), st.window_start, now_sec, self.step_sec,
         )
         st.pending_order = None
         logger.info("挂单成交：%s @ %.2f，建立持仓", pending.direction, entry)
@@ -453,28 +482,19 @@ class TradingLoop:
         target_size = action.amount / ask
         filled = self.trade.market_buy(token, action.amount)
         if filled is None:
-            logger.warning("市价买入失败（无成交数据）：%s，下 tick 重试", token[:16])
-            return  # 不置 flag、不建仓：防假持仓
-        entry = filled.get("avg_price") or ask
-        size = filled.get("filled_size") or target_size
-        if not self.dry_run and (filled.get("avg_price") is None or filled.get("filled_size") is None):
-            # 实盘必须使用 API 实际成交数据（份额/均价），禁止盘口估算建仓：
-            # 估算曾导致持仓股数记错（1.9231 vs 实际 1.7544），结算兑付对不上。
-            # 订单已成交时资金由 Polymarket 结算自动兑付，此处只放弃记录。
-            logger.warning("实盘买入无实际成交数据（avg=%s size=%s），放弃建仓",
-                           filled.get("avg_price"), filled.get("filled_size"))
+            # 下单失败，或实盘成交但 API 缺实际数据（执行器已放弃建仓追踪）：
+            # 不置 flag、不建仓，下 tick 重试（防假持仓 / 重复下单）
+            logger.warning("市价买入失败/无成交数据：%s，下 tick 重试", token[:16])
             return
-        st.position = Position(
-            direction=action.direction,
-            entry_price=entry,
-            size=size,
-            entered_remaining_sec=self._window_end_sec(now_sec) - now_sec,
-            window_start=st.window_start,
+        entry = filled.avg_price or ask
+        size = filled.filled_size or target_size
+        st.position = rebuilt_position(
+            action.direction, entry, size, st.window_start, now_sec, self.step_sec,
         )
         st.window_bet_placed = True
         # 立即落盘：防下单后崩溃导致同窗口重启重复下单
         self.save_status()
-        src = "API" if filled.get("avg_price") and filled.get("filled_size") else "盘口估算"
+        src = "API" if filled.avg_price and filled.filled_size else "盘口估算"
         logger.info(
             "市价买入：%s %s %.4f 股 @ %.3f (成本 %.2f USDC, 数据源 %s)",
             token[:16], action.direction.value, size, entry, size * entry, src,
@@ -494,21 +514,22 @@ class TradingLoop:
             return
         token = token_for(market, pos.direction)
         try:
-            resp = self.trade.market_sell(token, pos.size)
+            fill = self.trade.market_sell(token, pos.size)
         except Exception:
             # 卖出失败（网络/已结算 token 失效）：保留持仓交给 settle/下 tick，不崩 tick
             # （回归：卖出失败曾导致每 2s tick 异常死循环 + 结算超时丢跟踪）
             logger.warning("市价卖出失败（%s %s %.4f 股），保留持仓等待下一 tick",
                            token[:16], pos.direction.value, pos.size)
             return
-        resp = resp or {}
-        exit_price = resp.get("price")
-        if exit_price is None:
-            exit_price = self.book.best_bid(token) or 0.0
+        if fill is None:
+            logger.warning("市价卖出无成交（%s %s %.4f 股），保留持仓等待下一 tick",
+                           token[:16], pos.direction.value, pos.size)
+            return
+        exit_price = fill.avg_price or 0.0  # 执行器已回退 best_bid；0.0 最后防御
         # 真实到账（Polymarket 成交聚合，含实际成交价/手续费）；取不到回退理论价差
         proceeds = None
-        if not self.dry_run and resp.get("order_id"):
-            proceeds = self.trade.sell_proceeds(resp["order_id"], token)
+        if not self.dry_run and fill.order_id:
+            proceeds = self.trade.sell_proceeds(fill.order_id, token)
         self._close_position(pos, exit_price, action.reason or "sell", proceeds=proceeds)
 
     def _exec_pause(self, action: Action) -> None:
@@ -520,35 +541,11 @@ class TradingLoop:
         }.get(action.reason or "", "熔断暂停")
         logger.warning("收到暂停指令（%s）", st.pause_reason)
 
-    def _settle(self, now_sec: int) -> None:
+    def _abandon_position(self) -> None:
+        """结算超时丢弃持仓跟踪（Polymarket 结算自动兑付，不丢资金）。"""
         st = self.state
-        pos = st.position
-        market = self.discovery.find_window(self.symbol, pos.window_start, require_tradable=False)
-        if market is None:
-            # 清除负缓存：首次查询可能网络瞬时失败，让下一 tick 重新查询（防结算死循环）
-            invalidate = getattr(self.discovery, "invalidate", None)
-            if invalidate:
-                invalidate(self.symbol, pos.window_start, require_tradable=False)
-            if now_sec > pos.window_start + self.discovery.step_ms // 1000 + self.settle_timeout_sec:
-                # 超时仍不可达：丢弃持仓跟踪（Polymarket 结算自动兑付，不丢资金）
-                logger.warning("窗口 %d 结算市场持续不可达（超过 %ds），丢弃持仓跟踪",
-                               pos.window_start, self.settle_timeout_sec)
-                st.position = None
-                self.save_status()
-                return
-            logger.info("窗口 %d 结算价未就绪，等待下一 tick", pos.window_start)
-            return
-        settle_price = (
-            market.outcome_prices[0]
-            if pos.direction is Direction.UP
-            else market.outcome_prices[1]
-        )
-        # gamma 未结算时价格在 (0,1) 中间；超时后按当前价兜底
-        if 0 < settle_price < 1 and now_sec <= pos.window_start + self.discovery.step_ms // 1000 + self.settle_timeout_sec:
-            logger.info("窗口 %d 尚未结算（价格 %.3f），等待", pos.window_start, settle_price)
-            return
-        # 兑现（余额差 PnL → close_position → log_trade）走统一平仓 seam
-        self._close_position(pos, settle_price, "settle")
+        st.position = None
+        self.save_status()
 
     def _close_position(self, pos: Position, exit_price: float, reason: str,
                         proceeds: float | None = None) -> float:
@@ -576,7 +573,8 @@ class TradingLoop:
         )
         logger.info("平仓（%s）：%s @ %.3f，盈亏 %.4f%s",
                     reason, pos.direction.value, exit_price, result,
-                    "（真实成交）" if pnl is not None else "（理论价差）")
+                    "（真实兑付）" if (pnl is not None and reason == "settle")
+                    else "（真实成交）" if pnl is not None else "（理论价差）")
         return result
 
     def save_status(self) -> None:

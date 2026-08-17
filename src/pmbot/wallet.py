@@ -13,7 +13,13 @@ from __future__ import annotations
 import logging
 from typing import Callable, Protocol
 
-from pmbot.types import Direction, Position
+from pmbot.types import (
+    Direction,
+    Position,
+    direction_from_outcome,
+    rebuilt_position,
+    window_start_from_slug,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +70,24 @@ class WalletReconciler:
         self._refresh_balance(now_sec, state)
         self._refresh_positions(now_sec, state)
 
+    def startup_reconcile(self, now_sec: int, state) -> None:
+        """启动立即核对一次 Polymarket 实时持仓（live only，绕过节流）。
+
+        引擎 run_forever 启动处调用：意外退出（杀进程/关终端）残留的幽灵持仓
+        （本地有、链上已无、窗口已结束）在启动瞬间即清除，无需等待常规轮询；
+        链上仍有真实持仓则保留并继续管理（防误清）。本地无持仓时不核对
+        （未跟踪持仓由常规 reconcile 首 tick 接管）。
+        """
+        if self._dry_run:
+            return  # 模拟持仓与真实钱包无关，不核对
+        if state.position is None:
+            return
+        logger.info(
+            "启动持仓核对：本地残留 %s %.4f 股（窗口 %d），核对 Polymarket /positions",
+            state.position.direction.value, state.position.size, state.position.window_start,
+        )
+        self._refresh_positions(now_sec, state, force=True)
+
     # ---- 余额 ----
 
     def _refresh_balance(self, now_sec: int, state) -> None:
@@ -96,8 +120,10 @@ class WalletReconciler:
 
     # ---- 实时持仓核对 ----
 
-    def _refresh_positions(self, now_sec: int, state) -> None:
+    def _refresh_positions(self, now_sec: int, state, force: bool = False) -> None:
         """Polymarket 实时持仓核对（官方 /positions）：防幽灵持仓 + UI 实时展示。
+
+        force=True（启动核对）绕过节流门：启动场景必须执行一次，不等轮询周期。
 
         每 30s 拉取钱包实时持仓，与本地 position 比对：
         - 本地有持仓但 Polymarket 无 → 疑似幽灵持仓（崩溃/强杀残留）：
@@ -109,7 +135,7 @@ class WalletReconciler:
           无法解析（非 bot 市场格式，疑似手动仓位）只警告不接管。
         快照写入 state.live_positions 供 UI 展示（实时持仓/现价/浮动盈亏）。
         """
-        if now_sec - self._last_positions_sec < self._refresh_sec:
+        if not force and now_sec - self._last_positions_sec < self._refresh_sec:
             return
         self._last_positions_sec = now_sec
         if self._dry_run:
@@ -121,7 +147,8 @@ class WalletReconciler:
         aliases = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "bnb": "bnb"}
         want = [state.symbol.lower(), aliases.get(state.symbol.lower(), "")]
         mine = [p for p in positions
-                if any(w and w in str(p.get("title", "")).lower() for w in want)]
+                if any(w and w in str(p.get("title", "")).lower() for w in want)
+                and not self._is_dead_position(p, now_sec)]
         changed = bool(state.live_positions != positions)
         state.live_positions = positions
         if state.position is not None and not mine:
@@ -138,9 +165,9 @@ class WalletReconciler:
                 )
             else:
                 logger.warning(
-                    "幽灵持仓清除：本地记录 %s %.4f 股（窗口 %d），Polymarket 无实际持仓（%d 条实时持仓中无 %s）",
+                    "幽灵持仓清除：本地记录 %s %.4f 股（窗口 %d），Polymarket 无 %s 有效持仓（%d 条实时持仓，死仓已排除）",
                     pos.direction.value, pos.size, pos.window_start,
-                    len(positions), state.symbol,
+                    state.symbol, len(positions),
                 )
                 state.position = None
                 changed = True
@@ -151,6 +178,24 @@ class WalletReconciler:
                 changed = True
         if changed:
             self._save()
+
+    def _is_dead_position(self, p: dict, now_sec: int) -> bool:
+        """已结算归零的死仓：结果已定（redeemable）、无残值（currentValue<=0）、窗口已结束。
+
+        死仓在 /positions 中永久存在（未 redeem），title 匹配会误判"链上有持仓"：
+        - 本地残留幽灵持仓时被"链上有"保护 → 永不清除 → 占用持仓槽位，新窗口不开仓；
+        - 本地无持仓时被自动接管（_adopt_untracked 只看 slug/size）→ 死仓占用槽位。
+        （回归：ETH 8:40AM 窗口归零仓导致重启后系统不再交易。）
+
+        结果未定（redeemable=False，结算中）或仍有残值（currentValue>0，赢了可 redeem）
+        的持仓不算死仓：前者可能还有价值，后者走 _settle 记账兑付。
+        """
+        if p.get("redeemable") is not True:
+            return False
+        ws = window_start_from_slug(p.get("slug"))
+        if ws is None:
+            return False  # slug 无窗口起点（非 bot 市场格式）：保守不判死仓
+        return ws + self._step_sec <= now_sec and float(p.get("currentValue") or 0) <= 0
 
     def _adopt_untracked(self, mine: list[dict], state, now_sec: int) -> bool:
         """从未跟踪持仓重建本地 position（接管）。
@@ -164,21 +209,18 @@ class WalletReconciler:
         返回是否接管。
         """
         for p in mine:
-            try:
-                window_start = int(str(p.get("slug") or "").rsplit("-", 1)[-1])
-            except ValueError:
+            if self._is_dead_position(p, now_sec):
+                continue  # 已结算归零的死仓：不接管（无价值，占用槽位导致新窗口不开仓）
+            window_start = window_start_from_slug(p.get("slug"))
+            if window_start is None:
                 continue  # slug 无窗口起点：非 bot 市场格式，不接管
             size = float(p.get("size") or 0)
             entry = float(p.get("avgPrice") or 0)
             if size <= 0 or entry <= 0:
                 continue
-            direction = Direction.UP if str(p.get("outcome", "")).lower() == "up" else Direction.DOWN
-            state.position = Position(
-                direction=direction,
-                entry_price=entry,
-                size=size,
-                entered_remaining_sec=max(0, window_start + self._step_sec - now_sec),
-                window_start=window_start,
+            direction = direction_from_outcome(p.get("outcome")) or Direction.DOWN
+            state.position = rebuilt_position(
+                direction, entry, size, window_start, now_sec, self._step_sec,
             )
             # 同窗口已下过注：阻止接管后本窗口重复买入（窗口无法判断时保守置 True）
             if state.window_start is None or state.window_start == window_start:

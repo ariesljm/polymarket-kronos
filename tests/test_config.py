@@ -36,7 +36,6 @@ def test_missing_fields_get_defaults(tmp_path):
     assert cfg.take_profit == 0.30
     assert cfg.take_profit_max == 0.95
     assert cfg.stop_loss == 0.20
-    assert cfg.time_stop_min == 10
     assert cfg.max_consecutive_losses == 10
     assert cfg.max_daily_loss == 10
     assert cfg.max_klines == 2048  # 默认跟随 model.variant（kronos-mini）
@@ -251,3 +250,28 @@ kronos:
 """
     cfg = load_config(write_config(tmp_path, text))
     assert cfg.stop_loss == 0.0
+
+
+def test_open_delay_sec_range_raises(tmp_path):
+    """open_delay_sec 必须 0-300：越界报错。"""
+    from pmbot.config import load_config
+    for bad in ("-1", "301"):
+        text = f"""
+strategy: kronos
+kronos:
+  symbols: [BTC]
+  open_delay_sec: {bad}
+"""
+        with pytest.raises(ConfigError, match="open_delay_sec"):
+            load_config(write_config(tmp_path, text))
+    # 边界值合法：0 与 300
+    for ok in ("0", "300"):
+        text = f"""
+strategy: kronos
+kronos:
+  symbols: [BTC]
+  open_delay_sec: {ok}
+"""
+        cfg = load_config(write_config(tmp_path, text))
+        assert cfg.open_delay_sec == int(ok)
+

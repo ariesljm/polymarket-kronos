@@ -102,8 +102,8 @@ def _parse_ts(ts: str) -> datetime:
 
 
 def _fmt_ts(ts: str) -> str:
-    """ISO 时间 → 本地时区 HH:MM（astimezone(None) = 系统本地时区）。"""
-    return _parse_ts(ts).astimezone(None).strftime("%H:%M")
+    """ISO 时间 → 本地时区 MM-DD HH:MM（astimezone(None) = 系统本地时区）。"""
+    return _parse_ts(ts).astimezone(None).strftime("%m-%d %H:%M")
 
 
 def _fmt_cents(x: float) -> str:
@@ -189,89 +189,67 @@ def _view_defaults(accuracy, model_variant, tp_sl, uptime_sec, now_sec, config_s
     )
 
 
-def _fill_status_note(v: PanelView, status: TradeState, trades: list[dict]) -> None:
+def _fill_status_note(v: PanelView, status: TradeState, trades: list["TradeRecord"]) -> None:
     """运行状态说明：按持仓/挂单/本窗口平仓/信号状态生成状态文案。"""
-    # 当前窗口是否已有平仓记录（trades.csv 按时间追加，最后一条匹配的即最近）
+    # 当前窗口是否已有平仓记录（trades 按时间追加，最后一条匹配的即最近）
     window_trade = None
-    for row in trades:
-        try:
-            if int(row["window_start"]) == status.window_start:
-                window_trade = row
-        except (KeyError, ValueError, TypeError):
-            continue
+    for r in trades:
+        if r.window_start == status.window_start:
+            window_trade = r
     if v.position is not None:
         v.status_note = "持仓中"
     elif v.pending is not None:
         v.status_note = "挂单中（等回调）"
     elif window_trade is not None:
         # 本窗口已平仓：按实际离场原因显示（止盈/止损/时间止损/结算）
-        v.status_note = EXIT_LABELS.get(window_trade.get("reason"), "已平仓")
+        v.status_note = EXIT_LABELS.get(window_trade.reason, "已平仓")
     elif v.signal_note.startswith("买入方向"):
         v.status_note = "挂单已撤（窗口未成交）"
     elif v.signal_note:
         v.status_note = "观望（未达阈值）"
 
 
-def _aggregate_trades(trades: list[dict], match=None) -> dict:
-    """聚合交易统计（笔数/胜败/盈亏/最大亏损）；坏行跳过，不让视图退化。
+def _aggregate_trades(trades, match=None) -> dict:
+    """聚合交易统计：委托 stats.aggregate（单一实现，面板/验证报告同口径）。
 
-    match(row) 返回 False 的行不计入（如今日过滤）；None 表示全部交易。
+    match(record) 返回 False 的行不计入（如今日过滤）；None 表示全部交易。
     """
-    agg = {"n": 0, "wins": 0, "losses": 0, "gain": 0.0, "loss": 0.0,
-           "max_loss": 0.0, "pnl": 0.0}
-    for row in trades:
-        try:  # 坏行（半写/空行/缺字段）跳过
-            if match is not None and not match(row):
-                continue
-            p = float(row["pnl"])
-            agg["n"] += 1
-            agg["pnl"] += p
-            if p > 0:
-                agg["wins"] += 1
-                agg["gain"] += p
-            else:
-                agg["losses"] += 1
-                agg["loss"] += p
-                agg["max_loss"] = min(agg["max_loss"], p)
-        except (KeyError, ValueError, TypeError, AttributeError):
-            continue
-    return agg
+    from pmbot.stats import aggregate
+
+    return aggregate(trades, match)
 
 
-def _fill_trades(v: PanelView, trades: list[dict], today: str, tz,
+def _fill_trades(v: PanelView, trades: list["TradeRecord"], today: str, tz,
                 recent_limit: int | None = RECENT_LIMIT) -> None:
-    """今日统计/最近交易/全部交易统计（坏行跳过，不让视图退化）。
+    """今日统计/最近交易/全部交易统计（坏行已在账本读面滤除）。
 
     recent_limit=None 表示返回全部交易（Web 控制台用）；默认截断 RECENT_LIMIT 条。
     """
     today_stats = _aggregate_trades(
         trades,
-        match=lambda row: _parse_ts(row["ts"]).astimezone(tz).strftime("%Y-%m-%d") == today,
+        match=lambda r: _parse_ts(r.ts).astimezone(tz).strftime("%Y-%m-%d") == today,
     )
     v.today_pnl = round(today_stats["pnl"], 4)
     v.today_trades = today_stats["n"]
     v.today_stats = today_stats if today_stats["n"] else None
     recent = []
     limit = trades if recent_limit is None else trades[-recent_limit:]
-    for row in limit:
-        try:
-            recent.append(
-                {
-                    "ts": _fmt_ts(row["ts"]),
-                    "direction": row["direction"],
-                    "entry": float(row["entry_price"]),
-                    "exit": float(row["exit_price"]),
-                    "pnl": round(float(row["pnl"]), 4),
-                    "reason": row["reason"],
-                    "label": EXIT_LABELS.get(row["reason"], row["reason"]),
-                }
-            )
-        except (KeyError, ValueError, TypeError, AttributeError):
-            continue
+    for r in reversed(limit):  # 降序：最新交易在上（前端分页展示）
+        recent.append(
+            {
+                "ts": _fmt_ts(r.ts),
+                "direction": r.direction,
+                "entry": r.entry_price,
+                "exit": r.exit_price,
+                "pnl": round(r.pnl, 4),
+                "reason": r.reason,
+                "label": EXIT_LABELS.get(r.reason, r.reason),
+            }
+        )
     v.recent_trades = recent
 
 
-def build_view(status: TradeState | None, trades: list[dict], accuracy: dict | None,
+def build_view(status: TradeState | None, trades: list["TradeRecord"], accuracy: dict | None,
                now_sec: int, today: str | None = None, local_tz=None,
                panel: PanelConfig | None = None, recent_limit: int | None = RECENT_LIMIT) -> PanelView:
     """从 TradeState / trades / PredictionLog 构建视图数据（纯函数）。
@@ -312,6 +290,16 @@ def build_view(status: TradeState | None, trades: list[dict], accuracy: dict | N
         if status.position:
             p = status.position
             v.position = {"direction": p.direction.value, "entry_price": p.entry_price, "size": p.size}
+            # 止盈/止损价（与引擎同一公式 position_exit_levels，避免 UI 公式漂移）
+            if panel.tp_sl:
+                from pmbot.exit_rules import position_exit_levels
+
+                tp, sl = position_exit_levels(
+                    p.entry_price, panel.tp_sl["pct"], panel.tp_sl["sl"],
+                    tp_max=panel.tp_sl["max"],
+                )
+                v.position["take_profit_price"] = tp
+                v.position["stop_loss_price"] = sl
         v.paused = bool(status.paused)
         v.pause_reason = status.pause_reason
         v.consecutive_losses = status.consecutive_losses
@@ -330,10 +318,6 @@ def build_view(status: TradeState | None, trades: list[dict], accuracy: dict | N
         _fill_status_note(v, status, trades)
 
     _fill_trades(v, trades, today, tz, recent_limit)
-    # 实盘今日盈亏 = 现钱包余额 − 今日起始余额基准（含手续费/结算等全部真实资金变化）
-    if status is not None and status.day_start_balance is not None and status.balance is not None:
-        v.today_pnl = round(status.balance - status.day_start_balance, 4)
-        v.today_pnl_src = "balance"
     # 交易记录统计：全部交易（笔数/胜率/盈亏/盈利与亏损分计/最大亏损），非仅最近显示的行
     total = _aggregate_trades(trades)
     v.recent_stats = total if total["n"] else None
@@ -476,10 +460,12 @@ def _build_live_view(symbol: str | None, config: str, paths: RuntimePaths,
         if book is not None:
             st.market_prices = book
     trades = []
-    tp = Path(paths.trades)
-    if tp.is_file():
-        with open(tp, encoding="utf-8") as f:
-            trades = list(csv.DictReader(f))
+    # 统一读面（账本）：实盘 api_trades.csv（真实流水配对，含手续费）优先，
+    # 缺回退 trades.csv（引擎业务记录）；dry-run 目录无 api 流水自然回退。
+    # 判据唯一（ledger.load_records），消费方不再各自猜文件。
+    from pmbot.ledger import load_records
+
+    trades = load_records(paths.data_dir)
 
     symbol = symbol or (st.symbol if st else None)
     from pmbot.config import load_config
@@ -502,7 +488,7 @@ def _build_live_view(symbol: str | None, config: str, paths: RuntimePaths,
             f"止盈+{cfg.take_profit * 100:.0f}%（封顶{cfg.take_profit_max:.2f}） | "
             f"止损-{cfg.stop_loss * 100:.0f}% | 亏损离场{cfg.exit_loss_before_end_sec}s | "
             f"盈利持有{cfg.hold_until_end_sec}s | 禁入{cfg.no_entry_before_end_sec}s | "
-            f"时间止损{cfg.time_stop_min}min | "
+            f"开仓延迟{cfg.open_delay_sec}s | "
             f"连亏熔断{cfg.max_consecutive_losses} | 日亏熔断{cfg.max_daily_loss}"
         )
     except Exception:

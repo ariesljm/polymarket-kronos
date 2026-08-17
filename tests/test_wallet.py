@@ -34,11 +34,13 @@ def make_pos(**kw) -> Position:
     return Position(Direction.UP, 0.45, 2.0, 800, kw.pop("window_start", 995_000), **kw)
 
 
-def _eth_pos(size=5.0, slug="btc-updown-15m-999900", outcome="Up"):
-    return {"asset": "tok1", "conditionId": "c1", "size": size,
-            "avgPrice": 0.5, "curPrice": 0.6, "cashPnl": 0.5,
-            "title": "Bitcoin Up or Down - Aug 16", "outcome": outcome,
-            "slug": slug}
+def _eth_pos(size=5.0, slug="btc-updown-15m-999900", outcome="Up", **extra):
+    p = {"asset": "tok1", "conditionId": "c1", "size": size,
+         "avgPrice": 0.5, "curPrice": 0.6, "cashPnl": 0.5,
+         "title": "Bitcoin Up or Down - Aug 16", "outcome": outcome,
+         "slug": slug}
+    p.update(extra)
+    return p
 
 
 def _make(save_log=None, **kw) -> tuple[WalletReconciler, FakeWallet, TradeState, list]:
@@ -46,6 +48,105 @@ def _make(save_log=None, **kw) -> tuple[WalletReconciler, FakeWallet, TradeState
     src = FakeWallet(**kw.pop("wallet_kw", {}))
     r = WalletReconciler(src, lambda: saved.append(1), **kw)
     return r, src, make_state(), saved
+
+
+# ---- 死仓（已结算归零）不保护、不接管 ----
+
+def test_dead_position_does_not_block_ghost_clear():
+    """链上只有已结算归零的死仓 → 不构成"链上有持仓"，幽灵残留照常清除。
+
+    回归：/positions 永久保留未 redeem 的归零仓（title 匹配 ETH），本地残留
+    被误判"链上有"而保护 → 占用持仓槽位，新窗口不开仓。
+    """
+    r, src, st, saved = _make(dry_run=False, wallet_kw={
+        "positions": [_eth_pos(redeemable=True, currentValue=0.0)]})
+    st.position = make_pos()  # 窗口早已结束且超宽限
+    r.reconcile(1_000_500, st)
+    assert st.position is None  # 幽灵清除，死仓不阻止
+    assert saved
+
+
+def test_dead_position_not_adopted():
+    """本地无持仓 + 链上只有死仓 → 不接管（死仓占用槽位导致新窗口不开仓）。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={
+        "positions": [_eth_pos(redeemable=True, currentValue=0.0)]})
+    st.window_start = 999_900
+    r.reconcile(1_000_500, st)
+    assert st.position is None  # 不接管
+    assert st.live_positions == [_eth_pos(redeemable=True, currentValue=0.0)]  # 快照仍展示
+
+
+def test_settled_win_position_still_kept():
+    """已结算但有残值（赢了可 redeem）→ 不算死仓，仍保护本地持仓（settle 路径记账兑付）。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={
+        "positions": [_eth_pos(redeemable=True, currentValue=0.8)]})
+    st.position = make_pos()
+    r.reconcile(1_000_500, st)
+    assert st.position is not None  # 保留
+
+
+def test_unsettled_position_not_dead():
+    """结果未定（redeemable=False，结算中）→ 不算死仓，正常保护/接管。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={
+        "positions": [_eth_pos(redeemable=False, curPrice=0.4)]})
+    st.position = make_pos()
+    r.reconcile(1_000_500, st)
+    assert st.position is not None  # 保留
+
+
+# ---- 启动核对（startup_reconcile） ----
+
+def test_startup_reconcile_clears_ghost_immediately():
+    """启动核对：本地残留幽灵持仓（链上已无、窗口已结束）→ 当场清除，不等轮询。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": []})
+    st.position = make_pos()
+    r.startup_reconcile(1_000_031, st)
+    assert st.position is None
+    assert saved  # 有落盘回调
+
+
+def test_startup_reconcile_keeps_real_position():
+    """启动核对：链上仍有持仓 → 保留并继续管理（防误清真实持仓）。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": [_eth_pos()]})
+    st.position = make_pos()
+    r.startup_reconcile(1_000_031, st)
+    assert st.position is not None
+    assert st.live_positions == [_eth_pos()]
+
+
+def test_startup_reconcile_skipped_in_dry_run():
+    """dry-run 不启动核对（模拟持仓与真实钱包无关）。"""
+    r, src, st, saved = _make(dry_run=True, wallet_kw={"positions": []})
+    st.position = make_pos()
+    r.startup_reconcile(1_000_031, st)
+    assert st.position is not None
+    assert src.position_queries == 0
+
+
+def test_startup_reconcile_skipped_without_position():
+    """本地无持仓：不查询（未跟踪持仓由常规 reconcile 首 tick 接管）。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": [_eth_pos()]})
+    r.startup_reconcile(1_000_031, st)
+    assert src.position_queries == 0
+
+
+def test_startup_reconcile_bypasses_throttle():
+    """启动核对绕过节流：刚 reconcile 过（节流期内）仍强制核对——启动场景必须执行。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": []})
+    st.position = make_pos()
+    r.reconcile(1_000_000, st)  # 已核对一次（进入节流期）
+    st.position = make_pos()  # 模拟启动加载到的残留持仓
+    r.startup_reconcile(1_000_005, st)
+    assert src.position_queries == 2
+
+
+def test_startup_reconcile_recent_position_not_cleared():
+    """启动核对同样受宽限保护：窗口未结束/宽限期内不误清刚买入的持仓。"""
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": []})
+    st.position = make_pos(window_start=1_000_200)  # 窗口未结束（step 300s）
+    r.startup_reconcile(1_000_250, st)
+    assert st.position is not None  # 不误清
+    assert st.live_positions == []
 
 
 # ---- 余额快照 ----
@@ -221,3 +322,28 @@ def test_reconcile_tracks_new_state_after_reset():
     r.reconcile(1_000_031, st2)
     assert st.balance == 12.34  # 旧对象不受影响
     assert st2.balance == 15.0
+
+
+# ---- 候选 7：市场格式解析 + 持仓重建工厂（单一事实源） ----
+
+def test_slug_parsers_single_source():
+    from pmbot.types import direction_from_outcome, symbol_from_slug, window_start_from_slug
+
+    assert window_start_from_slug("eth-updown-5m-1786897500") == 1786897500
+    assert window_start_from_slug("eth-updown-5m-xyz") is None  # 无法解析
+    assert window_start_from_slug("") is None
+    assert symbol_from_slug("eth-updown-5m-1786897500") == "ETH"
+    assert symbol_from_slug("") == ""
+    assert direction_from_outcome("Up") is Direction.UP
+    assert direction_from_outcome("down") is Direction.DOWN
+    assert direction_from_outcome("?") is None
+
+
+def test_rebuilt_position_factory():
+    """重建工厂：entered_remaining_sec = 窗口剩余（负数截 0），三路径共用。"""
+    from pmbot.types import rebuilt_position
+
+    p = rebuilt_position(Direction.UP, 0.45, 2.0, window_start=1000, now_sec=1100, step_sec=300)
+    assert p.entered_remaining_sec == 200  # 1000+300−1100
+    p2 = rebuilt_position(Direction.DOWN, 0.5, 1.0, window_start=1000, now_sec=1500, step_sec=300)
+    assert p2.entered_remaining_sec == 0  # 已过窗口：截 0

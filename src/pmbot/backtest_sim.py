@@ -32,7 +32,6 @@ PROXIES = {"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")}
 LIMIT_PRICE = 0.5      # 限价模式挂单价
 TP_PCT = 0.30          # 百分比止盈（相对入场价）
 SL_PCT = 0.20          # 百分比止损
-TIME_STOP_MIN = 4      # 时间止损（分钟）
 TAKER_FEE_RATE = 0.07  # crypto taker 费率（官方公式参数）
 MIN_ORDER_SIZE = 5     # 限价单最小股数（/book min_order_size）
 
@@ -72,11 +71,10 @@ def fetch_window(cid: str, tokens: list[str], win_start: int, win_end: int) -> l
 
 
 def simulate_path(path: list[tuple[int, float]], entry_price: float, size: float,
-                  is_taker: bool, tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
-                  time_stop_min: int = TIME_STOP_MIN) -> dict:
+                  is_taker: bool, tp_pct: float = TP_PCT, sl_pct: float = SL_PCT) -> dict:
     """沿成交路径模拟持仓管理。path: [(ts, price), ...] 升序。
 
-    tp_pct/sl_pct/time_stop_min 默认模块内置值；run() 从 config 注入实盘参数
+    tp_pct/sl_pct 默认模块内置值；run() 从 config 注入实盘参数
     （与 exit_rules 单一事实源精神闭环：公式与参数同源）。
     """
     tp, sl = position_exit_levels(entry_price, tp_pct, sl_pct)  # 共享公式源（tp_max=0.999, floor=0.001 默认）
@@ -86,8 +84,6 @@ def simulate_path(path: list[tuple[int, float]], entry_price: float, size: float
             return _trade(entry_price, tp, size, is_taker, "take_profit", ts - t0)
         if price <= sl:
             return _trade(entry_price, sl, size, is_taker, "stop_loss", ts - t0)
-        if (ts - t0) >= time_stop_min * 60 and price <= entry_price:
-            return _trade(entry_price, price, size, is_taker, "time_stop", ts - t0)
     return _trade(entry_price, path[-1][1], size, is_taker, "window_end", path[-1][0] - t0)
 
 
@@ -109,26 +105,29 @@ def fetch_market(win_start: int) -> dict | None:
     return {"cid": m["conditionId"], "tokens": json.loads(m["clobTokenIds"])}
 
 
-def trade_params(args: argparse.Namespace) -> tuple[float, float, int]:
-    """止盈/止损/时间止损参数：CLI 覆盖 > config.yaml > 内置默认。
+def trade_params(args: argparse.Namespace) -> tuple[float, float, float, float]:
+    """止盈/止损/入场阈值参数：CLI 覆盖 > config.yaml > 内置默认。
 
     与 exit_rules 单一事实源精神闭环：回测跟随实盘配置（config 调整
-    止盈止损后离线模拟口径一致），CLI 可显式覆盖研究设定。
+    止盈止损/入场阈值后离线模拟口径一致），CLI 可显式覆盖研究设定。
+    入场阈值曾硬编码 0.55/0.5（engine 用 config.p_up_buy → 同一规则第三份实现）。
     """
-    tp, sl, tsm = args.tp, args.sl, args.time_stop
-    if tp is None or sl is None or tsm is None:
+    tp, sl, pub, pdb = args.tp, args.sl, args.p_up_buy, args.p_down_buy
+    if tp is None or sl is None or pub is None or pdb is None:
         try:
             from pmbot.config import load_config
 
             cfg = load_config(args.config)
             tp = tp if tp is not None else cfg.take_profit
             sl = sl if sl is not None else cfg.stop_loss
-            tsm = tsm if tsm is not None else cfg.time_stop_min
+            pub = pub if pub is not None else cfg.p_up_buy
+            pdb = pdb if pdb is not None else (1 - cfg.p_up_buy)
         except Exception:
             tp = tp if tp is not None else TP_PCT
             sl = sl if sl is not None else SL_PCT
-            tsm = tsm if tsm is not None else TIME_STOP_MIN
-    return tp, sl, tsm
+            pub = pub if pub is not None else 0.55
+            pdb = pdb if pdb is not None else 0.50
+    return tp, sl, pub, pdb
 
 
 def run(args: argparse.Namespace) -> int:
@@ -138,7 +137,7 @@ def run(args: argparse.Namespace) -> int:
     df5 = fetch_klines(args.symbol, "5m", need5m)
     df5 = df5.sort_values("timestamp").reset_index(drop=True)
 
-    tp_pct, sl_pct, time_stop_min = trade_params(args)
+    tp_pct, sl_pct, p_up_buy, p_down_buy = trade_params(args)
     client = KronosPredictorClient(variant=args.variant)
     t0 = time.time()
     limit_trades, market_trades = [], []
@@ -157,15 +156,15 @@ def run(args: argparse.Namespace) -> int:
         x = df5.iloc[k - ctx:k].reset_index(drop=True)
         preds = client.predict_targets(x, args.samples)
         p_up = sum(1 for v in preds if v > baseline) / len(preds)
-        if 0.5 <= p_up <= 0.55:
-            continue  # 未达阈值（p_up_buy=0.55 / p_down_buy=0.5）
-        direction = "UP" if p_up > 0.55 else "DOWN"
+        if p_down_buy <= p_up <= p_up_buy:
+            continue  # 未达入场阈值（config.p_up_buy / 1−p_up_buy）
+        direction = "UP" if p_up > p_up_buy else "DOWN"
 
         # ---- 市价模式：推理完成即按路径首笔成交价入场 ----
         entry_m = path[0][1]
         size_m = args.amount / entry_m  # 按金额，份额可小数
         tr_m = simulate_path(path[1:], entry_m, size_m, is_taker=True,
-                             tp_pct=tp_pct, sl_pct=sl_pct, time_stop_min=time_stop_min)
+                             tp_pct=tp_pct, sl_pct=sl_pct)
         market_trades.append(tr_m)
 
         # ---- 限价模式：路径上成交价 ≤ LIMIT_PRICE 才入场 ----
@@ -175,7 +174,7 @@ def run(args: argparse.Namespace) -> int:
                 entry_l = price
                 size_l = max(MIN_ORDER_SIZE, int(1 / entry_l) + 1)
                 tr_l = simulate_path(path[i + 1:], entry_l, size_l, is_taker=True,
-                                     tp_pct=tp_pct, sl_pct=sl_pct, time_stop_min=time_stop_min)
+                                     tp_pct=tp_pct, sl_pct=sl_pct)
                 break
         if tr_l is not None:
             limit_trades.append(tr_l)
@@ -189,8 +188,7 @@ def run(args: argparse.Namespace) -> int:
         return {"n": len(trades), "win": wins / len(trades), "pnl": pnl,
                 "fee": fees, "avg": pnl / len(trades),
                 "tp": sum(1 for t in trades if t["reason"] == "take_profit"),
-                "sl": sum(1 for t in trades if t["reason"] == "stop_loss"),
-                "ts": sum(1 for t in trades if t["reason"] == "time_stop")}
+                "sl": sum(1 for t in trades if t["reason"] == "stop_loss")}
 
     s_l, s_m = stats(limit_trades), stats(market_trades)
     print(f"\n评估 {args.points} 个窗口（耗时 {time.time() - t0:.0f}s，{args.samples} 采样/窗口，"
@@ -201,7 +199,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"{name}: 无成交"); continue
         print(f"{name}: {s['n']} 笔  胜率 {s['win']:.1%}  总盈亏 {s['pnl']:+.3f} USDC"
               f"  均 {s['avg']:+.4f}  费 {s['fee']:.3f}")
-        print(f"  止盈 {s['tp']} / 止损 {s['sl']} / 时间止损 {s['ts']}")
+        print(f"  止盈 {s['tp']} / 止损 {s['sl']}")
     print("=" * 68)
     return 0
 
@@ -213,11 +211,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--samples", type=int, default=10, help="每窗口采样次数")
     parser.add_argument("--amount", type=float, default=1.0, help="市价模式每注金额（USDC）")
     parser.add_argument("--variant", default="kronos-small")
-    parser.add_argument("--config", default="config.yaml", help="配置文件（TP/SL/时间止损参数源）")
+    parser.add_argument("--config", default="config.yaml", help="配置文件（TP/SL/入场阈值参数源）")
     parser.add_argument("--tp", type=float, default=None, help="止盈百分比（覆盖 config，如 0.30）")
     parser.add_argument("--sl", type=float, default=None, help="止损百分比（覆盖 config，如 0.20）")
-    parser.add_argument("--time-stop", dest="time_stop", type=int, default=None,
-                        help="时间止损分钟（覆盖 config）")
+    parser.add_argument("--p-up-buy", dest="p_up_buy", type=float, default=None,
+                        help="P(up) 买入阈值（覆盖 config，如 0.60）")
+    parser.add_argument("--p-down-buy", dest="p_down_buy", type=float, default=None,
+                        help="P(up) 卖出/做空阈值（覆盖 config，如 0.40）")
     args = parser.parse_args(argv)
     return run(args)
 

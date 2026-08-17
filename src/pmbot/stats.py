@@ -31,26 +31,53 @@ class Stats:
     accuracy: dict
 
 
-def compute_stats(trades_path: str | Path, accuracy: dict) -> Stats:
-    """从 trades.csv 计算交易指标；accuracy 来自 PredictionLog。"""
-    path = Path(trades_path)
-    if not path.is_file():
-        return Stats(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, accuracy)
-    df = pd.read_csv(path)
-    if df.empty:
-        return Stats(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, accuracy)
+def aggregate(records, match=None) -> dict:
+    """交易记录聚合（笔数/胜败/盈亏/最大亏损）。
 
-    total = len(df)
-    pnls = df["pnl"].astype(float)
-    wins = int((pnls > 0).sum())
-    losses = total - wins  # pnl<=0（含平局）均计为负
-    total_pnl = float(pnls.sum())
-    total_cost = float((df["entry_price"].astype(float) * df["size"].astype(float)).sum())
-    n_windows = int(df["window_start"].nunique())
+    match(record) 返回 False 的行不计入（如今日过滤）；None 表示全部交易。
+    记录为 TradeRecord（字段访问，坏行已在账本读面滤除）——语义曾手写在
+    monitor._aggregate_trades（面板），收敛为本模块单一实现，monitor 与
+    compute_stats 共用（候选 6：加一个统计维度只改一处）。
+    """
+    agg = {"n": 0, "wins": 0, "losses": 0, "gain": 0.0, "loss": 0.0,
+           "max_loss": 0.0, "pnl": 0.0}
+    for r in records:
+        if match is not None and not match(r):
+            continue
+        p = r.pnl
+        agg["n"] += 1
+        agg["pnl"] += p
+        if p > 0:
+            agg["wins"] += 1
+            agg["gain"] += p
+        else:
+            agg["losses"] += 1
+            agg["loss"] += p
+            agg["max_loss"] = min(agg["max_loss"], p)
+    return agg
+
+
+def compute_stats(records: list[dict], accuracy: dict) -> Stats:
+    """从交易记录计算指标；accuracy 来自 PredictionLog。
+
+    记录统一由 ledger.load_records 提供（实盘 API 流水配对 / 引擎业务记录），
+    本函数不再自行选文件或嗅探数据源（曾按 type 列判断 api 流水——口径漂移源）。
+    胜败/盈亏口径与聚合单一实现（aggregate）同源，pandas 只算跨度/窗口数。
+    """
+    if not records:
+        return Stats(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, accuracy)
+    ag = aggregate(records)
+    total = ag["n"]
+    if total == 0:
+        return Stats(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, accuracy)
+    wins = ag["wins"]
+    total_pnl = ag["pnl"]
+    total_cost = sum(r.entry_price * r.size for r in records)
+    n_windows = len({r.window_start for r in records})
 
     span_days = 0.0
     try:
-        ts = pd.to_datetime(df["ts"])
+        ts = pd.to_datetime([r.ts for r in records])
         span_days = (ts.max() - ts.min()).total_seconds() / 86400.0
     except (ValueError, TypeError, KeyError):
         pass
@@ -58,7 +85,7 @@ def compute_stats(trades_path: str | Path, accuracy: dict) -> Stats:
     return Stats(
         total_trades=total,
         wins=wins,
-        losses=losses,
+        losses=total - wins,  # pnl<=0（含平局）均计为负（与 aggregate.losses 同口径）
         win_rate=wins / total if total else 0.0,
         total_pnl=total_pnl,
         total_cost=total_cost,

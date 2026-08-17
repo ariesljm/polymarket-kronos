@@ -53,6 +53,64 @@ class Action:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class Fill:
+    """市价成交结果（跨 seam 类型化契约，替代成交 dict 魔法键）。
+
+    order_id：真实订单号（卖出兑付聚合用）；None = 无真实订单。
+    avg_price：成交均价（买/卖通用）；执行器取不到时已自行回退（卖：best_bid）。
+    filled_size：实际成交股数（买入语义；卖出为 None）。
+    """
+
+    order_id: str | None
+    avg_price: float | None
+    filled_size: float | None = None
+
+
+# ---- Polymarket 市场格式解析（slug/outcome）与持仓重建：单一事实源 ----
+# 市场格式（slug 结构、outcome 标签）曾被当字符串手工处理散落四处
+# （wallet 幽灵判定/接管、trade_history 流水配对、引擎挂单成交）。
+
+
+def window_start_from_slug(slug: str) -> int | None:
+    """slug → 窗口起点秒（如 eth-updown-5m-1786897500 → 1786897500）；无法解析返回 None。"""
+    try:
+        return int(str(slug).rsplit("-", 1)[-1])
+    except (ValueError, AttributeError):
+        return None
+
+
+def symbol_from_slug(slug: str) -> str:
+    """slug → 标的符号（大写，如 eth-updown-5m-… → ETH）。"""
+    return str(slug).split("-", 1)[0].upper() if slug else ""
+
+
+def direction_from_outcome(outcome: str) -> Direction | None:
+    """outcome → 方向（"Up"→UP，"Down"→DOWN）；无法识别返回 None。"""
+    o = str(outcome or "").lower()
+    if o == "up":
+        return Direction.UP
+    if o == "down":
+        return Direction.DOWN
+    return None
+
+
+def rebuilt_position(direction: Direction, entry_price: float, size: float,
+                     window_start: int, now_sec: int, step_sec: int) -> Position:
+    """从外部数据重建持仓（挂单成交/API 成交/钱包接管三条路径共用）。
+
+    entered_remaining_sec = 窗口剩余秒（window_start + step − now，负数截 0）——
+    时间止损/收益持有时钟从重建时刻重新计时。
+    """
+    return Position(
+        direction=direction,
+        entry_price=entry_price,
+        size=size,
+        entered_remaining_sec=max(0, window_start + step_sec - now_sec),
+        window_start=window_start,
+    )
+
+
 @dataclass
 class Position:
     """持仓：方向、入场价、股数、入场时窗口剩余秒、所属窗口。"""
@@ -94,6 +152,7 @@ class MarketView:
     best_bid: float | None
     position: Position | None
     pending_order: PendingOrder | None
+    elapsed_sec: int = 0  # 窗口已进行秒数（开仓延迟判断用，0 = 未知）
 
 def token_for(market, direction: Direction) -> str:
     """方向 → 市场 token（UP→yes，DOWN→no）。单一事实源（main_loop/lifecycle 共用）。"""

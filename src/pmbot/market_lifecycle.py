@@ -1,12 +1,11 @@
 """MarketLifecycle：单个市场窗口的生命周期状态机。
 
 参考 polymarket-trade-engine 的 EarlyBird + MarketLifecycle 架构：
-INIT → RUNNING → STOPPING → DONE
+INIT → RUNNING → DONE
 
 - INIT: 信号生成（Kronos 推理），完成后进入 RUNNING
 - RUNNING: 成交检测、持仓管理、决策执行（每 tick）
-- STOPPING: 引擎在窗口切换/停机时调用——撤遗留挂单、结算待处理持仓
-- DONE: 生命周期结束（对象可丢弃）
+- DONE: 生命周期结束（对象可丢弃，stop() 直接置 DONE）
 
 依赖通过 LifecycleDeps 窄接口注入（状态/策略/执行器/决策接缝），
 不持有引擎整体引用——测试可注入 fake，无需构造完整 TradingLoop。
@@ -33,7 +32,6 @@ logger = logging.getLogger(__name__)
 class Phase(Enum):
     INIT = "init"
     RUNNING = "running"
-    STOPPING = "stopping"
     DONE = "done"
 
 
@@ -109,9 +107,10 @@ class MarketLifecycle:
         self.deps.save_status()
 
     def stop(self, now_sec: int) -> None:
-        """STOPPING → DONE：撤遗留挂单（幂等），标记结束。
+        """收尾置 DONE：撤遗留挂单（幂等），标记结束。
 
         引擎负责：跨窗口判定（state.window_start）、roll_window、撤单兜底。
+        曾名义有 STOPPING 中间态，实际从未赋值（死态），直接 DONE。
         """
         if self.phase is Phase.DONE:
             return
@@ -120,12 +119,6 @@ class MarketLifecycle:
             self.deps.executor.cancel(st.pending_order.order_id)
             logger.info("生命周期收尾撤单：%s", st.pending_order.order_id)
         self.phase = Phase.DONE
-
-    # ---- 查询 ----
-
-    @property
-    def is_active(self) -> bool:
-        return self.phase in (Phase.INIT, Phase.RUNNING, Phase.STOPPING)
 
 
 

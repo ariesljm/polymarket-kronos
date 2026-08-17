@@ -24,7 +24,6 @@ CFG = Config(
     take_profit=0.30,
     take_profit_max=0.95,
     stop_loss=0.20,
-    time_stop_min=10,
     max_consecutive_losses=10,
     max_daily_loss=10,
     max_klines=2048,
@@ -71,6 +70,7 @@ def make_market(
     best_bid=None,
     position=None,
     pending_order=None,
+    elapsed_sec=800,
 ):
     return MarketView(
         remaining_sec=remaining_sec,
@@ -78,6 +78,7 @@ def make_market(
         best_bid=best_bid,
         position=position,
         pending_order=pending_order,
+        elapsed_sec=elapsed_sec,
     )
 
 
@@ -188,40 +189,6 @@ def test_stop_loss_when_bid_crashes():
     action = decide(CFG, make_state(), market, make_signal("skip", 0.5))
     assert action.type is ActionType.SELL
     assert action.reason == "stop_loss"
-
-
-def test_time_stop_after_ten_minutes_not_profitable():
-    # 入场时距结束 800s，现在距结束 199s（已过 601s > 600s），且未盈利
-    market = make_market(
-        remaining_sec=199,
-        best_bid=0.40,
-        position=make_position(),
-    )
-    action = decide(CFG, make_state(), market, make_signal("skip", 0.5))
-    assert action.type is ActionType.SELL
-    assert action.reason == "time_stop"
-
-
-def test_no_time_stop_when_profitable():
-    # 已超 10 分钟（entered=800 → remaining=199，elapsed=601），但 bid 高于入场价 → 不触发
-    market = make_market(
-        remaining_sec=199,
-        best_bid=0.50,
-        position=make_position(),
-    )
-    action = decide(CFG, make_state(), market, make_signal("skip", 0.5))
-    assert action.type is ActionType.SKIP
-
-
-def test_no_time_stop_before_ten_minutes():
-    # 入场时距结束 800s，现在距结束 250s（已过 550s < 600s），未到 10 分钟 → 不触发
-    market = make_market(
-        remaining_sec=250,
-        best_bid=0.40,
-        position=make_position(),
-    )
-    action = decide(CFG, make_state(), market, make_signal("skip", 0.5))
-    assert action.type is ActionType.SKIP
 
 
 # ---- 窗口结束前强制平仓 ----
@@ -373,6 +340,23 @@ def test_no_entry_gate_off_when_zero():
     assert a.type is ActionType.PLACE_MARKET
 
 
+# ---- 开仓延迟：市场开始后 N 秒内不开仓 ----
+
+def test_open_delay_blocks_entry_before_elapsed():
+    """open_delay_sec 内窗口已进行秒数不足 → 不开仓；达到 → 正常买入。"""
+    cfg = replace(CFG, open_delay_sec=60)
+    a = decide(cfg, make_state(), make_market(elapsed_sec=30), make_signal(Direction.UP, p_up=0.95))
+    assert a.type is ActionType.SKIP
+    a = decide(cfg, make_state(), make_market(elapsed_sec=60), make_signal(Direction.UP, p_up=0.95))
+    assert a.type is ActionType.PLACE_MARKET
+
+
+def test_open_delay_off_when_zero():
+    """open_delay_sec=0（默认）关闭延迟：窗口刚开始即可买。"""
+    a = decide(CFG, make_state(), make_market(elapsed_sec=0), make_signal(Direction.UP, p_up=0.95))
+    assert a.type is ActionType.PLACE_MARKET
+
+
 # ---- 窗口末拆分：亏损离场 / 盈利持有 两个独立阈值 ----
 
 def test_exit_loss_and_hold_until_are_independent():
@@ -412,3 +396,28 @@ def test_exit_loss_disabled_holds_loss_to_settlement():
         make_signal("skip", 0.5))
     assert action.type is ActionType.SELL
     assert action.reason == "stop_loss"
+
+
+# ---- 熔断判定纯函数（候选 5：tick/decide 共用单一事实源） ----
+
+def test_circuit_breaker_pure_function():
+    """熔断判定纯函数：阈值/文案单一出处，tick 与 decide 共用。"""
+    from pmbot.engine import circuit_breaker
+
+    assert circuit_breaker(make_state(consecutive_losses=5), CFG) is None  # 未到阈值
+    trip = circuit_breaker(make_state(consecutive_losses=10), CFG)  # 恰好阈值
+    assert trip is not None
+    key, message = trip
+    assert key == "consecutive_losses"
+    assert "连亏 10 笔" in message and "上限 10" in message
+    trip = circuit_breaker(make_state(daily_loss=10.5), CFG)
+    assert trip is not None and trip[0] == "daily_loss"
+    assert "日亏 10.50 USDC" in trip[1]
+
+
+def test_decide_pause_uses_same_breaker():
+    """decide 的 PAUSE 分支文案/阈值与 tick 共用（不再自写一版）。"""
+    action = decide(CFG, make_state(consecutive_losses=10), make_market(),
+                    make_signal("up", 0.95))
+    assert action.type is ActionType.PAUSE
+    assert action.reason == "consecutive_losses"

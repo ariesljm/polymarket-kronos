@@ -113,6 +113,9 @@ body { overflow-x: clip; margin: 0; background: var(--color-paper); color: var(-
 .trades-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-md); margin-bottom: var(--space-sm); }
 .trades-title { font-family: var(--font-display); font-size: var(--text-md); font-weight: 700; letter-spacing: -0.02em; margin: 0; overflow-wrap: anywhere; min-width: 0; }
 .trades-sum { font-size: var(--text-2xs); color: var(--color-ink-2); }
+.trades-pager { display: flex; align-items: center; gap: var(--space-xs); margin-left: auto; }
+.trades-pager .btn { padding: 2px 10px; font-size: var(--text-xs, 12px); }
+.trades-pager .page-num { font-size: var(--text-xs, 12px); color: var(--color-ink-2); min-width: 4.5em; text-align: center; }
 tr.open td { background: var(--color-paper-3); border-top: 1px solid var(--color-accent); font-weight: 600; }
 .table-wrap { overflow-x: auto; border-radius: var(--radius-md); background: var(--color-paper-2);
               border: 1px solid var(--color-rule); }
@@ -203,6 +206,11 @@ td.num, th.num { text-align: right; }
   <div class="trades-head">
     <h2 class="trades-title">交易历史</h2>
     <span class="trades-sum mono" id="hist-sum">—</span>
+    <span class="trades-pager">
+      <button id="hist-prev" class="btn" onclick="histPrev()">上一页</button>
+      <span class="page-num mono" id="hist-page">—</span>
+      <button id="hist-next" class="btn" onclick="histNext()">下一页</button>
+    </span>
   </div>
   <div class="table-wrap">
     <table>
@@ -302,6 +310,12 @@ function cell(label, value, sub) {
   return "<div class='cell-label'>" + label + "</div><div class='cell-value'>" + (value || "—") + "</div>" +
          (sub ? "<div class='cell-sub'>" + sub + "</div>" : "");
 }
+
+// 交易历史分页：每页最多 10 行，降序（最新在上，后端已排）
+const HIST_PAGE_SIZE = 10;
+let histPage = 0;
+function histPrev() { if (histPage > 0) { histPage -= 1; refresh(); } }
+function histNext() { histPage += 1; refresh(); }  // 超界由 refresh() clamp 回退
 async function refresh() {
   const d = await api("/api/status");
   if (!d.symbol) {
@@ -351,8 +365,7 @@ async function refresh() {
   tickPnl(document.getElementById("pnl"), d.today_pnl,
           d.today_pnl > 0 ? "pos" : d.today_pnl < 0 ? "neg" : "");
   const ts = d.today_stats;
-  const srcTag = d.today_pnl_src === "balance" ? "按钱包余额" : "按交易记录";
-  let pnlSub = srcTag + " · " + d.today_trades + " 笔今日交易";
+  let pnlSub = d.today_trades + " 笔今日交易";
   if (ts) pnlSub += " · 胜率 " + Math.round(ts.wins / ts.n * 100) + "% · 盈利 " + ts.wins + " 笔 +" + ts.gain.toFixed(2) +
     " · 亏损 " + ts.losses + " 笔 " + ts.loss.toFixed(2) + " · 最大亏损 " + ts.max_loss.toFixed(2);
   document.getElementById("pnl-sub").textContent = pnlSub;
@@ -413,11 +426,16 @@ async function refresh() {
     document.getElementById("book-cell").innerHTML = cell("盘口", "—");
   }
   const p = d.position;
-  // 持仓只显示方向/数量/价格三项（用户口径）
-  document.getElementById("pos-cell").innerHTML = p
-    ? cell("持仓", "<span class='dir'>" + p.direction.toUpperCase() + "</span> <span class='mono'>" + p.size.toFixed(2) +
-        " 股 @ " + centsStr(p.entry_price) + "</span>")
-    : cell("持仓", "—");
+  // 持仓卡片：主行显示方向/数量/价格，止盈/止损价用小字体副行（同 Kronos 卡片样式）
+  let posSub = "";
+  if (p && p.take_profit_price !== undefined) {
+    posSub = "止盈 " + centsStr(p.take_profit_price) + " · 止损 " +
+      (p.stop_loss_price > 0 ? centsStr(p.stop_loss_price) : "关闭");
+  }
+  document.getElementById("pos-cell").innerHTML = cell("持仓",
+    p ? "<span class='dir'>" + p.direction.toUpperCase() + "</span> <span class='mono'>" + p.size.toFixed(2) +
+        " 股 @ " + centsStr(p.entry_price) + "</span>" : null,
+    posSub);
   let kronos = "—";
   if (d.predicting) {
     const secs = Math.max(0, Math.floor(Date.now() / 1000 - (d.predict_start_sec || 0)));
@@ -448,7 +466,11 @@ async function refresh() {
       "</td><td class='num mono'>" + priceCents(p.entry_price) + "</td><td class='num mono'>—</td>" +
       "<td class='num mono'>—</td><td>持仓中</td></tr>");
   }
-  (d.recent_trades || []).forEach(t => rows.push(
+  // 交易历史：降序（最新在上），每页最多 10 行，翻页查看
+  const hist = d.recent_trades || [];
+  const histPages = Math.max(1, Math.ceil(hist.length / HIST_PAGE_SIZE));
+  if (histPage > histPages - 1) histPage = histPages - 1;  // 数据缩小后回退页码
+  hist.slice(histPage * HIST_PAGE_SIZE, (histPage + 1) * HIST_PAGE_SIZE).forEach(t => rows.push(
     "<tr><td class='mono'>" + t.ts + "</td><td>" + t.direction.toUpperCase() +
     "</td><td class='num mono'>" + priceCents(t.entry) + "</td><td class='num mono'>" + priceCents(t.exit) +
     "</td><td class='num mono " + (t.pnl >= 0 ? "pos" : "neg") + "'>" + signed(t.pnl) +
@@ -477,6 +499,18 @@ async function refresh() {
   const cfgBar = document.getElementById("cfg-bar");
   if (d.config_summary) { cfgBar.textContent = "配置 " + d.config_summary; cfgBar.hidden = false; }
   document.getElementById("trades").innerHTML = rows.join("") || "<tr><td colspan='6'>（暂无）</td></tr>";
+  // 分页控件状态
+  const pageEl = document.getElementById("hist-page");
+  const prevBtn = document.getElementById("hist-prev");
+  const nextBtn = document.getElementById("hist-next");
+  if (hist.length) {
+    pageEl.textContent = (histPage + 1) + " / " + histPages;
+    prevBtn.disabled = histPage === 0;
+    nextBtn.disabled = histPage >= histPages - 1;
+  } else {
+    pageEl.textContent = "—";
+    prevBtn.disabled = nextBtn.disabled = true;
+  }
   document.getElementById("updated").textContent = new Date().toTimeString().slice(0, 8);
   document.getElementById("uptime").textContent = fmtUptime(d.uptime_sec || 0);
   document.title = (isLive ? "[实盘] " : "[模拟] ") + "PMBOT 控制台 · " +

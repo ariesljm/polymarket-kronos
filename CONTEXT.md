@@ -12,7 +12,7 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 - **持仓（position）** — `Position`：入场方向/价、股数、入场时窗口剩余秒、所属窗口。窗口结束必结算，不跨窗口。
 - **挂单（pending order）** — `PendingOrder`：未成交限价单（方向/价/股数/order_id）。与"持仓"是互斥状态。当前策略市价入场不产生新挂单；pending 仅保留兼容旧状态恢复/WS 成交确认路径。
 - **决策（Action）** — 决策引擎输出：`PLACE_MARKET / CANCEL / SELL / SKIP / PAUSE`，含 reason（take_profit / stop_loss / time_stop / settle 等）。
-- **熔断（circuit breaker）** — 连亏 N 笔或单日亏 N USDC 自动暂停；人工改 status.json `paused=false` 恢复并清零计数。
+- **熔断（circuit breaker）** — 连亏 N 笔或单日亏 N USDC 自动暂停；人工改 status.json `paused=false` 恢复并清零计数。判定/文案单一事实源 `engine.circuit_breaker`（纯函数，(reason_key, 文案) | None）：tick 与决策引擎共用（曾各自实现一遍阈值、文案还各写各的）、fallback 入场阈值从 config 注入（backtest 曾硬编码 0.55）。
 - **引擎级兜底（engine-level fallback）** — TradingLoop 负责的跨窗口关注点（日界/熔断/窗口切换/跨窗口撤单/结算兜底），与单窗口生命周期逻辑分离。
 
 ### 决策引擎与视图
@@ -30,13 +30,17 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 
 ### 市场接入
 
-- **执行器（OrderPlacer）** — 主循环/生命周期下单依赖的协议：市价/限价/撤单/盘口/余额/凭证。接口按消费角色拆窄：`MarketBook`（盘口）、`TradeExecutor`（下单）、`WalletView`（钱包）、`AuthSource`（凭证）；OrderPlacer 是四者并集的组合面。两个适配器：`ClobExecutor`（实盘：真实下单、解析 API 成交 averagePrice/matchedAmount）与 `SimExecutor`（dry-run：打印指令、按盘口估算模拟成交；盘口/钱包/凭证面委托内部实盘实例）。限价规则校验（validate_limit_order）与成交解析（_parse_fill）为执行器内部单一事实源（禁止适配器各自复刻）。采样器依赖经 `SamplerProto` 窄接口注入。
+- **执行器（OrderPlacer）** — 主循环/生命周期下单依赖的协议：市价/限价/撤单/盘口/余额/凭证。接口按消费角色拆窄：`MarketBook`（盘口）、`TradeExecutor`（下单）、`WalletView`（钱包）、`AuthSource`（凭证）；OrderPlacer 是四者并集的组合面。两个适配器：`ClobExecutor`（实盘：真实下单、解析 API 成交 averagePrice/matchedAmount）与 `SimExecutor`（dry-run：打印指令、按盘口估算模拟成交；盘口/钱包/凭证面委托内部实盘实例）。限价规则校验（validate_limit_order）与成交解析（_parse_fill）为执行器内部单一事实源（禁止适配器各自复刻）。成交经 seam 用类型化契约 `Fill`（order_id/avg_price/filled_size）传递——曾用 dict 魔法键跨两适配器与引擎五处手抄；实盘“成交缺实际数据→放弃建仓”“卖价取不到→回退 best_bid”收进执行器成为成交语义，调用方只消费 Fill。采样器依赖经 `SamplerProto` 窄接口注入。
 - **钱包核对（WalletReconciler）** — 引擎 tick 的“外部世界同步”关注点（深模块）：余额定时刷新（30s 节流 + 今日盈亏基准捕获）与 Polymarket 实时持仓核对。引擎只留一行调用（wallet_sync.reconcile），规则独立可测（注入 WalletSource 窄替身）。
+- **结算状态机（Settler）** — 持仓窗口结束后的结算等待/兑付深模块：市场查询（find_window/invalidate）与兑付查询（settle_proceeds）窄接口注入，平仓/丢弃回调注入；状态机 PRICE_WAIT → REDEEM_WAIT → DONE/ABANDONED 可观察；结算超时按窗口步长自适应（2×步长，下限 300s）。引擎 tick/shutdown 各一行调用（settler.should_run/settle），build_view 的“结算等待期不报价”判定与结算同源。四路分支：市场不可达（超时丢弃跟踪）/ 结算归零（输，立即按成本记账）/ 中间价（超时按当前价兜底）/ 价格就绪（赢，等 REDEEM 真实兑付）。
+- **交易账本（ledger）** — 交易记录的统一读面与 schema 单一事实源：`RECORD_COLUMNS` 唯一列定义（引擎写入 TRADE_COLUMNS 与流水配对共用）；`load_records(data_dir)` 判据唯一——api_trades.csv（真实流水配对，含手续费）优先，缺回退 trades.csv（引擎业务记录）。monitor/stats/report 不再各自选文件（曾用 is_file 存在性 / type 列嗅探三种判据）。流水同步依赖走 `TradeHistorySource` 窄 Protocol（runtime_checkable）替代鸭子探测。
 - **幽灵持仓（ghost position）** — 本地记录有持仓但 Polymarket 实际无该标的持仓（崩溃/强杀残留）：核对时清除并警告；**清除有宽限保护**（持仓窗口结束 + 180s 后仍无才判幽灵，防买入后 /positions 索引延迟误清）；反向（本地无但远端有）未跟踪持仓**自动接管**（slug 可解析窗口起点时，重建 position 恢复止损/结算管理；非 bot 市场格式只警告不接管）；查询失败不核对（防误清真实持仓）。
 - **盘口采样器（BookSampler）** — 高频盘口 WS 线程（REST 兜底），内存快照供执行器报价，book.json 落盘供面板 1s 级展示。
 - **用户流（UserStream）** — 认证 WS（订单/成交推送）→ 事件队列，主循环 tick drain。无凭证时空转。
 - **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/心跳应答/停止/4 钩子）。新 WS 流应继承它而非复制样板。**心跳：应答不主动**——Polymarket 应用层心跳为服务端发 PING 文本、客户端回 PONG；客户端主动发 PING 被判非法（1008 policy violation，曾致盘口流 3 秒断连循环）。
+- **市场格式（slug/outcome）** — Polymarket 市场格式解析单一事实源在 `types.py`（window_start_from_slug / symbol_from_slug / direction_from_outcome）：曾把 slug `rsplit` 三处、outcome→方向映射两处当字符串手工处理。外部数据重建持仓走 `rebuilt_position` 工厂（entered_remaining_sec = 窗口剩余，负数截 0）：挂单成交 / API 成交 / 钱包接管三条路径共用。
 - **盘口定价（weighted_price / best_price）** — `book_price.py` 纯函数，单一事实源：按可成交量加权均价，**流动性不足返回 None**（宁缺毋滥，不显示误导价）。执行器与面板落盘必须共用，禁止本地复刻。
+- **盘口展示（book.json）** — 面板盘口单一来源：BookSampler 每 1s 落盘 book.json，monitor 只读它；tick 不再写 status.market_prices（曾是双写死工作，monitor 用 book.json 覆盖 status）。
 - **市场发现（MarketDiscovery）** — 定位当前窗口的 Up/Down 市场（gamma-api，slug 模式）。
 - **数据源（BinanceDataSource / KlineStore）** — Binance 镜像 K 线拉取 + 本地 CSV 滚动存储，增量/去重/裁剪。单批拉取统一走 `fetch_klines_batch`（在线与离线回测共用，禁止复刻）。
 

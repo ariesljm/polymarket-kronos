@@ -11,6 +11,27 @@ from pmbot.exit_rules import position_exit_levels
 from pmbot.types import Action, ActionType, Direction, MarketView, Position, Signal, StateView
 
 
+# 熔断原因 key（Action.reason 与状态 pause_reason 共用的枚举）：
+# 断言文案唯一出处见 breaker_message（tick/decide/执行共用，禁止各自拼 f-string）
+BREAKER_MESSAGES = {
+    "consecutive_losses": lambda st, cfg: f"连亏 {st.consecutive_losses} 笔（上限 {cfg.max_consecutive_losses}）",
+    "daily_loss": lambda st, cfg: f"日亏 {st.daily_loss:.2f} USDC（上限 {cfg.max_daily_loss}）",
+}
+
+
+def circuit_breaker(state: StateView, config: Config) -> tuple[str, str] | None:
+    """熔断判定纯函数（单一事实源）：触发返回 (reason_key, 文案)，否则 None。
+
+    tick 与 decide 共用——曾各自用同一阈值实现一遍（tick 先跑，
+    decide 的 PAUSE 分支成死路径），文案还各写各的。
+    """
+    if state.consecutive_losses >= config.max_consecutive_losses:
+        return "consecutive_losses", BREAKER_MESSAGES["consecutive_losses"](state, config)
+    if state.daily_loss >= config.max_daily_loss:
+        return "daily_loss", BREAKER_MESSAGES["daily_loss"](state, config)
+    return None
+
+
 def decide(config: Config, state: StateView, market: MarketView, signal: Signal) -> Action:
     """根据当前状态与信号决定下一个动作。
 
@@ -18,12 +39,13 @@ def decide(config: Config, state: StateView, market: MarketView, signal: Signal)
     market: 距窗口结束秒数、目标方向 best ask/bid、当前持仓、挂单。
     """
     # 熔断优先于一切交易动作；人工暂停时不产生任何交易动作
+    # （判定与文案与 tick 共用 circuit_breaker 单一事实源——tick 先跑故此处
+    # 正常序列不可达，保留为决策引擎防守兜底，不再自写一版阈值）
     if state.paused:
         return Action(ActionType.SKIP)
-    if state.consecutive_losses >= config.max_consecutive_losses:
-        return Action(ActionType.PAUSE, reason="consecutive_losses")
-    if state.daily_loss >= config.max_daily_loss:
-        return Action(ActionType.PAUSE, reason="daily_loss")
+    trip = circuit_breaker(state, config)
+    if trip is not None:
+        return Action(ActionType.PAUSE, reason=trip[0])
 
     position = market.position
     if position is not None:
@@ -40,7 +62,7 @@ def decide(config: Config, state: StateView, market: MarketView, signal: Signal)
         # 每窗口每标的最多一注
         return Action(ActionType.SKIP)
 
-    return _maybe_enter(config, signal, market.best_ask, market.remaining_sec)
+    return _maybe_enter(config, signal, market.best_ask, market.remaining_sec, market.elapsed_sec)
 
 
 def _manage_position(config: Config, position: Position, best_bid: float | None, remaining_sec: int) -> Action:
@@ -62,14 +84,15 @@ def _manage_position(config: Config, position: Position, best_bid: float | None,
         return Action(ActionType.SKIP)
     if best_bid <= sl:
         return Action(ActionType.SELL, reason="stop_loss")
-    elapsed = position.entered_remaining_sec - remaining_sec
-    if elapsed >= config.time_stop_min * 60 and best_bid <= position.entry_price:
-        return Action(ActionType.SELL, reason="time_stop")
     return Action(ActionType.SKIP)
 
 
-def _maybe_enter(config: Config, signal: Signal, best_ask: float | None, remaining_sec: int) -> Action:
+def _maybe_enter(config: Config, signal: Signal, best_ask: float | None,
+                 remaining_sec: int, elapsed_sec: int = 0) -> Action:
     if signal.direction is Direction.SKIP:
+        return Action(ActionType.SKIP)
+    # 开仓延迟：市场开始后 N 秒内不开仓（观察早期波动，避免开盘瞬间噪声信号；0 = 关闭）
+    if config.open_delay_sec > 0 and elapsed_sec < config.open_delay_sec:
         return Action(ActionType.SKIP)
     # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓）
     if remaining_sec <= config.no_entry_before_end_sec:

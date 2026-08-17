@@ -12,19 +12,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pmbot.ledger import RECORD_COLUMNS
 from pmbot.types import Direction, PendingOrder, Position, Signal
 
-TRADE_COLUMNS = [
-    "ts",
-    "window_start",
-    "symbol",
-    "direction",
-    "entry_price",
-    "exit_price",
-    "size",
-    "pnl",
-    "reason",
-]
+# 引擎写入 trades.csv 的列：与账本单一事实源同 schema（禁止本地另抄一份）
+TRADE_COLUMNS = RECORD_COLUMNS
 
 
 @dataclass

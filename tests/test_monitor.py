@@ -1,5 +1,6 @@
 """监控面板视图构建测试：纯函数 build_view + 渲染冒烟。"""
 
+import dataclasses
 import json
 import time
 
@@ -8,6 +9,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from pmbot.monitor import PanelConfig, SpotPrice, build_view
+from pmbot.ledger import TradeRecord
 from pmbot.state import Position, TradeState
 from pmbot.types import Direction, PendingOrder, Signal
 
@@ -63,16 +65,16 @@ def status_dict(**over):
 
 
 def test_today_pnl_uses_balance_diff_when_available():
-    """实盘今日盈亏 = 现余额 − 今日起始基准（余额差口径，覆盖交易聚合）。"""
+    """完全 API 口径：今日盈亏 = 已平仓交易聚合（流水净额），余额差不再覆盖。"""
     from pmbot.monitor import render
 
-    rows = trades_rows(1, pnl=0.55)  # 交易聚合 +0.55，但余额差 +5.00 优先
+    rows = trades_rows(1, pnl=0.55)  # 交易聚合 +0.55；余额差 +5.00 不再优先
     v = build_view(status_dict(balance=25.0, day_start_balance=20.0), rows, None,
                    now_sec=WINDOW_START, today=TODAY)
-    assert v.today_pnl == pytest.approx(5.0)
-    assert v.today_pnl_src == "balance"
+    assert v.today_pnl == pytest.approx(0.55)
+    assert v.today_pnl_src == ""
     text = render(v)
-    assert "今日盈亏: +5.00 USDC（按钱包余额）" in text
+    assert "今日盈亏: +0.55 USDC（按交易记录）" in text
 
 
 def test_today_pnl_falls_back_to_trades_aggregate():
@@ -86,9 +88,10 @@ def test_today_pnl_falls_back_to_trades_aggregate():
 def trades_rows(n=3, pnl=0.55):
     base = datetime(2026, 8, 14, 3, 0, tzinfo=timezone.utc)
     return [
-        {"ts": (base + timedelta(minutes=i * 15)).isoformat(), "window_start": WINDOW_START,
-         "symbol": "BTC", "direction": "up", "entry_price": 0.45, "exit_price": 0.56,
-         "size": 5.0, "pnl": pnl, "reason": "settle"}
+        TradeRecord(ts=(base + timedelta(minutes=i * 15)).isoformat(),
+                    window_start=WINDOW_START,
+                    symbol="BTC", direction="up", entry_price=0.45, exit_price=0.56,
+                    size=5.0, pnl=pnl, reason="settle")
         for i in range(n)
     ]
 
@@ -104,12 +107,32 @@ def test_view_extracts_status_fields():
     assert v.window_remaining_sec == 900 - 60
     assert v.signal == {"direction": "up", "p_up": 0.63}
     assert v.pending == {"direction": "up", "price": 0.45, "size": 5.0}
-    assert v.position == {"direction": "up", "entry_price": 0.45, "size": 5.0}
+    assert v.position == {"direction": "up", "entry_price": 0.45, "size": 5.0}  # 无 tp_sl 配置：不加止盈/止损价
     assert v.paused is False
     assert v.consecutive_losses == 2
     assert v.daily_loss == 4.5
     assert v.last_predict_sec == WINDOW_START + 30
     assert v.model_variant == "kronos-small"  # 注入
+
+
+def test_view_position_includes_tp_sl_prices():
+    """带 tp_sl 配置时，持仓视图携带止盈/止损价（与引擎同公式：min(入×1.3, 0.90)、入−入×0.9）。"""
+    v = build_view(status_dict(), trades_rows(), None,
+                   now_sec=WINDOW_START + 60, today=TODAY, local_tz=timezone.utc,
+                   panel=PanelConfig(tp_sl={"pct": 0.30, "max": 0.90, "sl": 0.90}))
+    assert v.position["direction"] == "up"
+    assert v.position["size"] == 5.0
+    assert v.position["take_profit_price"] == pytest.approx(0.585)  # min(0.45×1.3, 0.90)
+    assert v.position["stop_loss_price"] == pytest.approx(0.045)   # max(0.45×0.1, 0.001)
+
+
+def test_view_position_stop_loss_disabled():
+    """止损关闭（sl=0）→ 止损价 0.0（UI 显示“关闭”）。"""
+    v = build_view(status_dict(), trades_rows(), None,
+                   now_sec=WINDOW_START + 60, today=TODAY, local_tz=timezone.utc,
+                   panel=PanelConfig(tp_sl={"pct": 0.50, "max": 0.90, "sl": 0.0}))
+    assert v.position["take_profit_price"] == 0.675  # min(0.45×1.5, 0.90)
+    assert v.position["stop_loss_price"] == 0.0      # 关闭
 
 
 def test_view_missing_status_safe():
@@ -187,14 +210,6 @@ def test_render_smoke():
     assert "35/60" in text
 
 
-def test_bad_rows_skipped():
-    """坏行（缺字段）不影响视图，只跳过。"""
-    rows = trades_rows(n=2) + [{"ts": None, "direction": "up", "pnl": "x"}, {"bad": "row"}]
-    v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)
-    assert v.today_trades == 2  # 坏行被跳过
-    assert len(v.recent_trades) == 2
-
-
 def test_signal_note_thresholds():
     """信号状态标注：达阈值/未达阈值。"""
     th = {"p_up_buy": 0.60, "p_down_buy": 0.40}
@@ -264,8 +279,7 @@ def test_status_note_shows_actual_exit_reason():
     for reason, label in (("take_profit", "已止盈"), ("stop_loss", "已止损"),
                           ("time_stop", "已时间止损"), ("window_end", "窗口结束平仓"),
                           ("settle", "已结算")):
-        rows = trades_rows(n=1)
-        rows[-1]["reason"] = reason
+        rows = [dataclasses.replace(trades_rows(1)[0], reason=reason)]
         v = build_view(status_dict(pending_order=None, position=None), rows, None,
                        now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(thresholds=th))
         assert v.status_note == label, reason
@@ -273,8 +287,7 @@ def test_status_note_shows_actual_exit_reason():
 
 def test_status_note_other_window_trade_does_not_apply():
     """旧窗口的平仓不影响本窗口状态（仍显示挂单已撤/观望）。"""
-    rows = trades_rows(n=1)
-    rows[-1]["window_start"] = WINDOW_START - 300  # 上一窗口
+    rows = [dataclasses.replace(trades_rows(1)[0], window_start=WINDOW_START - 300)]  # 上一窗口
     v = build_view(status_dict(pending_order=None, position=None), rows, None,
                    now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(thresholds={"p_up_buy": 0.60, "p_down_buy": 0.40}))
@@ -433,12 +446,12 @@ def test_recent_trade_reason_chinese():
     from pmbot.monitor import render
 
     rows = trades_rows(1) + [
-        {"ts": "2026-08-14T03:30:00+00:00", "window_start": WINDOW_START,
-         "symbol": "BTC", "direction": "up", "entry_price": 0.45, "exit_price": 0.60,
-         "size": 5.0, "pnl": 0.75, "reason": "take_profit"},
-        {"ts": "2026-08-14T03:31:00+00:00", "window_start": WINDOW_START,
-         "symbol": "BTC", "direction": "down", "entry_price": 0.50, "exit_price": 0.30,
-         "size": 5.0, "pnl": -1.0, "reason": "window_end"},
+        TradeRecord(ts="2026-08-14T03:30:00+00:00", window_start=WINDOW_START,
+                    symbol="BTC", direction="up", entry_price=0.45, exit_price=0.60,
+                    size=5.0, pnl=0.75, reason="take_profit"),
+        TradeRecord(ts="2026-08-14T03:31:00+00:00", window_start=WINDOW_START,
+                    symbol="BTC", direction="down", entry_price=0.50, exit_price=0.30,
+                    size=5.0, pnl=-1.0, reason="window_end"),
     ]
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)
     text = render(v)
@@ -534,8 +547,7 @@ def test_recent_limit_default_truncated():
 
 
 def test_recent_trade_has_chinese_label():
-    rows = trades_rows(n=1)
-    rows[0]["reason"] = "take_profit"
+    rows = [dataclasses.replace(trades_rows(1)[0], reason="take_profit")]
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START)
     assert v.recent_trades[0]["label"] == "已止盈"
 
@@ -555,8 +567,7 @@ def test_render_trade_low_entry_shows_fractional_cents():
     """交易行低入场价显示小数美分（入0.10 而非入0）。"""
     from pmbot.monitor import render
 
-    rows = trades_rows(n=1)
-    rows[0].update({"entry_price": 0.001, "exit_price": 0.8, "pnl": 799.0, "reason": "take_profit"})
+    rows = [dataclasses.replace(trades_rows(1)[0], entry_price=0.001, exit_price=0.8, pnl=799.0, reason="take_profit")]
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START)
     text = render(v)
     assert "入0.10 出80" in text
@@ -600,3 +611,19 @@ def test_live_view_uses_config_interval(tmp_path, monkeypatch):
     v = _build_live_view("ETH", "config.yaml", RuntimePaths(data_dir=str(tmp_path)))
     assert v.window_label.endswith("-17:30")  # 17:25-17:30（5m 对齐）
     assert "5m" in v.config_summary  # config 读取未失败
+
+
+def test_recent_trades_descending_newest_first():
+    """交易历史降序：最新交易在最上（ts 最大排第一）。"""
+    rows = trades_rows(n=4)  # ts 递增：03:00 / 03:15 / 03:30 / 03:45 UTC（本地 +8h）
+    v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY, recent_limit=None)
+    ts = [r["ts"] for r in v.recent_trades]
+    assert ts[0] == "08-14 11:45"  # 最新在上（本地时区，MM-DD HH:MM）
+    assert ts == sorted(ts, reverse=True)
+
+
+def test_recent_trades_page_size_data():
+    """分页数据源：全量返回（前端每页 10 行翻页）。"""
+    rows = trades_rows(n=25)
+    v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY, recent_limit=None)
+    assert len(v.recent_trades) == 25  # 全量交给前端分页
