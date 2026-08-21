@@ -26,11 +26,13 @@ class ReconnectingWsThread(threading.Thread):
     ws_url: str = ""
     reconnect_base: float = RECONNECT_BASE
     reconnect_max: float = RECONNECT_MAX
+    disconnect_poll_sec: float = 2.0  # 断线等待期间子类兜底钩子的轮询间隔（秒）
 
     def __init__(self, *, name: str | None = None, proxy: str | None = None):
         super().__init__(daemon=True, name=name or self.__class__.__name__)
         self._proxy = proxy
         self._stop = threading.Event()
+        self.disconnect_poll_sec = self.__class__.disconnect_poll_sec
         # WS 线程写、主线程只读：当前连接与事件循环（动态订阅更新用）
         self._connected_ws: ClientConnection | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -83,7 +85,7 @@ class ReconnectingWsThread(threading.Thread):
                 waited = 0.0
                 while not self._stop.is_set() and waited < backoff:
                     self._while_disconnected()
-                    wait = min(2.0, backoff - waited)
+                    wait = min(self.disconnect_poll_sec, backoff - waited)
                     self._stop.wait(wait)
                     waited += wait
                 backoff = min(backoff * 2, self.reconnect_max)

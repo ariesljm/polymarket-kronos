@@ -35,7 +35,10 @@ def register(name: str) -> Callable[[type[Strategy]], type[Strategy]]:
     return deco
 
 
-def create_strategy(name: str, **kwargs) -> Strategy:
+def create_strategy(name: str, *, config=None, **kwargs) -> Strategy:
+    """按注册名创建策略；config 为 StrategyConfig 窄视图时打包传给策略构造。"""
+    if config is not None:
+        kwargs.setdefault("strategy_config", config)
     if name not in _REGISTRY:
         _load_strategy_modules()
     if name not in _REGISTRY:

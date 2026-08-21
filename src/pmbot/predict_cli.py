@@ -22,9 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     strat = create_strategy(
         cfg.strategy,
         symbol=cfg.symbols[0],
-        sample_count=cfg.sample_count,
-        max_klines=cfg.max_klines,
-        variant=cfg.model_variant,
+        config=cfg.to_strategy_config(),
     )
     signal = strat.generate_signal()
     acc = strat.log.accuracy()

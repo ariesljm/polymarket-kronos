@@ -11,11 +11,12 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pmbot.clob_executor import MarketBook, OrderPlacer, TradeExecutor, WalletView
+from pmbot.executor_protocols import MarketBook, OrderPlacer, TradeExecutor, WalletView
 from pmbot.config import Config
 from pmbot.constants import window_end_sec, window_start_sec
 from pmbot.control import read_control
 from pmbot.engine import decide, circuit_breaker
+from pmbot.execution_dispatcher import ExecutionDispatcher
 from pmbot.market_discovery import MarketDiscovery, MarketInfo
 from pmbot.market_lifecycle import MarketLifecycle, Phase
 from pmbot.settler import Settler
@@ -24,13 +25,9 @@ from pmbot.strategy import Strategy
 from pmbot.trade_history import TradeHistorySource
 from pmbot.types import (
     Action,
-    ActionType,
     Direction,
     MarketView,
-    PendingOrder,
-    Position,
     StateView,
-    rebuilt_position,
     token_for,
 )
 from pmbot.user_stream import UserStream
@@ -79,16 +76,26 @@ class TradingLoop:
         self.settle_timeout_sec = settle_timeout_sec
         self.poll_sec = poll_sec
         self.user_stream = user_stream
+        # 执行分派器：动作执行与挂单成交检测（深模块提取）
+        self._exec_dispatcher = ExecutionDispatcher(
+            state=state,
+            trade=self.trade,
+            book=self.book,
+            store=self._store,
+            dry_run=dry_run,
+            step_sec=self.step_sec,
+            save_status=self.save_status,
+        )
         # 结算状态机（持仓窗口结束后的结算等待/兑付）：深模块，规则独立可测。
         # 窄接口注入：市场查询（find_window/invalidate）+ 兑付查询 + 平仓/丢弃回调。
         self.settler = Settler(
             symbol=symbol,
             source=discovery,
             settle_proceeds=self.trade.settle_proceeds,
-            on_settle=lambda pos, exit_price, proceeds: self._close_position(
+            on_settle=lambda pos, exit_price, proceeds: self._exec_dispatcher.close_position(
                 pos, exit_price, "settle", proceeds=proceeds
             ),
-            on_abandon=self._abandon_position,
+            on_abandon=self._exec_dispatcher.abandon_position,
             step_sec=self.step_sec,
             settle_timeout_sec=settle_timeout_sec,
             dry_run=dry_run,
@@ -236,10 +243,8 @@ class TradingLoop:
             self.save_status()
             return
 
-        # 4.5 盘口采样器订阅（高频 WS 线程；面板盘口展示单一来源 book.json，
-        # 由采样器每 1s 落盘——tick 不再写 status.market_prices（双写死工作，
-        # monitor 实际读 book.json 覆盖 status 同名字段）
-        self._subscribe_sampler(market)
+        # 4.5 盘口采样器订阅（高频 WS 线程；面板盘口展示单一来源 book.json）
+        self._exec_dispatcher.subscribe_sampler(market, user_stream=self.user_stream)
 
         # 5. 生命周期推进：INIT（信号）→ RUNNING（成交/决策/执行）
         lc = self._lifecycle
@@ -281,6 +286,7 @@ class TradingLoop:
             reset_runtime(self.status_path, self.trades_path, str(self.status_path.parent),
                           symbol=self.symbol, interval=self.discovery.interval)
             self.state = TradeState(symbol=self.symbol, mode=self.state.mode)  # 保留运行模式标记
+            self._exec_dispatcher.state = self.state  # 同步新状态引用
             self.save_status()
             logger.warning("控制指令：已清除数据并重建状态（symbol=%s）", self.symbol)
             return False
@@ -330,7 +336,7 @@ class TradingLoop:
             st.pause_reason = None
             logger.info("人工恢复：熔断计数已清零，继续运行")
         # 判定与文案单一事实源（engine.circuit_breaker：tick/decide 共用）
-        trip = circuit_breaker(self.state_view(), self.config)
+        trip = circuit_breaker(self.state_view(), self.config.to_engine_config())
         if trip is not None:
             key, message = trip
             st.paused = True
@@ -408,7 +414,7 @@ class TradingLoop:
             status = str(data.get("status", "")).lower()
             if status in ("filled", "matched"):
                 logger.info("WS 订单成交确认：%s", oid)
-                self._fill_pending(self._now_sec())
+                self._exec_dispatcher.fill_pending(self._now_sec())
             elif status == "canceled":
                 logger.info("WS 订单撤销确认：%s", oid)
                 st.pending_order = None
@@ -427,177 +433,28 @@ class TradingLoop:
         return int(time.time())
 
     def refresh_pending(self, market: MarketInfo, now_sec: int) -> None:
-        st = self.state
-        pending = st.pending_order
-        if pending is None:
-            return
-        is_simulated = self.dry_run  # 模拟语义由引擎注入的 mode 判据承担（不再靠 order_id 前缀魔法串）
-        if is_simulated:
-            # dry-run 模拟成交：真实盘口 ask ≤ 限价即视为成交（与真实限价单吃单一致）
-            token = token_for(market, pending.direction)
-            ask = self.book.best_ask(token)
-            if ask is not None and ask <= float(pending.price):
-                self._fill_pending(now_sec, entry_price=ask)
-            return
-        try:
-            if self.user_stream is not None and self.user_stream.connected:
-                # WS 推送已覆盖成交/撤单确认（事件驱动），跳过 REST 轮询
-                return
-            order = self.trade.get_order(pending.order_id)
-        except Exception:
-            logger.exception("查询挂单失败")
-            return
-        if isinstance(order, dict) and order.get("status") == "filled":
-            self._fill_pending(now_sec)
+        """挂单成交检测（lifecycle 使用）。
 
-    def _fill_pending(self, now_sec: int, entry_price: float | None = None) -> None:
+        WS 连接中跳过 REST 轮询（事件驱动已覆盖成交/撤单确认），
+        否则委托 ExecutionDispatcher 执行盘口模拟或 REST 查询。
+        """
         st = self.state
-        pending = st.pending_order
-        entry = entry_price if entry_price is not None else float(pending.price)
-        st.position = rebuilt_position(
-            pending.direction, entry, float(pending.size), st.window_start, now_sec, self.step_sec,
-        )
-        st.pending_order = None
-        logger.info("挂单成交：%s @ %.2f，建立持仓", pending.direction, entry)
-
-    def _subscribe_sampler(self, market: MarketInfo) -> None:
-        """BookSampler 订阅当前窗口 token（高频采样线程）。"""
-        sampler = self.book.sampler
-        if sampler is not None:
-            sampler.subscribe(
-                [market.yes_token_id, market.no_token_id],
-                direction_map={market.yes_token_id: "up", market.no_token_id: "down"},
-            )
-        if self.user_stream is not None:
-            self.user_stream.subscribe_markets([market.condition_id])
+        if st.pending_order is None:
+            return
+        if self.dry_run:
+            self._exec_dispatcher.refresh_pending(market, now_sec)
+            return
+        if self.user_stream is not None and getattr(self.user_stream, 'connected', False):
+            return  # WS 推送已覆盖，跳过 REST 轮询
+        self._exec_dispatcher.refresh_pending(market, now_sec)
 
     def decide(self, view: MarketView) -> Action:
         """决策引擎调用（lifecycle 使用）。"""
-        return decide(self.config, self.state_view(), view, self.state.signal)
+        return decide(self.config.to_engine_config(), self.state_view(), view, self.state.signal)
 
     def execute(self, action: Action, market: MarketInfo, now_sec: int) -> None:
-        """动作分派：按类型路由到对应执行方法（薄分派器）。"""
-        st = self.state
-        if action.type is ActionType.PLACE_MARKET:
-            self._exec_place_market(action, market, now_sec)
-        elif action.type is ActionType.CANCEL:
-            self._exec_cancel(action)
-        elif action.type is ActionType.SELL:
-            self._exec_sell(action, market)
-        elif action.type is ActionType.PAUSE:
-            self._exec_pause(action)
-
-    def _exec_place_market(self, action: Action, market: MarketInfo, now_sec: int) -> None:
-        st = self.state
-        if st.window_bet_placed:
-            return
-        token = token_for(market, action.direction)
-        ask = self.book.best_ask(token)
-        if ask is None:
-            logger.warning("市价买入跳过：盘口无报价 %s", token[:16])
-            return  # 不置 flag，下 tick 重试
-        # 目标份额 = 金额/盘口价（真实成交以 API 返回为准，本值仅作回退）
-        target_size = action.amount / ask
-        filled = self.trade.market_buy(token, action.amount)
-        if filled is None:
-            # 下单失败，或实盘成交但 API 缺实际数据（执行器已放弃建仓追踪）：
-            # 不置 flag、不建仓，下 tick 重试（防假持仓 / 重复下单）
-            logger.warning("市价买入失败/无成交数据：%s，下 tick 重试", token[:16])
-            return
-        entry = filled.avg_price or ask
-        size = filled.filled_size or target_size
-        st.position = rebuilt_position(
-            action.direction, entry, size, st.window_start, now_sec, self.step_sec,
-        )
-        st.window_bet_placed = True
-        # 立即落盘：防下单后崩溃导致同窗口重启重复下单
-        self.save_status()
-        src = "API" if filled.avg_price and filled.filled_size else "盘口估算"
-        logger.info(
-            "市价买入：%s %s %.4f 股 @ %.3f (成本 %.2f USDC, 数据源 %s)",
-            token[:16], action.direction.value, size, entry, size * entry, src,
-        )
-
-    def _exec_cancel(self, action: Action) -> None:
-        st = self.state
-        if st.pending_order:
-            self.trade.cancel(st.pending_order.order_id)
-            logger.info("撤单：%s", st.pending_order.order_id)
-            st.pending_order = None
-
-    def _exec_sell(self, action: Action, market: MarketInfo) -> None:
-        st = self.state
-        pos = st.position
-        if pos is None:
-            return
-        token = token_for(market, pos.direction)
-        try:
-            fill = self.trade.market_sell(token, pos.size)
-        except Exception:
-            # 卖出失败（网络/已结算 token 失效）：保留持仓交给 settle/下 tick，不崩 tick
-            # （回归：卖出失败曾导致每 2s tick 异常死循环 + 结算超时丢跟踪）
-            logger.warning("市价卖出失败（%s %s %.4f 股），保留持仓等待下一 tick",
-                           token[:16], pos.direction.value, pos.size)
-            return
-        if fill is None:
-            logger.warning("市价卖出无成交（%s %s %.4f 股），保留持仓等待下一 tick",
-                           token[:16], pos.direction.value, pos.size)
-            return
-        exit_price = fill.avg_price or 0.0  # 执行器已回退 best_bid；0.0 最后防御
-        # 真实到账（Polymarket 成交聚合，含实际成交价/手续费）；取不到回退理论价差
-        proceeds = None
-        if not self.dry_run and fill.order_id:
-            proceeds = self.trade.sell_proceeds(fill.order_id, token)
-        self._close_position(pos, exit_price, action.reason or "sell", proceeds=proceeds)
-
-    def _exec_pause(self, action: Action) -> None:
-        st = self.state
-        st.paused = True
-        st.pause_reason = {
-            "consecutive_losses": "连亏熔断",
-            "daily_loss": "日亏熔断",
-        }.get(action.reason or "", "熔断暂停")
-        logger.warning("收到暂停指令（%s）", st.pause_reason)
-
-    def _abandon_position(self) -> None:
-        """结算放弃持仓跟踪（结算超时/市场不可达/无法结算；Polymarket 自动兑付，不丢资金）。"""
-        st = self.state
-        st.position = None
-        st.settle_pending = None
-        self.save_status()
-
-    def _close_position(self, pos: Position, exit_price: float, reason: str,
-                        proceeds: float | None = None) -> float:
-        """平仓共用路径（卖出/结算）：盈亏优先用 Polymarket 真实成交。
-
-        proceeds 为卖出订单真实到账（Polymarket 成交聚合）时，
-        盈亏 = 卖出收入 − 买入成本（entry_price×size，均来自 API 实际成交）；
-        无 proceeds（dry-run/聚合失败）回退理论价差；结算（settle）走理论价差。
-        最后调用 state.close_position 兑现并更新熔断计数，然后记账 + 日志。
-        """
-        st = self.state
-        pnl = None
-        if proceeds is not None:
-            pnl = proceeds - pos.size * pos.entry_price
-        result = st.close_position(exit_price, actual_pnl=pnl, pos=pos)
-        self._store.log_trade(
-            st,
-            window_start=pos.window_start,
-            direction=pos.direction,
-            entry_price=pos.entry_price,
-            exit_price=exit_price,
-            size=pos.size,
-            pnl=result,
-            reason=reason,
-        )
-        logger.info("平仓（%s）：%s @ %.3f，盈亏 %.4f%s",
-                    reason, pos.direction.value, exit_price, result,
-                    "（真实兑付）" if (pnl is not None and reason == "settle")
-                    else "（真实成交）" if pnl is not None else "（理论价差）")
-        if reason == "settle":
-            # 结算完成：settle_pending 已清，立即落盘（防面板残留旧持仓）
-            self.save_status()
-        return result
+        """动作分派（lifecycle 使用，委托 ExecutionDispatcher）。"""
+        self._exec_dispatcher.execute(action, market, now_sec)
 
     def save_status(self) -> None:
         self._store.save(self.state)

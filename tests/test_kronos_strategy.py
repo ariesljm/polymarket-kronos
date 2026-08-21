@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from pmbot.config import StrategyConfig
 from pmbot.strategy import create_strategy
 from pmbot.strategies.kronos import KronosStrategy
 from pmbot.types import Direction, Signal
@@ -33,7 +34,15 @@ def make_strategy(tmp_path, closes, pred_closes, symbol="BTC", **kw):
         def update(self, sym):
             return df
 
+    sc = StrategyConfig(
+        model_variant="kronos-mini",
+        sample_count=20,
+        max_klines=2048,
+        market_interval="15m",
+        thresholds=kw.pop("thresholds", None),
+    )
     return KronosStrategy(
+        strategy_config=sc,
         data_source=FakeDataSource(),
         predict_fn=lambda d, sample_count: pred_closes,
         log_dir=Path(tmp_path),
@@ -77,6 +86,7 @@ def test_in_progress_kline_dropped_from_baseline(tmp_path):
             return df
 
     strat = KronosStrategy(
+        strategy_config=StrategyConfig(),
         data_source=FakeDataSource(),
         predict_fn=lambda d, sample_count: [101.0],
         log_dir=Path(tmp_path),
@@ -100,18 +110,14 @@ def test_registered_as_kronos(tmp_path):
     assert isinstance(strat, KronosStrategy)
 
 
-def test_midband_signal_not_recorded(tmp_path):
-    """中间带信号（未达交易阈值）不进入方向准确率评估。
-
-    回归：p_up≈0.53 的 down 信号接近抛硬币，曾无条件记录，
-    持续稀释方向准确率。
-    """
+def test_all_signals_recorded(tmp_path):
+    """每次预测都记录（含中间带信号），用于统计模型整体方向准确率。"""
     strat = make_strategy(tmp_path, [100.0] * 10, [101.0] * 7 + [99.0] * 8,
                           thresholds={"p_up_buy": 0.6, "p_down_buy": 0.4})
     signal = strat.generate_signal()
     assert signal.direction is Direction.DOWN  # p_up = 7/15 ≈ 0.467 < 0.5
-    # p_up ≈ 0.467 在 (0.4, 0.6) 中间带 → 不记录
-    assert len(strat.log._load()) == 0
+    # 所有预测都应被记录（无论是否达交易阈值）
+    assert len(strat.log._load()) == 1
 
 
 def test_tradeable_signal_recorded(tmp_path):

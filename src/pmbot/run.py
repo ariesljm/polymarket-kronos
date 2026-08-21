@@ -52,20 +52,15 @@ def main(argv: list[str] | None = None) -> int:
     strategy = create_strategy(
         cfg.strategy,
         symbol=symbol,
-        sample_count=cfg.sample_count,
-        max_klines=cfg.max_klines,
-        variant=cfg.model_variant,
-        interval=cfg.market_interval,
         log_dir=data_dir,
-        # 交易阈值注入：中间带信号不记录（不进入方向准确率评估，与引擎交易口径一致）
-        thresholds={"p_up_buy": cfg.p_up_buy, "p_down_buy": cfg.p_down_buy},
+        config=cfg.to_strategy_config(),  # 策略参数窄视图（变体/采样/上下文/间隔/阈值）
     )
     discovery = MarketDiscovery(interval=cfg.market_interval)
     executor = SimExecutor() if args.dry_run else ClobExecutor()  # 两个适配器：模拟 / 实盘
 
     # Polymarket WS 市场频道（REST book 兜底）；代理从环境读取（polymarket 需代理）
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    sampler = BookSampler(executor.fetch_book, interval=2.0, proxy=proxy,
+    sampler = BookSampler(executor.fetch_book, interval=1.0, proxy=proxy,
                                  book_path=f"{data_dir}/book.json")
     executor.attach_sampler(sampler)
     sampler.start()

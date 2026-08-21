@@ -6,15 +6,12 @@
 
 from dataclasses import replace
 
-from pmbot.config import Config
+from pmbot.config import EngineConfig
 from pmbot.engine import decide
 from pmbot.types import ActionType, Direction, MarketView, PendingOrder, Position, Signal, StateView
 
-# 与默认配置一致的固定配置，方便断言
-CFG = Config(
-    strategy="kronos",
-    symbols=["BTC"],
-    market_interval="15m",
+# 与默认配置一致的固定引擎配置，方便断言
+CFG = EngineConfig(
     amount_per_trade=1,
     p_up_buy=0.60,
     p_down_buy=0.40,
@@ -26,9 +23,6 @@ CFG = Config(
     stop_loss=0.20,
     max_consecutive_losses=10,
     max_daily_loss=10,
-    max_klines=2048,
-    model_variant="kronos-mini",
-    sample_count=20,
 )
 
 

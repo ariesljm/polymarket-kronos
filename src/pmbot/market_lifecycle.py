@@ -20,7 +20,7 @@ import logging
 from enum import Enum
 from typing import Protocol
 
-from pmbot.config import Config
+from pmbot.config import EngineConfig
 from pmbot.market_discovery import MarketInfo
 from pmbot.state import TradeState
 from pmbot.strategy import Strategy
@@ -51,7 +51,7 @@ class LifecycleDeps(Protocol):
     state: TradeState
     strategy: Strategy
     executor: CancelExecutor
-    config: Config
+    config: EngineConfig
     step_sec: int  # 窗口步长（秒）
 
     def refresh_pending(self, market: MarketInfo, now_sec: int) -> None: ...

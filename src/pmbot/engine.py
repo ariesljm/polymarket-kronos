@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from pmbot.config import Config
+from pmbot.config import EngineConfig
 from pmbot.exit_rules import position_exit_levels
 from pmbot.types import Action, ActionType, Direction, MarketView, Position, Signal, StateView
 
@@ -19,7 +19,7 @@ BREAKER_MESSAGES = {
 }
 
 
-def circuit_breaker(state: StateView, config: Config) -> tuple[str, str] | None:
+def circuit_breaker(state: StateView, config: EngineConfig) -> tuple[str, str] | None:
     """熔断判定纯函数（单一事实源）：触发返回 (reason_key, 文案)，否则 None。
 
     tick 与 decide 共用——曾各自用同一阈值实现一遍（tick 先跑，
@@ -32,7 +32,7 @@ def circuit_breaker(state: StateView, config: Config) -> tuple[str, str] | None:
     return None
 
 
-def decide(config: Config, state: StateView, market: MarketView, signal: Signal) -> Action:
+def decide(config: EngineConfig, state: StateView, market: MarketView, signal: Signal) -> Action:
     """根据当前状态与信号决定下一个动作。
 
     state: 连续亏损、当日亏损、本窗口是否已下注、是否暂停。
@@ -65,7 +65,7 @@ def decide(config: Config, state: StateView, market: MarketView, signal: Signal)
     return _maybe_enter(config, signal, market.best_ask, market.remaining_sec, market.elapsed_sec)
 
 
-def _manage_position(config: Config, position: Position, best_bid: float | None, remaining_sec: int) -> Action:
+def _manage_position(config: EngineConfig, position: Position, best_bid: float | None, remaining_sec: int) -> Action:
     if best_bid is None:
         return Action(ActionType.SKIP)
     # 百分比止盈止损（相对入场价）：共享 exit_rules 单一事实源（回测/面板同公式）
@@ -87,7 +87,7 @@ def _manage_position(config: Config, position: Position, best_bid: float | None,
     return Action(ActionType.SKIP)
 
 
-def _maybe_enter(config: Config, signal: Signal, best_ask: float | None,
+def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
                  remaining_sec: int, elapsed_sec: int = 0) -> Action:
     if signal.direction is Direction.SKIP:
         return Action(ActionType.SKIP)

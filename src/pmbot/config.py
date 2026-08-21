@@ -37,6 +37,36 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class EngineConfig:
+    """引擎决策所需参数窄视图（engine.decide / circuit_breaker 消费）。"""
+
+    amount_per_trade: float
+    p_up_buy: float
+    p_down_buy: float
+    cancel_before_end_sec: int
+    exit_loss_before_end_sec: int
+    hold_until_end_sec: int
+    take_profit: float
+    take_profit_max: float
+    stop_loss: float
+    max_consecutive_losses: int
+    max_daily_loss: float
+    no_entry_before_end_sec: int = 0
+    open_delay_sec: int = 0
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """策略所需参数窄视图（Strategy 构造消费）。"""
+
+    model_variant: str = DEFAULT_VARIANT
+    sample_count: int = 20
+    max_klines: int = 2048  # 跟随 mini 上下文（显式覆盖见 Config.to_strategy_config）
+    market_interval: str = "15m"
+    thresholds: dict | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     strategy: str
     symbols: list[str]
@@ -59,6 +89,32 @@ class Config:
     no_entry_before_end_sec: int = 0
     # 市场开始后 N 秒内不开仓（0-300，0 = 关闭）
     open_delay_sec: int = 0
+
+    def to_engine_config(self) -> EngineConfig:
+        return EngineConfig(
+            amount_per_trade=self.amount_per_trade,
+            p_up_buy=self.p_up_buy,
+            p_down_buy=self.p_down_buy,
+            cancel_before_end_sec=self.cancel_before_end_sec,
+            exit_loss_before_end_sec=self.exit_loss_before_end_sec,
+            hold_until_end_sec=self.hold_until_end_sec,
+            take_profit=self.take_profit,
+            take_profit_max=self.take_profit_max,
+            stop_loss=self.stop_loss,
+            max_consecutive_losses=self.max_consecutive_losses,
+            max_daily_loss=self.max_daily_loss,
+            no_entry_before_end_sec=self.no_entry_before_end_sec,
+            open_delay_sec=self.open_delay_sec,
+        )
+
+    def to_strategy_config(self) -> StrategyConfig:
+        return StrategyConfig(
+            model_variant=self.model_variant,
+            sample_count=self.sample_count,
+            max_klines=self.max_klines,
+            market_interval=self.market_interval,
+            thresholds={"p_up_buy": self.p_up_buy, "p_down_buy": self.p_down_buy},
+        )
 
 
 def load_config(path: str | Path) -> Config:

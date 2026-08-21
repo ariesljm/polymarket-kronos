@@ -209,16 +209,47 @@ def test_flush_book_writes_mapped_prices(tmp_path, fake_connect):
     assert "ts" in data
 
 
-def test_flush_book_skips_incomplete(tmp_path, fake_connect):
-    """两方向快照不全时不落盘。"""
+def test_flush_book_partial_writes_nulls(tmp_path, fake_connect):
+    """方向缺快照/流动性不足时：该方向写 null，文件照写、时间戳照更（防旧价冻结）。"""
     from pmbot.book_sampler import BookSampler
 
     book_path = tmp_path / "book.json"
     s = BookSampler(book_path=str(book_path))
     s.subscribe(["tok-up", "tok-down"], direction_map={"tok-up": "up", "tok-down": "down"})
+    # tok-down 无快照（null）；tok-up asks 仅 1 股（<5 股 → 流动性不足 → null），bids 正常
     with s._lock:
         s._snapshots["tok-up"] = {"bids": [{"price": "0.01", "size": "10"}],
-                                  "asks": [{"price": "0.02", "size": "10"}]}
+                                  "asks": [{"price": "0.02", "size": "1"}]}
+    s._flush_book()
+    assert book_path.is_file()
+    data = json.loads(book_path.read_text(encoding="utf-8"))
+    assert data["up_ask"] is None  # 流动性不足 → null
+    assert data["up_bid"] == 0.01
+    assert data["down_ask"] is None  # 无快照 → null
+    assert data["down_bid"] is None
+    assert "ts" in data
+
+    # 方向补齐后正常写全量（时间戳持续更新）
+    with s._lock:
+        s._snapshots["tok-down"] = {"bids": [{"price": "0.97", "size": "10"}],
+                                    "asks": [{"price": "0.98", "size": "10"}]}
+        s._snapshots["tok-up"] = {"bids": [{"price": "0.01", "size": "10"}],
+                                    "asks": [{"price": "0.02", "size": "10"}]}
+    s._flush_book()
+    data = json.loads(book_path.read_text(encoding="utf-8"))
+    assert data["up_bid"] == 0.01
+    assert data["up_ask"] == 0.02
+    assert data["down_ask"] == 0.98
+    assert data["down_bid"] == 0.97
+
+
+def test_flush_book_no_direction_map_skips(tmp_path, fake_connect):
+    """尚未订阅方向映射（direction_map 空）时不落盘。"""
+    from pmbot.book_sampler import BookSampler
+
+    book_path = tmp_path / "book.json"
+    s = BookSampler(book_path=str(book_path))
+    s.subscribe(["tok-a"])
     s._flush_book()
     assert not book_path.is_file()
 

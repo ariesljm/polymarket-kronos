@@ -3,6 +3,7 @@
 import pytest
 
 from pmbot.clob_executor import ClobExecutor, SimExecutor
+from pmbot.executor_protocols import min_shares_for_price
 
 
 def test_dry_run_place_and_sell():
@@ -63,8 +64,6 @@ def test_missing_key_raises_on_real_call(monkeypatch):
 
 def test_min_shares_for_price():
     """规则组合：≥5 股且金额 ≥$1。"""
-    from pmbot.clob_executor import min_shares_for_price
-
     assert min_shares_for_price(0.45) == 5    # 5×0.45=2.25 ≥ 1
     assert min_shares_for_price(0.20) == 5    # 5×0.20=1.0 恰好
     assert min_shares_for_price(0.10) == 10   # 5×0.10=0.5 < 1 → 10 股

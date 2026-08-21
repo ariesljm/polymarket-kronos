@@ -27,7 +27,7 @@ uv run python -m pmbot.start_bot --live
 | `uv run python -m pmbot.start_bot [--dry-run\|--live]` | 一键启动：主循环（后台）+ 监控面板（前台） |
 | `uv run python -m pmbot.run [--dry-run\|--live] [--once]` | 仅主循环（调试可用 `--once` 跑一个 tick） |
 | `uv run python -m pmbot.monitor [--web-port 8765]` | 监控面板 + Web 控制台（http://127.0.0.1:8765，仅本机） |
-| `uv run python -m pmbot.predict_cli` | 跑一次真实预测，输出信号与方向准确率 |
+| `uv run python -m pmbot.predict_cli` | 跑一次真实预测，输出信号与方向准确率（包含所有预测样本） |
 | `uv run python -m pmbot.report` | 生成验证报告（trades.csv + 预测准确率；实盘用 `--data-dir data_live` 需另行指定，见 `report.py --help`） |
 | `uv run python -m pmbot.backtest [--interval 15m]` | 离线方向准确率回测（15m vs 5m 对比） |
 | `uv run python -m pmbot.backtest_sim` | 交易模拟回测（真实成交路径，限价 vs 市价） |
@@ -39,15 +39,20 @@ uv run python -m pmbot.start_bot --live
 src/pmbot/            核心代码
   strategies/         Strategy 实现（kronos）
   vendor_kronos/      上游 Kronos 模型 vendored 代码（勿改）
-  engine.py           决策引擎（纯函数，无 IO）
-  main_loop.py        主循环编排（TradingLoop）
+  engine.py           决策引擎（纯函数，无 IO，接 EngineConfig 窄视图）
+  main_loop.py        主循环编排（TradingLoop，纯编排器）
+  execution_dispatcher.py 执行分派器（动作执行/挂单成交检测/平仓）
   market_lifecycle.py 单窗口生命周期状态机
   predictor.py        Kronos 推理客户端
-  clob_executor.py    CLOB 下单/撤单/盘口查询
+  executor_protocols.py 执行器窄接口 Protocols + 限价规则
+  clob_executor.py    CLOB 下单/撤单/盘口（实盘/模拟适配器）
+  panel_view.py       展示视图构建（build_view/render/PanelView）
+  spot_price.py       交易品种实时价轮询
+  watchdog.py         父进程看门狗（终端关闭整树清理）
   data_source.py      Binance K 线拉取（fetch_klines_batch）与 CSV 滚动存储
   fileio.py           原子写工具（状态文件落盘统一入口）
   ...
-tests/                测试（280 个，pytest）
+tests/                测试（379 个，pytest）
 config.yaml           全部策略参数
 data/                 模拟模式（dry-run）运行时数据（status.json / trades.csv / 凭证缓存）
 data_live/            实盘模式运行时数据（`--live` 自动使用，与模拟完全分离）
@@ -61,7 +66,8 @@ docs/                 ADR、agent 文档、参考资料
 监控面板内嵌 HTTP 控制台（默认 http://127.0.0.1:8765，仅本机可访问，`--web-port -1` 禁用）：
 
 - **状态**：标的 / 主循环运行状态 / 窗口 / 信号 / 持仓 / 盘口 / 交易历史（全量）
-- **控制**：启动（拉起主循环，`--live/--dry-run` 与面板一致）、停止（优雅停机：撤单→结算→落盘）、恢复运行（解除熔断并清零计数）、清除数据（重建状态并清空 K线/交易/预测记录）。**有持仓时清除会丢弃持仓跟踪**（Polymarket 结算自动兑付，不丢资金）；主循环停止时由面板直接清除，避免“停止后持仓不平仓 → 无法清除”的死锁
+- **方向准确率**：Kronos 模型整体方向判断准确率，**包含所有预测样本**（含中间带信号）。阈值参数（`p_up_buy`/`p_down_buy`）仅控制是否开仓，不影响准确率统计
+- **控制**：启动（拉起主循环，`--live/--dry-run` 与面板一致）、停止（优雅停机：撤单→结算→落盘）、恢复运行（解除熔断并清零计数）、清除数据（重建状态并清空 K线/交易/预测记录）。**有持仓时清除会丢弃持仓跟踪**（Polymarket 结算自动兑付，不丢资金）；主循环停止时由面板直接清除，避免"停止后持仓不平仓 → 无法清除"的死锁
 
 控制指令经 `data/control.json` 由主循环每 tick 消费（读后即删，无竞态）。
 

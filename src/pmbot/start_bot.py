@@ -16,8 +16,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 
 
@@ -88,44 +86,21 @@ def _main_with_guard(args, mode: str, data_dir: str) -> int:
     # 父进程看门狗：uv run 的 shim 层脱离控制台信号，关闭终端窗口时
     # 信号传不到本进程——改为主动探测终端进程（父进程）存活，
     # 父进程退出（终端关闭）即整树清理子进程并自退出。
+    # 提取为独立模块（watchdog.ParentWatchdog）使其可测。
+    from pmbot.paths import spawn_loop
+    from pmbot.single_instance import InstanceGuard
+    from pmbot.watchdog import ParentWatchdog
+
+    bot = spawn_loop(args.config, args.live, data_dir)
+    logging.info("主循环已启动（PID %s, %s, data=%s）", bot.pid, mode, data_dir)
     parent_pid = os.getppid() if hasattr(os, "getppid") else None
-    _wd_log = open("logs/watchdog.log", "a", encoding="utf-8")
-
-    def _watch_parent() -> None:
-        if not parent_pid:
-            _wd_log.write(f"[{time.time():.0f}] 无父进程可监视\n")
-            _wd_log.flush()
-            return
-        _wd_log.write(f"[{time.time():.0f}] 监视父进程 PID={parent_pid}\n")
-        _wd_log.flush()
-        while True:
-            time.sleep(2)
-            # 存活检查用 ctypes OpenProcess（PROCESS_QUERY_LIMITED_INFORMATION）：
-            # Windows 上 os.kill(pid, 0) 是 TerminateProcess(pid, 0) 而非存在性检查，
-            # 对双击 bat 启动的 cmd 父进程稳定失败（OSError 22）→ 误判父进程退出、
-            # 误杀主循环并自杀（watchdog.log "父进程已退出"）。
-            if not InstanceGuard.alive(parent_pid):
-                _wd_log.write(f"[{time.time():.0f}] 父进程已退出 poll={bot.poll()} pid={bot.pid}\n")
-                _wd_log.flush()
-                try:
-                    if bot.poll() is None:
-                        # 只看 returncode，不读输出：taskkill 在中文系统输出 GBK，
-                        # text=True 按 UTF-8 解码会抛 UnicodeDecodeError（reader 线程崩溃）
-                        r = subprocess.run(
-                            ["taskkill", "/PID", str(bot.pid), "/T", "/F"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                        _wd_log.write(f"[{time.time():.0f}] taskkill rc={r.returncode}\n")
-                        _wd_log.flush()
-                except Exception as e:
-                    _wd_log.write(f"[{time.time():.0f}] watchdog 清理异常: {e}\n")
-                    _wd_log.flush()
-                _wd_log.write(f"[{time.time():.0f}] watchdog 退出\n")
-                _wd_log.flush()
-                os._exit(0)
-
-    threading.Thread(target=_watch_parent, daemon=True).start()
+    watchdog = ParentWatchdog(
+        parent_pid=parent_pid,
+        child_process=bot,
+        is_alive=lambda pid: InstanceGuard.alive(pid),
+        on_parent_exit=_kill_tree,
+    )
+    watchdog.start()
 
     try:
         # 前台跑监控面板（web-only：不渲染终端面板，浏览器打开 Web 控制台；

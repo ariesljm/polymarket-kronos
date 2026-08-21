@@ -5,7 +5,7 @@ market_interval: 5m        # 市场/K线频率：5m / 15m / 1h（Polymarket slug
 
 # 策略参数（按策略名分节；切换策略只需改顶部 strategy 字段）
 kronos:
-  symbols: [ETH]
+  symbols: [BTC]
   amount_per_trade: 1        # 每注金额（USDC）：市价买入按金额换算份额 = 1/盘口价，可小数
                               # （市价单无 5 股限制；如盘口价 0.2 → 5 股 = 1 USDC）
   p_up_buy: 0.55             # P(up) 高于此值买 Up；低于 1−此值（0.45）自动买 Down，无需另配
@@ -13,10 +13,10 @@ kronos:
   exit_loss_before_end_sec: 20   # 窗口结束前 N 秒内浮亏 → 市价平仓离场（0 = 关闭）
   hold_until_end_sec: 60         # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
   no_entry_before_end_sec: 60  # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓；0 = 关闭）
-  open_delay_sec: 80          # 市场开始后 N 秒内不开仓（观察早期波动，避开开盘噪声信号；0-300，0 = 关闭）
+  open_delay_sec: 0          # 市场开始后 N 秒内不开仓（观察早期波动，避开开盘噪声信号；0-300，0 = 关闭）
   take_profit: 0.5          # 百分比止盈：入场价 +50% 卖出（如入场 0.50 → 0.75）
   take_profit_max: 0.90      # 止盈封顶价：算出的止盈价 > 此值则按此价止盈（如入场 0.80 → 1.04 → 0.90）
-  stop_loss: 0           # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
+  stop_loss: 0.6         # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
   max_consecutive_losses: 5 # 连亏 N 笔熔断
   max_daily_loss: 8         # 单日亏损 N USDC 熔断
 

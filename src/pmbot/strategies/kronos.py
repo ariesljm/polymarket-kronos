@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from pmbot.config import StrategyConfig
 from pmbot.constants import step_ms_for
 from pmbot.data_source import BinanceDataSource, KlineStore
 from pmbot.prediction_log import PredictionLog
@@ -25,32 +26,32 @@ from pmbot.types import Direction, Signal, SignalContext
 class KronosStrategy(Strategy):
     def __init__(
         self,
+        *,
+        strategy_config: StrategyConfig | None = None,
         data_source: BinanceDataSource | None = None,
         predict_fn: Callable | None = None,
         log_dir: str | Path = "data",
         symbol: str = "BTC",
-        sample_count: int = 20,
-        max_klines: int = 2048,
-        variant: str = "kronos-mini",
-        interval: str = "15m",
-        thresholds: dict | None = None,
     ):
-        """thresholds: {"p_up_buy", "p_down_buy"} 交易阈值；提供时只有达到阈值
+        """strategy_config: 策略参数窄视图（模型变体/采样数/上下文长度/间隔/阈值），
+        来自 Config.to_strategy_config()，避免 10 参数构造签名。
 
-        的信号（引擎会交易的）才记录进方向准确率评估——中间带信号接近
-        抛硬币，不交易也不计样本；None 时全部记录（回测/测试兼容）。
+        依赖注入（data_source / predict_fn）与配置（strategy_config）分离：
+        测试注入 fake，运行态由工厂（create_strategy）构造真实依赖。
         """
+        sc = strategy_config or StrategyConfig()
         self.data_source = data_source or BinanceDataSource(
-            KlineStore(log_dir, timeframe=interval), max_klines=max_klines, timeframe=interval
+            KlineStore(log_dir, timeframe=sc.market_interval), max_klines=sc.max_klines,
+            timeframe=sc.market_interval,
         )
         # 真实预测客户端在构造时创建（惰性加载权重），避免每次信号生成重载模型
         self._predict_fn = predict_fn
         self._real_predictor = None
         self.log = PredictionLog(log_dir, symbol)
         self.symbol = symbol
-        self.sample_count = sample_count
-        self.variant = variant
-        self.thresholds = thresholds
+        self.sample_count = sc.sample_count
+        self.variant = sc.model_variant
+        self.thresholds = sc.thresholds
 
     def generate_signal(self, context: SignalContext | None = None) -> Signal:
         now_ms = (context or {}).get("now_ms") or int(time.time() * 1000)
@@ -69,17 +70,9 @@ class KronosStrategy(Strategy):
         current = float(df["close"].iloc[-1])
         p_up = sum(1 for p in preds if p > current) / len(preds)
         direction = Direction.UP if p_up > 0.5 else Direction.DOWN
-        # 只有达交易阈值的信号才记录（引擎会用它交易）：中间带信号接近
-        # 抛硬币，计入评估会持续拉低方向准确率（与交易无关的噪声样本）。
-        tradeable = (
-            self.thresholds is None
-            or p_up > self.thresholds["p_up_buy"]
-            or p_up < self.thresholds["p_down_buy"]
-        )
-        if tradeable:
-            # 记录"预测目标 K 线"的时间戳（= 最后闭合 + 步长），即预测窗口开始时间
-            target_ts = int(df["timestamp"].iloc[-1]) + step_ms_for(self.data_source.timeframe)
-            self.log.record(target_ts, direction, p_up, current)
+        # 记录每次预测结果（含中间带信号），用于统计模型整体方向准确率
+        target_ts = int(df["timestamp"].iloc[-1]) + step_ms_for(self.data_source.timeframe)
+        self.log.record(target_ts, direction, p_up, current)
         return Signal(direction=direction, p_up=p_up)
 
     def reset_runtime_data(self) -> None:

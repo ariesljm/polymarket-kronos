@@ -3,7 +3,7 @@
 - 订阅 wss://ws-subscriptions-clob.polymarket.com/ws/market（v2 官方 Market Channel）
 - 订阅时 initial_dump 全深度快照（event_type=book，bids/asks 格式与 REST book 兼容）
 - price_change 增量更新（side=BUY→bids，SELL→asks，size=0 删档）
-- 每 10 秒发 PING 保活；断线指数退避重连，期间保留旧快照并可走 REST 兜底
+- 断线指数退避重连，期间保留旧快照并按 interval 秒走 REST 兜底（并行拉取）
 - subscribe() 动态增删订阅（update 消息，不重连）
 - 主循环 tick 读内存快照（零网络等待）
 """
@@ -63,6 +63,8 @@ class BookSampler(ReconnectingWsThread):
         self.ws_url = ws_url
         self._fetch = fetch_book
         self._interval = interval
+        # 断线等待期间 REST 兜底的轮询间隔（interval 参数真正生效；上限 2 秒防过频）
+        self.disconnect_poll_sec = min(interval, 2.0)
         self.ws_url = ws_url
         self._proxy = proxy
         self._tokens: set[str] = set()
@@ -129,23 +131,29 @@ class BookSampler(ReconnectingWsThread):
     # ---- book.json 落盘（监控面板 1s 级实时盘口） ----
 
     def _flush_book(self) -> None:
-        """按 direction_map 组装加权盘口价写 book.json；任一方向缺快照则不写。"""
+        """按 direction_map 组装加权盘口价写 book.json；单方向独立计算。
+
+        任一方向缺快照/流动性不足时该方向写 null、**文件照写且时间戳照更**
+        （防止旧价冻结成面板上的"滞后"假象——面板对 null 显示 —）。
+        """
         if self._book_path is None:
             return
         with self._lock:
             dm = dict(self._direction_map)
             snaps = {t: self._snapshots.get(t) for t in dm}
-        if not dm or any(s is None for s in snaps.values()):
+        if not dm:  # 尚未订阅任何方向：不落盘
             return
         prices: dict = {"ts": int(time.time() * 1000)}
         for token, label in dm.items():
-            snap = snaps[token]
+            snap = snaps.get(token)
+            if snap is None:
+                prices[f"{label}_ask"] = None
+                prices[f"{label}_bid"] = None
+                continue
             ask = weighted_price(snap, "asks")
             bid = weighted_price(snap, "bids")
-            if ask is None or bid is None:
-                return
-            prices[f"{label}_ask"] = round(ask, 6)
-            prices[f"{label}_bid"] = round(bid, 6)
+            prices[f"{label}_ask"] = round(ask, 6) if ask is not None else None
+            prices[f"{label}_bid"] = round(bid, 6) if bid is not None else None
         try:
             self._book_path.write_text(json.dumps(prices), encoding="utf-8")
         except Exception:
@@ -230,16 +238,24 @@ class BookSampler(ReconnectingWsThread):
                 _apply_price_change(snap, c)
 
     def _rest_fallback(self) -> None:
-        """WS 断开期间：用 REST 刷新一次订阅中的快照（保留旧快照于失败时）。"""
+        """WS 断开/重连等待期间：用 REST 并行刷新订阅中的快照（失败保留旧快照）。"""
         if self._fetch is None:
             return
         with self._lock:
             tokens = list(self._tokens)
-        for tok in tokens:
-            try:
-                book = self._fetch(tok)
+        if not tokens:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(len(tokens), 4)) as pool:
+            futures = {pool.submit(self._fetch, t): t for t in tokens}
+            for fut in futures:
+                tok = futures[fut]
+                try:
+                    book = fut.result()
+                except Exception:
+                    logger.warning("盘口 REST 兜底失败 token=%s", tok[:16] if tok else tok)
+                    continue
                 if book:
                     with self._lock:
                         self._snapshots[tok] = book
-            except Exception:
-                logger.warning("盘口 REST 兜底失败 token=%s", tok[:16] if tok else tok)
