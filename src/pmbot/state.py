@@ -93,6 +93,18 @@ class TradeState:
         self.settle_pending = self.position
         self.position = None
 
+    def clear_breaker(self) -> None:
+        """熔断恢复（人工改 paused / resume 指令）：清零熔断计数与暂停标记。
+
+        与 engine.circuit_breaker（触发判定单一事实源）对称的「恢复侧」事实源；
+        主循环 resume 分支与人工恢复分支共用。
+        """
+        self.paused = False
+        self.was_paused = False
+        self.consecutive_losses = 0
+        self.daily_loss = 0.0
+        self.pause_reason = None
+
 
 class StateStore:
     """TradeState 持久化：status.json 快照 + trades.csv 交易日志。

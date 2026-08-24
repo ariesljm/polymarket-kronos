@@ -52,18 +52,18 @@ def _make(save_log=None, **kw) -> tuple[WalletReconciler, FakeWallet, TradeState
 
 # ---- 死仓（已结算归零）不保护、不接管 ----
 
-def test_dead_position_does_not_block_ghost_clear():
-    """链上只有已结算归零的死仓 → 不构成"链上有持仓"，幽灵残留照常清除。
+def test_dead_position_does_not_block_settle_path():
+    """链上只有已结算归零的死仓 → 窗口已结束残留不占位（交结算流程清）。
 
     回归：/positions 永久保留未 redeem 的归零仓（title 匹配 ETH），本地残留
-    被误判"链上有"而保护 → 占用持仓槽位，新窗口不开仓。
+    被误判"链上有"而保护 → 占用持仓槽位，新窗口不开仓。新语义：窗口已结束
+    残留交 defer_to_settle → Settler 超时丢弃，活跃槽同样不会被死仓阻塞。
     """
     r, src, st, saved = _make(dry_run=False, wallet_kw={
         "positions": [_eth_pos(redeemable=True, currentValue=0.0)]})
     st.position = make_pos()  # 窗口早已结束且超宽限
     r.reconcile(1_000_500, st)
-    assert st.position is None  # 幽灵清除，死仓不阻止
-    assert saved
+    assert st.position is not None  # 不幽灵清除：保留给结算流程记账
 
 
 def test_dead_position_not_adopted():
@@ -96,13 +96,16 @@ def test_unsettled_position_not_dead():
 
 # ---- 启动核对（startup_reconcile） ----
 
-def test_startup_reconcile_clears_ghost_immediately():
-    """启动核对：本地残留幽灵持仓（链上已无、窗口已结束）→ 当场清除，不等轮询。"""
+def test_startup_reconcile_keeps_expired_residue_for_settle():
+    """启动核对：窗口已结束的残留仓不当场幽灵清除（丢记账），保留交结算流程。
+
+    回归：reconcile 幽灵清除抢在 defer_to_settle 之前 → settle_pending 机制
+    失效、无 trades 记账（11:09 启动 up 3.5714 被直接丢弃实证）。
+    """
     r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": []})
     st.position = make_pos()
     r.startup_reconcile(1_000_031, st)
-    assert st.position is None
-    assert saved  # 有落盘回调
+    assert st.position is not None  # 保留：由引擎第一 tick defer_to_settle 接管
 
 
 def test_startup_reconcile_keeps_real_position():
@@ -203,13 +206,13 @@ def test_day_roll_resets_benchmark_then_recaptures():
 
 # ---- 实时持仓核对（幽灵持仓） ----
 
-def test_clears_ghost_position():
+def test_expired_position_kept_for_settle():
+    """窗口已结束残留仓保留（不幽灵清）：settle_pending 接管记账/超时丢弃。"""
     r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": []})
-    st.position = make_pos()
+    st.position = make_pos()  # 窗口早已结束
     r.reconcile(1_000_031, st)
-    assert st.position is None  # 幽灵持仓清除
+    assert st.position is not None  # 保留：交结算流程
     assert st.live_positions == []
-    assert saved  # 有落盘回调
 
 
 def test_keeps_position_when_polymarket_has_it():
@@ -297,10 +300,22 @@ def test_recent_position_not_cleared_during_index_delay():
     r.reconcile(1_000_031, st)  # 买入 31s 后核对：索引可能未同步
     assert st.position is not None  # 不误清
     assert st.live_positions == []
-    # 窗口结束且超过宽限（>1_000_380）后仍无持仓 → 真幽灵，清除
+    # 窗口已结束（>1_000_200）仍无持仓：不清除——残留仓交窗口切换
+    # defer_to_settle 后台结算（记账/超时丢弃），不直接丢跟踪
     r.reconcile(1_000_500, st)
-    assert st.position is None
-    assert saved  # 有落盘回调
+    assert st.position is not None
+
+
+def test_expired_position_not_ghost_cleared_waits_settle():
+    """窗口已结束的残留仓不按幽灵清除（直接丢跟踪会丢失结算记账）。
+
+    回归：reconcile 幽灵清除抢在 defer_to_settle 之前清掉旧仓
+    → settle_pending 机制失效、无 trades 记账（11:09 启动实证）。
+    """
+    r, src, st, saved = _make(dry_run=False, wallet_kw={"positions": []})
+    st.position = make_pos(window_start=997_000)  # 窗口早已结束
+    r.reconcile(1_000_500, st)
+    assert st.position is not None  # 不幽灵清除，保留给结算流程
 
 
 def test_title_alias_matching():
@@ -310,7 +325,7 @@ def test_title_alias_matching():
     ]})
     st.position = make_pos()
     r.reconcile(1_000_031, st)
-    assert st.position is None  # 无 BTC 持仓 → 幽灵清除
+    assert st.position is not None  # 窗口已结束残留：交结算流程，不按幽灵清
 
 
 def test_reconcile_tracks_new_state_after_reset():

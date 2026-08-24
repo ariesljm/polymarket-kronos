@@ -254,14 +254,39 @@ def test_flush_book_no_direction_map_skips(tmp_path, fake_connect):
     assert not book_path.is_file()
 
 
-def test_subscription_diff():
-    from pmbot.book_sampler import _subscription_diff
+def test_push_subscriptions_diff_in_base():
+    """订阅 diff 推送收敛在 ReconnectingWsThread._push_subscriptions。"""
+    from pmbot.ws_thread import ReconnectingWsThread
 
-    add, rm = _subscription_diff({"a", "b"}, {"a", "c"})
-    assert set(add) == {"b"}
-    assert set(rm) == {"c"}
-    add, rm = _subscription_diff({"a"}, {"a"})
-    assert add == [] and rm == []
+    t = ReconnectingWsThread()
+    t._last_subscribed = {"a", "c"}
+    sent = []
+
+    class FakeLoopWS:
+        async def send(self, msg):
+            sent.append(msg)
+
+    import asyncio
+    import threading
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    t._connected_ws = FakeLoopWS()
+    t._loop = loop
+    try:
+        t._push_subscriptions({"a", "b"}, "assets_ids")
+        fut = asyncio.run_coroutine_threadsafe(asyncio.sleep(0.05), loop)
+        fut.result(timeout=2)
+        assert len(sent) == 2
+        rm = json.loads(sent[0])
+        add = json.loads(sent[1])
+        assert rm == {"operation": "unsubscribe", "assets_ids": ["c"]}
+        assert add == {"operation": "subscribe", "assets_ids": ["b"]}
+        assert t._last_subscribed == {"a", "b"}
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
 
 
 def test_subscribe_pushes_update_message():

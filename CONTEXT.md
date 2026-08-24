@@ -12,8 +12,8 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 - **持仓（position）** — `Position`：入场方向/价、股数、入场时窗口剩余秒、所属窗口。窗口结束必结算，不跨窗口。
 - **挂单（pending order）** — `PendingOrder`：未成交限价单（方向/价/股数/order_id）。与"持仓"是互斥状态。当前策略市价入场不产生新挂单；pending 仅保留兼容旧状态恢复/WS 成交确认路径。
 - **决策（Action）** — 决策引擎输出：`PLACE_MARKET / CANCEL / SELL / SKIP / PAUSE`，含 reason（take_profit / stop_loss / time_stop / settle 等）。
-- **熔断（circuit breaker）** — 连亏 N 笔或单日亏 N USDC 自动暂停；人工改 status.json `paused=false` 恢复并清零计数。判定/文案单一事实源 `engine.circuit_breaker`（纯函数，(reason_key, 文案) | None）：tick 与决策引擎共用（曾各自实现一遍阈值、文案还各写各的）、fallback 入场阈值从 config 注入（backtest 曾硬编码 0.55）。
-- **引擎级兜底（engine-level fallback）** — TradingLoop 负责的跨窗口关注点（日界/熔断/窗口切换/跨窗口撤单/结算兜底），与单窗口生命周期逻辑分离。单窗口的成交检测/决策/执行/落盘委托 ExecutionDispatcher（执行分派器深模块），TradingLoop 退化为纯编排器。
+- **熔断（circuit breaker）** — 连亏 N 笔或单日亏 N USDC 自动暂停；人工改 status.json `paused=false` 恢复并清零计数。判定/文案单一事实源 `engine.circuit_breaker`（纯函数，(reason_key, 文案) | None）：tick 与决策引擎共用（曾各自实现一遍阈值、文案还各写各的）、fallback 入场阈值从 config 注入（backtest 曾硬编码 0.55）。恢复侧对称事实源 `TradeState.clear_breaker()`：resume 指令分支与人工恢复分支共用清零清单（paused/was_paused/连亏/日亏/pause_reason）。
+- **引擎级兜底（engine-level fallback）** — TradingLoop 负责的跨窗口关注点（日界/熔断/窗口切换/跨窗口撤单/结算兜底），与单窗口生命周期逻辑分离。结算兜底序列收敛于 `_settle_expired(now_sec, defer_only=)`（defer 转待结算槽 + Settler 推进一处定义）：tick 前置检查走完整推进，窗口切换分支 defer_only=True 只转槽不重复查询（步骤1 已推进过同一 settle_pending）。单窗口的成交检测/决策/执行/落盘委托 ExecutionDispatcher（执行分派器深模块），TradingLoop 退化为纯编排器。
 
 ### 决策引擎与视图
 
@@ -22,7 +22,7 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 - **市场视图（MarketView）** — 决策输入：窗口剩余秒、目标方向 best ask/bid、当前持仓、挂单。
 - **接缝方法（seam methods）** — TradingLoop 上生命周期消费的公开方法：`refresh_pending / build_view / decide / execute / save_status`。不要改回下划线私有穿透。`execute` 与 `refresh_pending` 委托 `ExecutionDispatcher`（执行分派器），但接缝仍在 TradingLoop。
 - **状态（state）** — `TradeState` 领域对象：只含交易语义（窗口/持仓/挂单/熔断/运行快照字段）。**不做序列化**——持久化归 StateStore。
-- **执行分派器（ExecutionDispatcher）** — 从 TradingLoop 提取的动作执行与挂单成交检测深模块：`execute`（动作分派→`_exec_place_market/_exec_sell/_exec_cancel/_exec_pause`）、`refresh_pending`（挂单成交检测）、`close_position`/`abandon_position`（平仓与结算回调）、`fill_pending`（挂单成交）。TradingLoop tick 编排 + LifecycleDeps 接缝 + 窗口切换/熔断/控制指令仍在主循环；执行 IO + 平仓记账收敛于此。
+- **执行分派器（ExecutionDispatcher）** — 从 TradingLoop 提取的动作执行与挂单成交检测深模块；TradeState 经 getter 注入（不持引用副本），reset 重建状态自动跟随、无需手工回写同步：`execute`（动作分派→`_exec_place_market/_exec_sell/_exec_cancel/_exec_pause`）、`refresh_pending`（挂单成交检测）、`close_position`/`abandon_position`（平仓与结算回调）、`fill_pending`（挂单成交）。TradingLoop tick 编排 + LifecycleDeps 接缝 + 窗口切换/熔断/控制指令仍在主循环；执行 IO + 平仓记账收敛于此。
 - **平仓（close）** — `ExecutionDispatcher.close_position` 统一卖出/结算两条路径：余额差 PnL（exit_balance − entry_balance，含滑点/手续费）优先，余额查询失败回退理论价差；兑现持仓、更新熔断计数、记 trades.csv。`entry_balance` 取**买入前**余额（净盈亏基准：结算所得 − 买入成本含费）。
 - **结算等待期（settle pending）** — 持仓窗口已结束后 gamma 结算未完成的等待期：**不交易只等结算**（build_view 不给 bid → 决策引擎不卖）。曾因结算等待期止盈卖出失败（Polymarket 已结算 token 失效，balance 0）导致 tick 异常死循环与结算超时丢跟踪。
 - **实盘数据只用实际获取值** — 持仓股数=订单详情 `size_matched`/响应 `takingAmount`；入场价=详情 `price`（纯成交价，不含费）；盈亏=余额差（实证含 ~3% taker 手续费：1 USDC 单实扣 1.0301，链上两笔转账：成交 1.0 + 费用 0.03）。API 无实际成交数据时**放弃建仓**（不盘口估算，dry-run 除外）。
@@ -31,14 +31,14 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 
 ### 市场接入
 
-- **执行器（OrderPlacer）** — 主循环/生命周期下单依赖的协议：市价/限价/撤单/盘口/余额/凭证。接口按消费角色拆窄：`MarketBook`（盘口）、`TradeExecutor`（下单）、`WalletView`（钱包）、`AuthSource`（凭证）；OrderPlacer 是四者并集的组合面。窄接口 Protocols 与限价规则（`validate_limit_order`/`min_shares_for_price`）收敛于 `executor_protocols.py`（单一事实源），两个适配器（`ClobExecutor` 实盘 / `SimExecutor` 模拟）在 `clob_executor.py`。限价规则校验与成交解析（`_parse_fill`）为执行器内部单一事实源（禁止适配器各自复刻）。成交经 seam 用类型化契约 `Fill`（order_id/avg_price/filled_size）传递——曾用 dict 魔法键跨两适配器与引擎五处手抄；实盘“成交缺实际数据→放弃建仓”“卖价取不到→回退 best_bid”收进执行器成为成交语义，调用方只消费 Fill。采样器依赖经 `SamplerProto` 窄接口注入。
+- **执行器（OrderPlacer）** — 主循环/生命周期下单依赖的协议：市价/限价/撤单/盘口/余额/凭证。接口按消费角色拆窄：`MarketBook`（盘口）、`TradeExecutor`（下单）、`WalletView`（钱包）、`AuthSource`（凭证）；OrderPlacer 是四者并集的组合面。窄接口 Protocols 与限价规则（`validate_limit_order`/`min_shares_for_price`）收敛于 `executor_protocols.py`（单一事实源），两个适配器（`ClobExecutor` 实盘 / `SimExecutor` 模拟）在 `clob_executor.py`。限价规则校验与成交解析（`_parse_fill`）为执行器内部单一事实源（禁止适配器各自复刻）。成交经 seam 用类型化契约 `Fill`（order_id/avg_price/filled_size）传递——曾用 dict 魔法键跨两适配器与引擎五处手抄；实盘“成交缺实际数据→放弃建仓”“卖价取不到→回退 best_bid”收进执行器成为成交语义，调用方只消费 Fill。采样器依赖经 `SamplerProto` 窄接口注入。data-api 公开端点（/positions、/activity）HTTP 样板收敛 `_data_api_get`（代理默认值/超时/错误归一一次）+ `_activity_page`（TRADE/REDEEM 分页参数化）——代理 dict 曾四处手抄。
 - **钱包核对（WalletReconciler）** — 引擎 tick 的“外部世界同步”关注点（深模块）：余额定时刷新（30s 节流 + 今日盈亏基准捕获）与 Polymarket 实时持仓核对。引擎只留一行调用（wallet_sync.reconcile），规则独立可测（注入 WalletSource 窄替身）。
 - **结算状态机（Settler）** — 持仓窗口结束后的结算等待/兑付深模块：市场查询（find_window/invalidate）与兑付查询（settle_proceeds）窄接口注入，平仓/丢弃回调注入；状态机 PRICE_WAIT → REDEEM_WAIT → DONE/ABANDONED 可观察；结算超时按窗口步长自适应（2×步长，下限 300s）。引擎 tick/shutdown 各一行调用（settler.should_run/settle），build_view 的“结算等待期不报价”判定与结算同源。四路分支：市场不可达（超时丢弃跟踪）/ 结算归零（输，立即按成本记账）/ 中间价（超时按当前价兜底）/ 价格就绪（赢，等 REDEEM 真实兑付）。
 - **交易账本（ledger）** — 交易记录的统一读面与 schema 单一事实源：`RECORD_COLUMNS` 唯一列定义（引擎写入 TRADE_COLUMNS 与流水配对共用）；`load_records(data_dir)` 判据唯一——api_trades.csv（真实流水配对，含手续费）优先，缺回退 trades.csv（引擎业务记录）。monitor/stats/report 不再各自选文件（曾用 is_file 存在性 / type 列嗅探三种判据）。流水同步依赖走 `TradeHistorySource` 窄 Protocol（runtime_checkable）替代鸭子探测。
 - **幽灵持仓（ghost position）** — 本地记录有持仓但 Polymarket 实际无该标的持仓（崩溃/强杀残留）：核对时清除并警告；**清除有宽限保护**（持仓窗口结束 + 180s 后仍无才判幽灵，防买入后 /positions 索引延迟误清）；反向（本地无但远端有）未跟踪持仓**自动接管**（slug 可解析窗口起点时，重建 position 恢复止损/结算管理；非 bot 市场格式只警告不接管）；查询失败不核对（防误清真实持仓）。
 - **盘口采样器（BookSampler）** — 高频盘口 WS 线程（REST 兜底），内存快照供执行器报价，book.json 落盘供面板 1s 级展示。
 - **用户流（UserStream）** — 认证 WS（订单/成交推送）→ 事件队列，主循环 tick drain。无凭证时空转。
-- **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/心跳应答/停止/4 钩子）。新 WS 流应继承它而非复制样板。**心跳：应答不主动**——Polymarket 应用层心跳为服务端发 PING 文本、客户端回 PONG；客户端主动发 PING 被判非法（1008 policy violation，曾致盘口流 3 秒断连循环）。
+- **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/心跳应答/停止/4 钩子 + 订阅集合动态推送 `_push_subscriptions`：跨线程统一 `run_coroutine_threadsafe` 调度——`loop.create_task` 从非事件循环线程调用不是线程安全的曾致丢任务窗口）。新 WS 流应继承它而非复制样板。**心跳：应答不主动**——Polymarket 应用层心跳为服务端发 PING 文本、客户端回 PONG；客户端主动发 PING 被判非法（1008 policy violation，曾致盘口流 3 秒断连循环）。
 - **市场格式（slug/outcome）** — Polymarket 市场格式解析单一事实源在 `types.py`（window_start_from_slug / symbol_from_slug / direction_from_outcome）：曾把 slug `rsplit` 三处、outcome→方向映射两处当字符串手工处理。外部数据重建持仓走 `rebuilt_position` 工厂（entered_remaining_sec = 窗口剩余，负数截 0）：挂单成交 / API 成交 / 钱包接管三条路径共用。
 - **盘口定价（weighted_price / best_price）** — `book_price.py` 纯函数，单一事实源：按可成交量加权均价，**流动性不足返回 None**（宁缺毋滥，不显示误导价）。执行器与面板落盘必须共用，禁止本地复刻。
 - **盘口展示（book.json）** — 面板盘口单一来源：BookSampler 每 1s 落盘 book.json，monitor 只读它；tick 不再写 status.market_prices（曾是双写死工作，monitor 用 book.json 覆盖 status）。
@@ -47,7 +47,7 @@ Polymarket 加密货币涨跌（Up/Down）预测交易机器人：Kronos 模型�
 
 ### 展示与验证
 
-- **监控面板（monitor）** — 只读 TUI，独立进程：从 `StateStore.load()` 读状态、trades.csv、PredictionLog、book.json 构建视图。任何异常只显示不崩溃。展示逻辑（`build_view`/`render`/`PanelView`/`PanelConfig`）提取至 `panel_view.py` 深模块（纯函数 + 类型化视图，TUI 与 Web 控制台共用）；实时价轮询提取至 `spot_price.py`（`SpotPrice` 后台线程）。`monitor.py` 只负责 CLI 入口与 TUI 渲染循环。`build_view` 的展示配置（模型变体/阈值/窗口长度/摘要/止盈止损/运行时长）经 `PanelConfig` 打包注入。
+- **监控面板（monitor）** — 只读 TUI，独立进程：从 `StateStore.load()` 读状态、trades.csv、PredictionLog、book.json 构建视图。任何异常只显示不崩溃。展示逻辑（`build_view`/`render`/`PanelView`/`PanelConfig`）提取至 `panel_view.py` 深模块（纯函数 + 类型化视图，TUI 与 Web 控制台共用）；实时价轮询提取至 `spot_price.py`（`SpotPrice` 后台线程）。`monitor.py` 只负责 CLI 入口与 TUI/Web 渲染循环，无兼容 re-export（测试直接锚定 panel_view，防「改 panel_view 但旧路径仍绿」假安全感）。`build_view` 的展示配置（模型变体/阈值/窗口长度/摘要/止盈止损/运行时长）经 `PanelConfig` 打包注入。
 - **展示视图（PanelView）** — `build_view` 输出的类型化视图：TUI render 属性访问（静态检查）；Web 控制台经 `asdict` 边界转换，字段名即 JSON 键名唯一出处。展示侧禁止魔法字符串键（ADR-0001 精神延伸）。
 - **运行路径（RuntimePaths）** — 数据目录派生单一事实源（status/trades/log_dir/pid_file/mode）：模拟 data/、实盘 data_live/；`paths_for(live, data_dir)` 工厂。
 - **协调状态（ProcessControl）** — monitor ↔ Web 控制台共享的进程协调（proc/show_tui/live/paths），替代裸 holder dict；模拟/实盘切换一次赋值（pc.paths 换新即全部跟随）。进程级操作也收敛于此：`spawn(config)`（按当前模式/数据目录拉起主循环）与 `loop_alive()`（读当前 pid 文件判存活），spawn_loop 模块函数在 paths.py，web_ui 只做 HTTP 路由。

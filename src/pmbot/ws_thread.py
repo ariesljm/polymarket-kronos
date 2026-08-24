@@ -1,6 +1,7 @@
 """可重连 WS 线程基类：后台线程跑 asyncio 事件循环。
 
-统一连接生命周期骨架（指数退避重连 + 应用层心跳应答 + 优雅停止），
+统一连接生命周期骨架（指数退避重连 + 应用层心跳应答 + 优雅停止）
+与订阅集合动态推送（_push_subscriptions：跨线程安全调度 + 增量 diff），
 业务差异由子类实现：订阅消息、消息处理、连接/断线回调。
 
 两个消费者（BookSampler / UserStream）共享此骨架，第三个 WS 流直接复用。
@@ -9,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 
@@ -121,3 +123,44 @@ class ReconnectingWsThread(threading.Thread):
 
     def _handle_message(self, raw: str) -> None:
         """处理收到的消息。"""
+
+    # ---- 订阅集合动态推送 ----
+
+    def _push_subscriptions(self, wanted: set[str], payload_key: str,
+                            on_error=None) -> None:
+        """订阅集合变化且 WS 连接中：推送 operation 消息动态增删，避免等重连。
+
+        wanted: 当前想要的完整订阅集合；payload_key: 服务端键名（如 assets_ids/markets）。
+        统一经 run_coroutine_threadsafe 跨线程调度（loop.create_task 从非事件循环线程
+        调用不是线程安全的，曾致丢任务竞争窗口）。未连接时不推：重连时 _send_subscribe
+        全量订阅。on_error: 发送失败回调（缺省静默——断线后全量重订阅兑底）。
+        """
+        ws = self._connected_ws
+        loop = self._loop
+        if ws is None or loop is None:
+            return
+
+        async def _do() -> None:
+            subbed = set(self._last_subscribed)
+            add = wanted - subbed
+            rm = subbed - wanted
+            if not add and not rm:
+                return
+            try:
+                if rm:
+                    await ws.send(json.dumps(
+                        {"operation": "unsubscribe", payload_key: sorted(rm)}))
+                if add:
+                    await ws.send(json.dumps(
+                        {"operation": "subscribe", payload_key: sorted(add)}))
+                self._last_subscribed = set(wanted)
+            except Exception:
+                if on_error is not None:
+                    on_error()
+                else:
+                    logger.warning("订阅增量同步失败", exc_info=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_do(), loop)
+        except RuntimeError:
+            pass  # loop 关闭（线程退出中）

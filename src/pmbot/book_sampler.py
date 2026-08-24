@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import threading
@@ -39,11 +38,6 @@ def _apply_price_change(snap: dict, change: dict) -> None:
     if size and float(size) > 0:
         levels.append({"price": str(price), "size": str(size)})
     snap[side] = sorted(levels, key=lambda l: float(l["price"]), reverse=(side == "bids"))
-
-
-def _subscription_diff(wanted: set[str], subbed: set[str]) -> tuple[list, list]:
-    """计算订阅差异：(需要新增, 需要退订)。"""
-    return [t for t in wanted if t not in subbed], [t for t in subbed if t not in wanted]
 
 
 class BookSampler(ReconnectingWsThread):
@@ -103,30 +97,9 @@ class BookSampler(ReconnectingWsThread):
 
     def _push_update(self) -> None:
         """订阅集合变化且 WS 连接中：推送官方 update 消息动态增删，避免等重连。"""
-        ws = self._connected_ws
-        loop = self._loop
-        if ws is None or loop is None:
-            return  # 未连接：重连时 _send_subscribe 全量订阅
-
-        async def _do() -> None:
-            with self._lock:
-                wanted = set(self._tokens)
-            add, rm = _subscription_diff(wanted, set(self._last_subscribed))
-            if not add and not rm:
-                return
-            try:
-                if rm:
-                    await ws.send(json.dumps({"operation": "unsubscribe", "assets_ids": rm}))
-                if add:
-                    await ws.send(json.dumps({"operation": "subscribe", "assets_ids": add}))
-                self._last_subscribed = wanted
-            except Exception:
-                pass  # 连接已断开：重连后 _send_subscribe 全量订阅
-
-        try:
-            asyncio.run_coroutine_threadsafe(_do(), loop)
-        except RuntimeError:
-            pass  # loop 关闭（线程退出中）
+        with self._lock:
+            wanted = set(self._tokens)
+        self._push_subscriptions(wanted, "assets_ids")
 
     # ---- book.json 落盘（监控面板 1s 级实时盘口） ----
 
@@ -155,7 +128,10 @@ class BookSampler(ReconnectingWsThread):
             prices[f"{label}_ask"] = round(ask, 6) if ask is not None else None
             prices[f"{label}_bid"] = round(bid, 6) if bid is not None else None
         try:
-            self._book_path.write_text(json.dumps(prices), encoding="utf-8")
+            # ADR-0003：所有 JSON 状态文件原子写（monitor 进程并发读，防半写脏读）
+            from pmbot.fileio import atomic_write_text
+
+            atomic_write_text(self._book_path, json.dumps(prices))
         except Exception:
             logger.warning("book.json 落盘失败", exc_info=True)
 

@@ -16,26 +16,10 @@ import threading
 import time
 from pathlib import Path
 
-# 展示逻辑与实时价从深模块重导出（保持 pmbot.monitor.X 的旧导入路径兼容）
-from pmbot.panel_view import (  # noqa: F401
-    EXIT_LABELS,
-    RECENT_LIMIT,
-    REFRESH_SEC,
-    PanelConfig,
-    PanelView,
-    build_live_view as build_live_view_impl,
-    _fmt_cents,
-    _read_book_prices,
-    build_view,
-    render,
-)
-from pmbot.spot_price import SpotPrice  # noqa: F401
-
-
-def _build_live_view(symbol, config, paths, recent_limit=None, uptime_sec=None, spot=None):
-    """TUI/Web 控制台共用：读取状态/交易/盘口/配置并构建视图。"""
-    return build_live_view_impl(symbol, config, paths,
-                                recent_limit=recent_limit, uptime_sec=uptime_sec, spot=spot)
+# 展示逻辑（build_view/render/PanelView/PanelConfig）与实时价在深模块：
+# panel_view.py / spot_price.py，本模块只负责 CLI 入口与 TUI/Web 渲染循环。
+from pmbot.panel_view import REFRESH_SEC, build_live_view
+from pmbot.spot_price import SpotPrice
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
 
         spot.start()
         server = start_server(
-            lambda: _build_live_view(args.symbol, args.config, pc.paths, recent_limit=None,
+            lambda: build_live_view(args.symbol, args.config, pc.paths, recent_limit=None,
                                      uptime_sec=int(time.monotonic() - t_start),
                                      spot=spot.snapshot()),
             args.config, args.live, args.web_port, args.web_host, pc, lock,
@@ -140,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             while True:
                 if pc.show_tui:
                     try:
-                        v = _build_live_view(args.symbol, args.config, pc.paths,
+                        v = build_live_view(args.symbol, args.config, pc.paths,
                                              uptime_sec=int(time.monotonic() - t_start))
                         if args.web_port > 0:
                             v.loop_alive = pc.loop_alive()

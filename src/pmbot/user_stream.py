@@ -49,30 +49,9 @@ class UserStream(ReconnectingWsThread):
 
     def _push_update(self) -> None:
         """markets 变化且 WS 连接中：推送 operation 消息动态增删，避免等重连。"""
-        ws = self._connected_ws
-        loop = self._loop
-        if ws is None or loop is None:
-            return  # 未连接：重连时 _send_subscribe 全量订阅
-
-        async def _do() -> None:
-            with self._lock:
-                wanted = set(self._markets)
-            subbed = set(self._last_subscribed)
-            add = wanted - subbed
-            rm = subbed - wanted
-            if not add and not rm:
-                return
-            try:
-                if rm:
-                    await ws.send(json.dumps({"operation": "unsubscribe", "markets": sorted(rm)}))
-                if add:
-                    await ws.send(json.dumps({"operation": "subscribe", "markets": sorted(add)}))
-                with self._lock:
-                    self._last_subscribed = wanted
-            except Exception:
-                logger.warning("markets 增量同步失败", exc_info=True)
-
-        loop.create_task(_do())
+        with self._lock:
+            wanted = set(self._markets)
+        self._push_subscriptions(wanted, "markets")
 
     def drain(self) -> list[tuple[str, dict]]:
         """取出全部待处理事件（主循环 tick 调用）：[(event_type, payload), ...]"""

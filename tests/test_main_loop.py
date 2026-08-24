@@ -1486,3 +1486,59 @@ def test_settle_mid_price_after_timeout_forces_close(tmp_path):
     rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
     assert rows and rows[-1]["reason"] == "settle"
     assert float(rows[-1]["pnl"]) == pytest.approx(2.0 * 0.55 - 2.0 * 0.45)  # 按当前价
+
+def test_user_event_trade_sell_clears_position(tmp_path):
+    """WS trade 事件（外部卖出兜底，live）：活跃持仓经结算流程清理记账。
+
+    用户在网页手动卖出 → 本地持仓记录交给 Settler（窗口内等结算价，
+    窗口结束后按结算价/真实兑付清理），不能残留幽灵持仓。
+    """
+    ex = FakeExecutor()
+    settled = make_market(price=1.0)  # 结算后 Up=1：按结算价记账清仓
+    st = TradeState(
+        symbol="BTC", window_start=999_900, window_bet_placed=True,
+        position=make_position(),
+    )
+    stream = FakeUserStream([("trade", {"event_type": "trade", "id": "t1",
+                                        "side": "SELL"})])
+    loop = make_loop(tmp_path, executor=ex, state=st,
+                     discovery=FakeDiscovery(None, settled=settled),
+                     user_stream=stream, dry_run=False)
+    # 窗口已结束（999_900 + 900 <= now）：settle 直接按结算价记账
+    loop.tick(now_ms=(999_900 + 900) * 1000 + 60_000)
+    assert st.position is None, "外部卖出后本地持仓应经结算流程清空"
+    assert st.settle_pending is None
+    trades = Path(tmp_path, "trades.csv").read_text(encoding="utf-8")
+    assert "settle" in trades
+
+
+def test_user_event_trade_sell_ignored_in_dry_run(tmp_path):
+    """WS trade 事件（SELL）：dry-run 不触发（模拟仓无真实卖出）。"""
+    ex = FakeExecutor()
+    st = TradeState(
+        symbol="BTC", window_start=999_900, window_bet_placed=True,
+        position=make_position(),
+    )
+    stream = FakeUserStream([("trade", {"event_type": "trade", "id": "t2",
+                                        "side": "SELL"})])
+    loop = make_loop(tmp_path, executor=ex, state=st, user_stream=stream,
+                     dry_run=True)
+    loop.tick(now_ms=1_000_000_000)
+    assert st.position is not None, "dry-run 模拟仓不受外部卖出事件影响"
+
+
+def test_user_event_trade_buy_ignored(tmp_path):
+    """WS trade 事件（BUY）：不影响持仓状态。"""
+    ex = FakeExecutor()
+    st = TradeState(
+        symbol="BTC", window_start=999_900, window_bet_placed=True,
+        position=make_position(),
+    )
+    stream = FakeUserStream([("trade", {"event_type": "trade", "id": "t3",
+                                        "side": "BUY"})])
+    loop = make_loop(tmp_path, executor=ex, state=st,
+                     discovery=FakeDiscovery(None, settled=make_market(price=1.0)),
+                     user_stream=stream, dry_run=False)
+    loop.tick(now_ms=(999_900 + 900) * 1000 + 60_000)
+    assert st.position is not None or st.settle_pending is not None,         "BUY 事件不触发持仓清理"
+

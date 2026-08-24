@@ -154,10 +154,20 @@ class WalletReconciler:
         if state.position is not None and not mine:
             # 本地有持仓、Polymarket 无本标的持仓 → 疑似幽灵持仓（已平仓/已结算但本地未清除）
             pos = state.position
-            # 防误清竞态：刚买入的持仓 Polymarket /positions 索引有延迟（数十秒），
-            # 立即核对会误判幽灵 → 真实持仓失去止损/时间止损/结算管理。
-            # 仅当持仓窗口已结束并超过宽限期才判定真幽灵（崩溃/强杀残留必早于此）。
-            if now_sec < pos.window_start + self._step_sec + GHOST_GRACE_SEC:
+            if now_sec >= pos.window_start + self._step_sec:
+                # 窗口已结束的残留仓：不按幽灵清除（会直接丢弃跟踪、丢失结算记账），
+                # 交给窗口切换的 defer_to_settle → Settler 后台结算（记账/超时丢弃）。
+                # 回归：reconcile 抢在 defer 之前幽灵清除 → settle_pending 机制失效
+                #（11:09 启动：up 3.5714 被幽灵清，无 trades 记录）。
+                logger.warning(
+                    "本地残留持仓窗口已结束（%s %.4f 股 窗口 %d），"
+                    "不按幽灵清除，交结算流程记账",
+                    pos.direction.value, pos.size, pos.window_start,
+                )
+            elif now_sec < pos.window_start + self._step_sec + GHOST_GRACE_SEC:
+                # 防误清竞态：刚买入的持仓 Polymarket /positions 索引有延迟（数十秒），
+                # 立即核对会误判幽灵 → 真实持仓失去止损/时间止损/结算管理。
+                # 仅当持仓窗口已结束并超过宽限期才判定真幽灵（崩溃/强杀残留必早于此）。
                 logger.warning(
                     "本地持仓 %s %.4f 股（窗口 %d）暂未在 Polymarket 出现"
                     "（窗口未结束/索引延迟），跳过幽灵清除",

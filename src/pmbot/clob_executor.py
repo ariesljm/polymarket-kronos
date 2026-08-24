@@ -127,23 +127,22 @@ class ClobExecutor:
             return int(r["balance"]) / 1e6
         return None
 
-    def live_positions(self, user: str | None = None) -> list[dict] | None:
-        """Polymarket 实时持仓（官方 data-api /positions，user 过滤有效）。
+    # ---- data-api 公开端点（/positions、/activity）----
 
-        返回 [{asset, conditionId, size, avgPrice, curPrice, currentValue,
-        cashPnl, realizedPnl, redeemable, title, outcome, ...}]；
-        查询失败（网络/无地址）返回 None——调用方必须区分「无持仓」与「查询失败」。
-        user 缺省用代理钱包地址（.env PROXY_WALLET）。
+    _DATA_API = "https://data-api.polymarket.com"
+
+    def _data_api_get(self, path: str, params: dict) -> list[dict] | None:
+        """data-api GET：代理/超时/错误归一集中一次；失败返回 None。
+
+        代理默认 127.0.0.1:10808（本机环境，可用 HTTPS_PROXY 覆盖）——
+        曾四处手抄同一 dict，换机器要改四处，收敛于此。
         """
         import requests
 
-        addr = user or self._proxy_wallet
-        if not addr:
-            return None
         try:
             r = requests.get(
-                "https://data-api.polymarket.com/positions",
-                params={"user": addr, "limit": 100},
+                f"{self._DATA_API}{path}",
+                params=params,
                 proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
                 timeout=30,
             )
@@ -154,38 +153,51 @@ class ClobExecutor:
         except Exception:
             return None
 
+    def _activity_page(self, activity_type: str, offset: int = 0, limit: int = 500) -> list[dict]:
+        """/activity 分页（type=TRADE/REDEEM）；失败返回 []（同步器静默跳过）。"""
+        addr = self._proxy_wallet
+        if not addr:
+            return []
+        data = self._data_api_get(
+            "/activity",
+            {"user": addr, "type": activity_type, "limit": limit, "offset": offset},
+        )
+        return data or []
+
+    def live_positions(self, user: str | None = None) -> list[dict] | None:
+        """Polymarket 实时持仓（官方 data-api /positions，user 过滤有效）。
+
+        返回 [{asset, conditionId, size, avgPrice, curPrice, currentValue,
+        cashPnl, realizedPnl, redeemable, title, outcome, ...}]；
+        查询失败（网络/无地址）返回 None——调用方必须区分「无持仓」与「查询失败」。
+        user 缺省用代理钱包地址（.env PROXY_WALLET）。
+        """
+        addr = user or self._proxy_wallet
+        if not addr:
+            return None
+        return self._data_api_get("/positions", {"user": addr, "limit": 100})
+
     def settle_proceeds(self, condition_id: str) -> float | None:
         """结算兑付真实到账（data-api /activity REDEEM）：匹配 conditionId 的 REDEEM 记录 usdcSize。
         市场结算后赢的持仓自动兑付为 USDC（链上 REDEEM 交易），usdcSize 为实际到账
         金额（含本金）；结算记账用 到账 − 成本 替代理论价差，口径与钱包一致。
         查询失败/无匹配记录返回 None——调用方回退理论价差（与 sell_proceeds 同模式）。
         """
-        import requests
-
         addr = self._proxy_wallet
         if not addr or not condition_id:
             return None
-        try:
-            r = requests.get(
-                "https://data-api.polymarket.com/activity",
-                params={"user": addr, "type": "REDEEM", "limit": 200},
-                proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
-                timeout=30,
-            )
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            if not isinstance(data, list):
-                return None
-            want = str(condition_id).lower()
-            for a in data:
-                if str(a.get("conditionId") or "").lower() == want:
-                    usdc = a.get("usdcSize")
-                    if usdc is not None:
-                        return float(usdc)
-            return None  # 有响应但该市场尚未 REDEEM（结算延迟/未兑付）
-        except Exception:
+        data = self._data_api_get(
+            "/activity", {"user": addr, "type": "REDEEM", "limit": 200},
+        )
+        if not data:
             return None
+        want = str(condition_id).lower()
+        for a in data:
+            if str(a.get("conditionId") or "").lower() == want:
+                usdc = a.get("usdcSize")
+                if usdc is not None:
+                    return float(usdc)
+        return None  # 有响应但该市场尚未 REDEEM（结算延迟/未兑付）
 
     @property
     def wallet_address(self) -> str | None:
@@ -198,45 +210,11 @@ class ClobExecutor:
         用 /activity 而非 /trades：前者带 usdcSize（含手续费的美元金额），
         统计/报表切 API 口径需要它。失败返回 []（同步器静默跳过）。
         """
-        import requests
-
-        addr = self._proxy_wallet
-        if not addr:
-            return []
-        try:
-            r = requests.get(
-                "https://data-api.polymarket.com/activity",
-                params={"user": addr, "type": "TRADE", "limit": limit, "offset": offset},
-                proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
-                timeout=30,
-            )
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+        return self._activity_page("TRADE", offset, limit)
 
     def fetch_redeem_page(self, offset: int = 0, limit: int = 500) -> list[dict]:
         """结算兑付分页（data-api /activity?type=REDEEM，倒序最新在前）；失败返回 []。"""
-        import requests
-
-        addr = self._proxy_wallet
-        if not addr:
-            return []
-        try:
-            r = requests.get(
-                "https://data-api.polymarket.com/activity",
-                params={"user": addr, "type": "REDEEM", "limit": limit, "offset": offset},
-                proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
-                timeout=30,
-            )
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+        return self._activity_page("REDEEM", offset, limit)
 
     def _load_creds(self) -> ApiCreds | None:
         """从本地缓存读取 ApiCreds（避免每次重新派生/400 噪音）。"""

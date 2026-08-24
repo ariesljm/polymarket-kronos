@@ -79,18 +79,11 @@ def _main_with_guard(args, mode: str, data_dir: str) -> int:
     # paths.spawn_loop——Web 控制台 start 按钮与桌面双击共用同一实现。
     from pmbot.paths import spawn_loop
     from pmbot.single_instance import InstanceGuard
-
-    bot = spawn_loop(args.config, args.live, data_dir)
-    logging.info("主循环已启动（PID %s, %s, data=%s）", bot.pid, mode, data_dir)
+    from pmbot.watchdog import ParentWatchdog
 
     # 父进程看门狗：uv run 的 shim 层脱离控制台信号，关闭终端窗口时
     # 信号传不到本进程——改为主动探测终端进程（父进程）存活，
     # 父进程退出（终端关闭）即整树清理子进程并自退出。
-    # 提取为独立模块（watchdog.ParentWatchdog）使其可测。
-    from pmbot.paths import spawn_loop
-    from pmbot.single_instance import InstanceGuard
-    from pmbot.watchdog import ParentWatchdog
-
     bot = spawn_loop(args.config, args.live, data_dir)
     logging.info("主循环已启动（PID %s, %s, data=%s）", bot.pid, mode, data_dir)
     parent_pid = os.getppid() if hasattr(os, "getppid") else None

@@ -8,7 +8,8 @@ import pytest
 
 from datetime import datetime, timedelta, timezone
 
-from pmbot.monitor import PanelConfig, SpotPrice, build_view
+from pmbot.panel_view import PanelConfig, build_view
+from pmbot.spot_price import SpotPrice
 from pmbot.ledger import TradeRecord
 from pmbot.state import Position, TradeState
 from pmbot.types import Direction, PendingOrder, Signal
@@ -66,7 +67,7 @@ def status_dict(**over):
 
 def test_today_pnl_uses_balance_diff_when_available():
     """完全 API 口径：今日盈亏 = 已平仓交易聚合（流水净额），余额差不再覆盖。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     rows = trades_rows(1, pnl=0.55)  # 交易聚合 +0.55；余额差 +5.00 不再优先
     v = build_view(status_dict(balance=25.0, day_start_balance=20.0), rows, None,
@@ -184,7 +185,7 @@ def test_paused_flag():
 
 def test_pause_reason_shown():
     """暂停时显示熔断原因。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(paused=True, pause_reason="日亏 10.30 USDC（上限 10）")
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY)
@@ -196,7 +197,7 @@ def test_pause_reason_shown():
 
 
 def test_render_smoke():
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     v = build_view(status_dict(), trades_rows(), {"correct": 35, "total": 60, "accuracy": 0.583},
                    now_sec=WINDOW_START + 60, local_tz=timezone.utc, panel=PanelConfig(model_variant="kronos-small"))
@@ -228,7 +229,7 @@ def test_signal_note_thresholds():
 
 
 def test_render_shows_signal_note():
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     v = build_view(status_dict(signal={"direction": "up", "p_up": 0.55}), trades_rows(), None,
                    now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(thresholds={"p_up_buy": 0.60, "p_down_buy": 0.40}))
@@ -238,7 +239,7 @@ def test_render_shows_signal_note():
 
 def test_inferred_yes_with_signal_no_last_predict():
     """旧 status（无 last_predict_sec）但有信号 → 判定已推理。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(last_predict_sec=None)
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY)
@@ -248,7 +249,7 @@ def test_inferred_yes_with_signal_no_last_predict():
 
 def test_waiting_for_pullback_note():
     """信号候选但未挂单 → 等回调状态（盘口未到限价）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     # 候选 + 无挂单（挂单已撤）→ 本窗口未成交（trades 无本窗口平仓）
     v = build_view(status_dict(pending_order=None, position=None), [], None,
@@ -295,7 +296,7 @@ def test_status_note_other_window_trade_does_not_apply():
 
 
 def test_view_market_prices():
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(market_prices={"up_ask": 0.16, "up_bid": 0.15, "down_ask": 0.86, "down_bid": 0.85})
     v = build_view(st, trades_rows(), None, now_sec=WINDOW_START, today=TODAY)
@@ -311,7 +312,7 @@ def test_view_market_prices_missing_safe():
 
 
 def test_position_line_shows_mark_and_floating_pnl():
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(
         position={"direction": "up", "entry_price": 0.45, "size": 5.0,
@@ -326,7 +327,7 @@ def test_position_line_shows_mark_and_floating_pnl():
 
 
 def test_position_line_without_mark_safe():
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(
         position={"direction": "down", "entry_price": 0.36, "size": 5.0,
@@ -340,7 +341,7 @@ def test_position_line_without_mark_safe():
 
 def test_position_line_shows_direction_size_price_only():
     """持仓行只显示方向/数量/价格三项：不含现价/浮动/止盈/止损（用户口径）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(
         position={"direction": "up", "entry_price": 0.50, "size": 5.0,
@@ -360,7 +361,7 @@ def test_position_line_shows_direction_size_price_only():
 
 def test_uptime_shown_bottom():
     """面板底部显示运行时长（HH:MM:SS）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     v = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(uptime_sec=3661))
@@ -371,7 +372,7 @@ def test_uptime_shown_bottom():
 
 def test_trade_records_stats_all_trades():
     """交易记录标题显示全部交易统计（超过显示行数也按全量统计）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     rows = trades_rows(8, pnl=0.55)  # 8 笔 > 显示上限 5 行
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START, today=TODAY)
@@ -401,7 +402,7 @@ def test_trade_records_stats_all_trades():
 
 def test_today_line_shows_win_loss_breakdown():
     """今日行显示笔数、盈利/亏损分计与最大亏损。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     rows = trades_rows(5, pnl=0.55)  # 5 笔盈利 +0.55
     rows += trades_rows(1, pnl=-0.30)  # 1 笔亏损 -0.30
@@ -422,7 +423,7 @@ def test_today_line_shows_win_loss_breakdown():
 
 def test_today_line_plain_when_no_trades():
     """无今日交易时只显示盈亏行（余额差口径无标记 = 交易聚合回退）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     v = build_view(status_dict(), [], None, now_sec=WINDOW_START, today=TODAY)
     assert v.today_stats is None
@@ -432,7 +433,7 @@ def test_today_line_plain_when_no_trades():
 
 def test_recent_trades_stats_hidden_when_empty():
     """无交易时不显示统计（保持原标题）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     v = build_view(status_dict(), [], None, now_sec=WINDOW_START, today=TODAY)
     assert v.recent_stats is None
@@ -443,7 +444,7 @@ def test_recent_trades_stats_hidden_when_empty():
 
 def test_recent_trade_reason_chinese():
     """最近交易行的离场原因用中文显示（take_profit → 已止盈）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     rows = trades_rows(1) + [
         TradeRecord(ts="2026-08-14T03:30:00+00:00", window_start=WINDOW_START,
@@ -463,7 +464,7 @@ def test_recent_trade_reason_chinese():
 
 def test_position_size_two_decimals():
     """持仓份额只显示小数点后 2 位（1.4925... → 1.49）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(
         position={"direction": "up", "entry_price": 0.67, "size": 1.4925373134328357,
@@ -485,7 +486,7 @@ def test_window_label_uses_injected_interval():
 
 
 def test_render_shows_config_summary():
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     v = build_view(status_dict(), trades_rows(), None, now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(config_summary="kronos | BTC | 5m | 注1.0 | 限价0.40 | 止盈0.70 | 止损0.15"))
@@ -495,7 +496,7 @@ def test_render_shows_config_summary():
 
 
 def test_predicting_state_shown():
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     st = status_dict(last_predict_sec=None, signal=None)
     st.predicting = True
@@ -508,7 +509,7 @@ def test_predicting_state_shown():
 
 def test_read_book_prices_fresh(tmp_path, monkeypatch):
     """book.json 新鲜（3s 内）→ 返回实时盘口。"""
-    from pmbot.monitor import _read_book_prices
+    from pmbot.panel_view import _read_book_prices
 
     d = tmp_path / "data"
     d.mkdir()
@@ -522,7 +523,7 @@ def test_read_book_prices_fresh(tmp_path, monkeypatch):
 
 def test_read_book_prices_stale_or_missing(tmp_path, monkeypatch):
     """过期/缺失 → None（回退 status.json）。"""
-    from pmbot.monitor import _read_book_prices
+    from pmbot.panel_view import _read_book_prices
 
     d = tmp_path / "data"
     d.mkdir()
@@ -554,7 +555,7 @@ def test_recent_trade_has_chinese_label():
 
 def test_fmt_cents_low_price_keeps_precision():
     """0.1 美分价格不得显示为 0（如 entry=0.001 → 0.10 美分）。"""
-    from pmbot.monitor import _fmt_cents
+    from pmbot.panel_view import _fmt_cents
 
     assert _fmt_cents(0.001) == "0.10"
     assert _fmt_cents(0.008) == "0.80"
@@ -565,7 +566,7 @@ def test_fmt_cents_low_price_keeps_precision():
 
 def test_render_trade_low_entry_shows_fractional_cents():
     """交易行低入场价显示小数美分（入0.10 而非入0）。"""
-    from pmbot.monitor import render
+    from pmbot.panel_view import render
 
     rows = [dataclasses.replace(trades_rows(1)[0], entry_price=0.001, exit_price=0.8, pnl=799.0, reason="take_profit")]
     v = build_view(status_dict(), rows, None, now_sec=WINDOW_START)
@@ -603,7 +604,7 @@ def test_live_view_uses_config_interval(tmp_path, monkeypatch):
     except 吞掉 → window_seconds 回退默认 900s（显示 15m 窗口标签）、
     config_summary 为空。
     """
-    from pmbot.monitor import _build_live_view
+    from pmbot.panel_view import build_live_view as _build_live_view
     from pmbot.paths import RuntimePaths
 
     (tmp_path / "status.json").write_text('{"symbol": "ETH", "window_start": 1786872300}',

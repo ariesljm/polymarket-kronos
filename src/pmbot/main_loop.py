@@ -76,9 +76,11 @@ class TradingLoop:
         self.settle_timeout_sec = settle_timeout_sec
         self.poll_sec = poll_sec
         self.user_stream = user_stream
-        # 执行分派器：动作执行与挂单成交检测（深模块提取）
+        # 执行分派器：动作执行与挂单成交检测（深模块提取）。
+        # state 经 getter 注入：reset 重建 TradeState 后自动跟随，无需手工回写。
         self._exec_dispatcher = ExecutionDispatcher(
-            state=state,
+            state=lambda: self.state,
+
             trade=self.trade,
             book=self.book,
             store=self._store,
@@ -181,17 +183,8 @@ class TradingLoop:
         self.wallet_sync.reconcile(now_sec, st)
         self._drain_user_events()
 
-        # 1. 窗口结束后结算持仓（gamma 结算有延迟；引擎级兜底，跨生命周期）。
-        #    结算对象是 settle_pending；窗口结束瞬间活跃持仓先转入该槽（释放
-        #    position → 新窗口开仓不阻塞），结算在后台推进、出结果后记账清空。
-        if st.position is not None and now_sec >= st.position.window_start + self.step_sec:
-            st.defer_to_settle()
-            sp = st.settle_pending
-            logger.info(
-                "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
-                sp.window_start, sp.direction.value, sp.size, sp.entry_price)
-        if self.settler.should_run(now_sec, st.settle_pending):
-            self.settler.settle(now_sec, st.settle_pending)
+        # 1. 窗口结束后结算持仓（引擎级兜底，跨生命周期；见 _settle_expired）
+        self._settle_expired(now_sec)
 
         # 2. 熔断/暂停：不交易（生命周期暂停推进，恢复后继续）
         if self._check_circuit_breaker(now_sec):
@@ -201,14 +194,8 @@ class TradingLoop:
         step = self.discovery.step_ms // 1000
         new_window = window_start_sec(now_ms // 1000, step)
         if st.window_start != new_window:
-            # 旧窗口持仓转入待结算（立即释放 position → 新市场开仓不阻塞）：
-            # 结算由 Settler 在后台推进（等结算价/兑付），出结果后记账清空。
-            if st.position is not None:
-                st.defer_to_settle()
-                logger.info(
-                    "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
-                    st.window_start, st.settle_pending.direction.value,
-                    st.settle_pending.size, st.settle_pending.entry_price)
+            # 旧窗口持仓转待结算/推进结算（同上；窗口切换即旧窗口结束）
+            self._settle_expired(now_sec, defer_only=True)
             # 跨窗口遗留挂单先撤单（基于 state 判断，兼容预置旧挂单场景）
             if st.pending_order is not None:
                 self.trade.cancel(st.pending_order.order_id)
@@ -260,11 +247,7 @@ class TradingLoop:
             return False
         st = self.state
         if cmd == "resume":
-            st.paused = False
-            st.was_paused = False
-            st.consecutive_losses = 0
-            st.daily_loss = 0.0
-            st.pause_reason = None
+            st.clear_breaker()
             self.save_status()
             logger.info("控制指令：恢复运行（熔断计数已清零）")
             return False
@@ -286,7 +269,6 @@ class TradingLoop:
             reset_runtime(self.status_path, self.trades_path, str(self.status_path.parent),
                           symbol=self.symbol, interval=self.discovery.interval)
             self.state = TradeState(symbol=self.symbol, mode=self.state.mode)  # 保留运行模式标记
-            self._exec_dispatcher.state = self.state  # 同步新状态引用
             self.save_status()
             logger.warning("控制指令：已清除数据并重建状态（symbol=%s）", self.symbol)
             return False
@@ -313,13 +295,43 @@ class TradingLoop:
         if self._lifecycle is not None:
             self._lifecycle.stop(now_sec)
             self._lifecycle = None
-        if st.position is not None and now_sec >= st.position.window_start + self.step_sec:
-            st.defer_to_settle()
-        if self.settler.should_run(now_sec, st.settle_pending):
-            self.settler.settle(now_sec, st.settle_pending)
+        self._settle_expired(now_sec)
         self.save_status()
         if self.history_sync is not None:
             self.history_sync.stop()
+
+    def _settle_expired(self, now_sec: int, *, defer_only: bool = False) -> None:
+        """窗口结束后持仓的结算兜底（引擎级关注点，tick×2 + shutdown 共用）。
+
+        活跃持仓已过窗口终点 → 先转待结算槽（释放 position，新窗口不阻塞开仓），
+        再把待结算仓交给 Settler 后台推进（等结算价/兑付），出结果后记账清空。
+        defer_only=True：窗口切换分支调用——切换本身即旧窗口结束的权威信号，
+        持仓无条件转待结算（state.window_start 与市场窗口错位时也正确）；
+        只 defer 不推进 Settler（步骤1 已推进过同一 settle_pending，
+        避免同 tick 重复查询；shutdown 语境传默认值走完整推进）。
+        """
+        if defer_only:
+            # 窗口切换分支：切换本身即旧窗口结束的权威信号，无条件 defer；
+            # 不推进 Settler（步骤1 已推进过同一 settle_pending，避免同 tick 重复查询）
+            st = self.state
+            if st.position is not None:
+                st.defer_to_settle()
+                sp = st.settle_pending
+                logger.info(
+                    "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
+                    sp.window_start, sp.direction.value, sp.size, sp.entry_price)
+            return
+
+        st = self.state
+        expired = now_sec >= (st.position.window_start + self.step_sec) if st.position else False
+        if expired:
+            st.defer_to_settle()
+            sp = st.settle_pending
+            logger.info(
+                "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
+                sp.window_start, sp.direction.value, sp.size, sp.entry_price)
+        if self.settler.should_run(now_sec, st.settle_pending):
+            self.settler.settle(now_sec, st.settle_pending)
 
     def _check_circuit_breaker(self, now_sec: int) -> bool:
         """熔断/暂停检查；返回 True 表示本 tick 不交易。"""
@@ -330,10 +342,7 @@ class TradingLoop:
             return True
         if st.was_paused:
             # 人工恢复：用户把 paused 改回 false → 清零熔断计数后继续
-            st.was_paused = False
-            st.consecutive_losses = 0
-            st.daily_loss = 0.0
-            st.pause_reason = None
+            st.clear_breaker()
             logger.info("人工恢复：熔断计数已清零，继续运行")
         # 判定与文案单一事实源（engine.circuit_breaker：tick/decide 共用）
         trip = circuit_breaker(self.state_view(), self.config.to_engine_config())

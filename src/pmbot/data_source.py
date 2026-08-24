@@ -176,5 +176,21 @@ class BinanceDataSource:
             since = batch[0].timestamp - self._page * step_ms_for(self.timeframe)
 
     def _fetch_incremental(self, symbol: str, since: int) -> None:
-        batch = self._fetch(symbol, self.timeframe, since, None)
-        self.store.append(symbol, batch)
+        """分页增量拉取：从 since 逐页向后拉，直到拉完（空批/无新数据即停）。
+
+        单次 klines 请求上限有限（实测 data-api.binance.vision 默认只回 500）；
+        停机超过单次上限（5m≈42h、15m≈5d）时不翻页会留下数据空洞
+        （回归：4 天停机实测一次仅拉 500/1152 根，推理特征断裂）。
+        翻页上限 max_klines/page +1：正常增量一页即完，上限只防数据源异常
+        （永远返回新数据的死循环）。
+        """
+        max_pages = self.max_klines // self._page + 1
+        for _ in range(max_pages):
+            batch = self._fetch(symbol, self.timeframe, since, self._page)
+            if not batch:
+                break
+            before = len(self.store.load(symbol))
+            self.store.append(symbol, batch)
+            if len(self.store.load(symbol)) - before == 0:
+                break  # 无新数据（防数据源忽略 since 时死循环）
+            since = batch[-1].timestamp + step_ms_for(self.timeframe)

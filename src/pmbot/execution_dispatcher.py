@@ -2,11 +2,15 @@
 
 从 TradingLoop 提取的深模块，将执行分派（execute/_exec_*）与挂单成交检测
 （refresh_pending/_fill_pending）收敛于此，使 TradingLoop 退化为纯编排器。
+
+TradeState 经 getter 注入（不持有引用副本）：TradingLoop reset 重建状态后
+自动跟随，无需消费方手工回写同步。
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 from pmbot.executor_protocols import MarketBook, TradeExecutor
 from pmbot.market_discovery import MarketInfo
@@ -41,13 +45,21 @@ class ExecutionDispatcher:
         step_sec: int,
         save_status,
     ):
-        self.state = state
+        # state 可传 TradeState 实例或 () -> TradeState；统一收敛为 getter：
+        # 每次 self.state 都取当前对象，reset 重建状态无需手工同步。
+        self._state_getter: Callable[[], TradeState] = (
+            state if callable(state) else (lambda: state)
+        )
         self.trade = trade
         self.book = book
         self._store = store
         self.dry_run = dry_run
         self.step_sec = step_sec
         self._save = save_status
+
+    @property
+    def state(self) -> TradeState:
+        return self._state_getter()
 
     # ---- 接缝方法（LifecycleDeps 消费） ----
 
