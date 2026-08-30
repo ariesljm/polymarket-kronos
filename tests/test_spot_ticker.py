@@ -5,6 +5,7 @@ import json
 import pytest
 
 from pmbot.spot_ticker import SpotTickerThread, REST_URL_TMPL, WS_URL_TMPL
+from pmbot.data_source import normalize_symbol
 
 
 def mini_ticker(price: float) -> str:
@@ -58,6 +59,27 @@ def test_rest_url_uses_mirror():
     assert t._rest_url == REST_URL_TMPL.format(sym="BTCUSDT")
     assert t.symbol == "BTCUSDT"  # 幂等规范化：不拼成 btcusdtUSDT
     assert "data-api.binance.vision" in t._rest_url
+
+
+def test_snapshot_compatible_with_panel():
+    """snapshot() 与旧 SpotPrice 兼容（面板顶栏 {"price","delta"} 语义）。"""
+    t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
+    assert t.snapshot() is None  # 尚未拉取
+    t._handle_message(mini_ticker(77_000.0))
+    assert t.snapshot() == {"price": 77_000.0, "delta": 0.0}
+    t._handle_message(mini_ticker(77_050.0))
+    assert t.snapshot() == {"price": 77_050.0, "delta": 50.0}
+
+
+def test_normalize_symbol_shared_single_source():
+    """交易对规范化单一事实源（data_source 归属，K 线/实时价/面板共用）。"""
+    assert normalize_symbol("BTC") == "BTCUSDT"
+    assert normalize_symbol("btc") == "BTCUSDT"
+    assert normalize_symbol("BTCUSDT") == "BTCUSDT"
+    assert normalize_symbol("btcusdt") == "BTCUSDT"  # 大小写幂等（原两实现互不相同）
+    assert normalize_symbol("ETH/USDT") == "ETHUSDT"
+    t = SpotTickerThread(symbol="BTCUSDT")
+    assert t.symbol == "BTCUSDT" and t.ws_url.endswith("btcusdt@miniTicker")
 
 
 # ---- 端到端 WS（patch websockets.connect → FakeWS，同 BookSampler 测试模式） ----

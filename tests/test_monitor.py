@@ -9,7 +9,6 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from pmbot.panel_view import PanelConfig, build_view
-from pmbot.spot_price import SpotPrice
 from pmbot.ledger import TradeRecord
 from pmbot.state import Position, TradeState
 from pmbot.types import Direction, PendingOrder, Signal
@@ -584,17 +583,18 @@ def test_view_carries_spot_price():
     assert v2.spot is None
 
 
-def test_spot_price_snapshot_and_delta():
-    """SpotPrice 快照与涨跌差值（首次拉取后无 delta，之后有）。"""
-    sp = SpotPrice()
-    assert sp.snapshot() is None  # 尚未拉取
-    sp._price = 2000.0
-    sp._delta = 0.0
-    assert sp.snapshot() == {"price": 2000.0, "delta": 0.0}
-    sp._tick = lambda: None  # 防线程启动干扰
-    sp._price = 2010.0
-    sp._delta = 10.0
-    assert sp.snapshot() == {"price": 2010.0, "delta": 10.0}
+def test_spot_ticker_snapshot_and_delta():
+    """SpotTickerThread 快照与涨跌差（面板顶栏语义，与旧 SpotPrice 兼容）。"""
+    import json
+
+    from pmbot.spot_ticker import SpotTickerThread
+
+    t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
+    assert t.snapshot() is None  # 尚未拉取
+    t._handle_message(json.dumps({"e": "24hrMiniTicker", "s": "BTCUSDT", "c": "2000.0"}))
+    assert t.snapshot() == {"price": 2000.0, "delta": 0.0}  # 首次无 delta
+    t._handle_message(json.dumps({"e": "24hrMiniTicker", "s": "BTCUSDT", "c": "2010.0"}))
+    assert t.snapshot() == {"price": 2010.0, "delta": 10.0}
 
 
 def test_live_view_uses_config_interval(tmp_path, monkeypatch):

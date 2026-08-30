@@ -22,21 +22,17 @@ import logging
 import threading
 import time
 
+from pmbot.data_source import normalize_symbol
 from pmbot.ws_thread import ReconnectingWsThread
 
 logger = logging.getLogger(__name__)
 
 # Binance 数据流镜像 WS（与 K 线 REST 镜像同源；单流 GET 连接，无需订阅消息）
+# WS stream 路径用小写交易对（btcusdt@miniTicker）；REST 端点用大写（镜像 400 拒小写）
 WS_URL_TMPL = "wss://data-stream.binance.vision/ws/{sym}@miniTicker"
 # REST 兜底（断线等待期间 1s 轮询；强制直连不跟随代理——data_source 同款实证）
 REST_URL_TMPL = "https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}"
 REST_POLL_SEC = 1.0
-
-
-def _binance_symbol(symbol: str) -> str:
-    """规范化交易对：BTC → BTCUSDT（幂等：BTCUSDT 保持）。"""
-    s = symbol.replace("/", "").upper()
-    return s if s.endswith("USDT") else s + "USDT"
 
 
 class SpotTickerThread(ReconnectingWsThread):
@@ -50,13 +46,14 @@ class SpotTickerThread(ReconnectingWsThread):
         if not sym.endswith("usdt"):
             sym += "usdt"
         super().__init__(name="spot-ticker", proxy=proxy)
-        self.symbol = _binance_symbol(symbol)
+        self.symbol = normalize_symbol(symbol)
         self.ws_url = WS_URL_TMPL.format(sym=sym)
         self._rest_url = REST_URL_TMPL.format(sym=self.symbol)
         self._proxy = proxy  # REST 兜底也走环境代理（与调度一致）；WS 直连时传 None
         self._fetch = fetch_ticker or self._rest_fetch  # 测试注入点（同 BookSampler）
         self._lock = threading.Lock()
         self._price: float | None = None
+        self._delta: float = 0.0  # 面板展示：最近一次价格差（与 SpotPrice 语义一致）
         self._ts: float = 0.0
 
     # ---- 消费方接口（线程安全） ----
@@ -65,6 +62,13 @@ class SpotTickerThread(ReconnectingWsThread):
         """最近一次 Binance 实时价（线程安全）。尚无成功拉取返回 None。"""
         with self._lock:
             return self._price
+
+    def snapshot(self) -> dict | None:
+        """价格快照（面板顶栏用，与 SpotPrice.snapshot 兼容）：{"price", "delta"}。"""
+        with self._lock:
+            if self._price is None:
+                return None
+            return {"price": self._price, "delta": self._delta}
 
     # ---- WS 钩子（ReconnectingWsThread 子类实现） ----
 
@@ -84,7 +88,13 @@ class SpotTickerThread(ReconnectingWsThread):
             price = float(close)
         except (TypeError, ValueError):
             return
+        self._update(price)
+
+    def _update(self, price: float) -> None:
+        """记录最新价与涨跌差（WS/REST 共用；首次无 delta）。"""
         with self._lock:
+            if self._price is not None:
+                self._delta = price - self._price
             self._price = price
             self._ts = time.monotonic()
 
@@ -99,9 +109,7 @@ class SpotTickerThread(ReconnectingWsThread):
         price = self._fetch()
         if price is None:
             return  # 失败静默保留旧值（下次轮询重试）
-        with self._lock:
-            self._price = price
-            self._ts = time.monotonic()
+        self._update(price)
 
     def _rest_fetch(self) -> float | None:
         """REST 兜底默认实现：Binance 公共镜像直连（不跟随环境代理，K 线源同款实证）。"""

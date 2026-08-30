@@ -17,9 +17,9 @@ import time
 from pathlib import Path
 
 # 展示逻辑（build_view/render/PanelView/PanelConfig）与实时价在深模块：
-# panel_view.py / spot_price.py，本模块只负责 CLI 入口与 TUI/Web 渲染循环。
+# panel_view.py / spot_ticker.py，本模块只负责 CLI 入口与 TUI/Web 渲染循环。
 from pmbot.panel_view import REFRESH_SEC, build_live_view
-from pmbot.spot_price import SpotPrice
+from pmbot.spot_ticker import SpotTickerThread
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     lock = threading.Lock()
     t_start = time.monotonic()
     server = None
-    spot = SpotPrice(symbol=args.symbol or _load_config(args.config).symbols[0])
+    spot = SpotTickerThread(symbol=args.symbol or _load_config(args.config).symbols[0])
 
     def apply_mode(live: bool) -> None:
         """切换面板/启动主循环的运行模式（模拟 ↔ 实盘，含数据目录切换）。

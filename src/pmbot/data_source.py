@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
+def normalize_symbol(symbol: str) -> str:
+    """规范化 Binance 交易对：BTC / btc / BTCUSDT → BTCUSDT（幂等）。
+
+    单一事实源：fetch_klines_batch / SpotTickerThread / SpotPrice 曾各自实现
+    「加 USDT 后缀」（大小写敏感互不相同，spot_price 曾可能拼出 BTCUSDTUSDT）。
+    """
+    s = symbol.replace("/", "").upper()
+    return s if s.endswith("USDT") else s + "USDT"
+
+
 @dataclass(frozen=True)
 class Kline:
     timestamp: int  # epoch 毫秒
@@ -49,9 +59,7 @@ def fetch_klines_batch(
     if proxies is None:
         # Binance 公共镜像直连：不跟随 HTTPS_PROXY 环境变量
         proxies = {"http": None, "https": None}
-    sym = symbol.replace("/", "")
-    if not sym.endswith("USDT"):
-        sym += "USDT"
+    sym = normalize_symbol(symbol)
     params = {"symbol": sym, "interval": timeframe}
     if limit is not None:
         params["limit"] = limit

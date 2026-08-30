@@ -399,7 +399,7 @@ def build_live_view(symbol: str | None, config: str, paths,
 
     symbol: 交易品种（None 时从 status.json 回退）；config: 配置文件路径。
     paths: 运行路径单一事实源（模式切换后自动跟随新数据目录）。
-    spot: 交易品种实时价快照（Web 控制台由 SpotPrice 轮询提供）。
+    spot: 交易品种实时价快照（Web 控制台由 SpotTickerThread 轮询提供）。
     """
     st = StateStore(paths.status).load()
     if st is not None:

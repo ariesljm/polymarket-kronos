@@ -78,3 +78,14 @@ def test_symbols_are_isolated(store):
     store.append("ETH", make_klines(5_000_000, 2))
     assert len(store.load("BTC")) == 2
     assert len(store.load("ETH")) == 2
+
+
+def test_normalize_symbol():
+    """交易对规范化单一事实源：幂等大小写不敏感（三处重复收敛）。"""
+    from pmbot.data_source import normalize_symbol
+
+    assert normalize_symbol("BTC") == "BTCUSDT"
+    assert normalize_symbol("btc") == "BTCUSDT"
+    assert normalize_symbol("BTCUSDT") == "BTCUSDT"
+    assert normalize_symbol("btcusdt") == "BTCUSDT"
+    assert normalize_symbol("ETH/USDT") == "ETHUSDT"
