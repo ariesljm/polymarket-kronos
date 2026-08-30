@@ -40,10 +40,15 @@ def fetch_klines_batch(
     """Binance 公共数据镜像拉取一批 K 线（在线数据源与离线回测共用）。
 
     主站 api.binance.com 在中国大陆不可达，镜像端点只提供公开市场数据，
-    足够 K 线需求；直接请求公开接口。proxies 为 None 时走 requests 环境变量。
+    足够 K 线需求；直接请求公开接口。proxies=None 时强制直连（不跟随
+    环境代理）——实证：Binance 公共镜像大陆直连可达，经本地代理反而
+    握手/读超时；确需代理的环境显式传 proxies 覆盖。
     """
     import requests
 
+    if proxies is None:
+        # Binance 公共镜像直连：不跟随 HTTPS_PROXY 环境变量
+        proxies = {"http": None, "https": None}
     sym = symbol.replace("/", "")
     if not sym.endswith("USDT"):
         sym += "USDT"
