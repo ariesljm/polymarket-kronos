@@ -86,9 +86,9 @@ class ExecutionDispatcher:
         if pending is None:
             return
         if self.dry_run:
-            # dry-run 模拟成交：真实盘口 ask ≤ 限价即视为成交
+            # dry-run 模拟成交：真实盘口 ask ≤ 限价即视为成交（最优档价，小单口径）
             token = token_for(market, pending.direction)
-            ask = self.book.best_ask(token)
+            ask = self.book.best_ask(token, size=1.0)
             if ask is not None and ask <= float(pending.price):
                 self.fill_pending(now_sec, entry_price=ask)
             return
@@ -107,7 +107,9 @@ class ExecutionDispatcher:
         if st.window_bet_placed:
             return
         token = token_for(market, action.direction)
-        ask = self.book.best_ask(token)
+        # 开仓小单（1 USDC ≈ 1-3 股）用最优档价估算份额（size=1.0）：
+        # 5 股加权价对小单系统性偏贵，会把可开仓堵在阈值外（C：定价量级对齐）
+        ask = self.book.best_ask(token, size=1.0)
         if ask is None:
             logger.warning("市价买入跳过：盘口无报价 %s", token[:16])
             return

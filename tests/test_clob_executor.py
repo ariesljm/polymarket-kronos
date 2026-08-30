@@ -17,8 +17,8 @@ def test_dry_run_place_and_sell():
 def test_dry_run_market_buy_sell(monkeypatch):
     """市价单不受 5 股/金额限制（服务端按金额换算份额，可小数）。"""
     ex = SimExecutor(private_key="0x" + "0" * 64)
-    monkeypatch.setattr(ex, "best_ask", lambda t: 0.50)  # 无盘口时注入报价
-    monkeypatch.setattr(ex, "best_bid", lambda t: 0.30)
+    monkeypatch.setattr(ex, "best_ask", lambda t, size=5.0: 0.50)  # 无盘口时注入报价
+    monkeypatch.setattr(ex, "best_bid", lambda t, size=5.0: 0.30)
     assert ex.market_buy("111", 2.38) is not None  # 小数份额
     assert ex.market_buy("111", 0.5) is not None   # 低于 5 股也放行
     r = ex.market_sell("111", 2.38)
@@ -29,7 +29,7 @@ def test_dry_run_market_buy_sell(monkeypatch):
 def test_dry_run_market_buy_without_book_returns_none(monkeypatch):
     """dry-run 无盘口报价 → 不建仓（与实盘“缺成交数据放弃建仓”同语义）。"""
     ex = SimExecutor(private_key="0x" + "0" * 64)
-    monkeypatch.setattr(ex, "best_ask", lambda t: None)
+    monkeypatch.setattr(ex, "best_ask", lambda t, size=5.0: None)
     assert ex.market_buy("111", 2.38) is None
 
 
@@ -188,8 +188,128 @@ def test_market_sell_falls_back_to_best_bid(monkeypatch):
     ex = ClobExecutor(private_key="0x" + "0" * 64)
     monkeypatch.setattr(ex, "_get_client",
                         lambda: _FakeClient({"orderID": "oid-2", "status": "matched"}))
-    monkeypatch.setattr(ex, "best_bid", lambda t: 0.40)
+    monkeypatch.setattr(ex, "best_bid", lambda t, size=5.0: 0.40)
     fill = ex.market_sell("111", 2.0)
     assert fill is not None
     assert fill.order_id == "oid-2"
     assert fill.avg_price == pytest.approx(0.40)
+
+
+# ---- 盘口新鲜度（A）+ 定价量级（C） ----
+
+
+class FakeSampler:
+    """采样器替身：可注入快照与年龄（snapshot_age 直接返回预设值）。"""
+
+    def __init__(self):
+        self._snaps = {}
+        self._ages = {}
+
+    def attach(self, token, book, age):
+        self._snaps[token] = book
+        self._ages[token] = age
+
+    def snapshot(self, token):
+        return dict(self._snaps[token]) if token in self._snaps else None
+
+    def snapshot_age(self, token):
+        return self._ages.get(token)
+
+    def update_snapshot(self, token, book):
+        self._snaps[token] = book
+        self._ages[token] = 0.0  # 回填后视为新鲜
+
+
+def _book(ask=0.50, bid=0.48):
+    return {"bids": [{"price": f"{bid:.2f}", "size": "10"}],
+            "asks": [{"price": f"{ask:.2f}", "size": "10"}]}
+
+
+def test_best_ask_fresh_snapshot_no_rest(monkeypatch):
+    """快照新鲜（age ≤ STALE_AGE_SEC）→ 直接用快照，不触发 REST。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    s = FakeSampler()
+    s.attach("tok-a", _book(ask=0.50), 0.1)
+    ex.attach_sampler(s)
+    rest_calls = {"n": 0}
+    monkeypatch.setattr(ex, "fetch_book",
+                        lambda t: rest_calls.__setitem__("n", rest_calls["n"] + 1) or _book(ask=0.90))
+    assert ex.best_ask("tok-a") == 0.50
+    assert ex.best_ask("tok-a", size=1.0) == 0.50
+    assert rest_calls["n"] == 0
+
+
+def test_best_ask_stale_snapshot_refreshes_rest(monkeypatch):
+    """快照陈旧（age > STALE_AGE_SEC）→ REST 现拉新价并回填采样器（防下 tick 重复查询）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    s = FakeSampler()
+    s.attach("tok-a", _book(ask=0.10), 30.0)  # 陈旧
+    ex.attach_sampler(s)
+    monkeypatch.setattr(ex, "fetch_book", lambda t: _book(ask=0.60))
+    assert ex.best_ask("tok-a") == 0.60  # 新价（不再用 0.10 旧快照）
+    assert s._snaps["tok-a"]["asks"][0]["price"] == "0.60"  # 已回填
+    assert s._ages["tok-a"] == 0.0  # 回填后新鲜
+
+
+def test_best_ask_stale_rest_failure_returns_none(monkeypatch):
+    """快照陈旧且 REST 失败 → 返回 None（宁缺毋滥，不报误导价，下 tick 重试）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    s = FakeSampler()
+    s.attach("tok-a", _book(ask=0.10), 30.0)  # 陈旧
+    ex.attach_sampler(s)
+
+    def boom(t):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(ex, "fetch_book", boom)
+    assert ex.best_ask("tok-a") is None
+
+
+def test_best_ask_missing_snapshot_uses_rest(monkeypatch):
+    """无快照（窗口切换/订阅失败）→ REST 查询返回新价。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    s = FakeSampler()  # 无任何快照
+    ex.attach_sampler(s)
+    monkeypatch.setattr(ex, "fetch_book", lambda t: _book(ask=0.60))
+    assert ex.best_ask("tok-a") == 0.60
+    assert ex.best_ask("no-sampler-token") == 0.60  # 无采样器也走 REST
+
+
+def test_best_ask_size_param():
+    """size 参数：定价基准按可成交量加权（C 项：小单/持仓量级决定吃到哪一档）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    s = FakeSampler()
+    # asks: 0.50×8 股 + 0.60×2 股
+    s.attach("tok-a", {"bids": [], "asks": [
+        {"price": "0.50", "size": "8"}, {"price": "0.60", "size": "2"}]}, 0.1)
+    ex.attach_sampler(s)
+    assert ex.best_ask("tok-a", size=5.0) == 0.50   # 5 股只吃第一档
+    assert ex.best_ask("tok-a", size=10.0) == 0.52  # 10 股吃穿两档: (0.5×8+0.6×2)/10
+    # bids 同理
+    s.attach("tok-b", {"bids": [
+        {"price": "0.90", "size": "4"}, {"price": "0.80", "size": "6"}], "asks": []}, 0.1)
+    assert ex.best_bid("tok-b", size=4.0) == 0.90
+    assert ex.best_bid("tok-b", size=10.0) == 0.84  # (0.9×4+0.8×6)/10
+
+
+def test_best_bid_stale_refreshes_rest(monkeypatch):
+    """best_bid 同样做新鲜度检查：陈旧 → REST 刷新（平仓决策价时效保证）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    s = FakeSampler()
+    s.attach("tok-a", _book(bid=0.20), 30.0)  # 陈旧
+    ex.attach_sampler(s)
+    monkeypatch.setattr(ex, "fetch_book", lambda t: _book(bid=0.70))
+    assert ex.best_bid("tok-a") == 0.70
+    assert s._snaps["tok-a"]["bids"][0]["price"] == "0.70"
+
+
+def test_market_sell_fallback_uses_position_size(monkeypatch):
+    """市场卖价取不到 → 回退 best_bid 按持仓股数量级定价（size 透传）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    seen = {}
+    monkeypatch.setattr(ex, "_get_client",
+                        lambda: _FakeClient({"orderID": "oid-3", "status": "matched"}))
+    monkeypatch.setattr(ex, "best_bid", lambda t, size=5.0: seen.__setitem__("size", size) or 0.40)
+    fill = ex.market_sell("111", 2.0)
+    assert fill is not None and fill.avg_price == pytest.approx(0.40)
+    assert seen["size"] == 2.0  # 卖单股数透传给 best_bid

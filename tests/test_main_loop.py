@@ -114,10 +114,10 @@ class FakeExecutor:
             return None
         return Fill(order_id="sim-mk", avg_price=ask, filled_size=amount / ask)
 
-    def best_bid(self, token_id):
+    def best_bid(self, token_id, size=5.0):
         return self.best_bid_value
 
-    def best_ask(self, token_id):
+    def best_ask(self, token_id, size=5.0):
         return self.best_ask_value
 
     def live_positions(self, user=None):
@@ -661,7 +661,7 @@ def test_market_buy_uses_latest_ask_even_if_volatile(tmp_path):
             super().__init__()
             self.ask_calls = 0
 
-        def best_ask(self, token_id):
+        def best_ask(self, token_id, size=5.0):
             self.ask_calls += 1
             # tick 不再预写 market_prices：_build_view（第 1 次）→ 0.42；
             # _execute 市价查询（第 2 次）→ 0.50（盘口已涨回）→ 按 0.50 成交

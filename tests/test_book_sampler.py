@@ -344,3 +344,144 @@ def test_subscribe_no_message_when_unchanged():
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
         loop.close()
+
+
+# ---- 快照新鲜度（A）+ 健康检查（B）+ 轻量事件（D） ----
+
+
+def test_update_snapshot_and_age():
+    """update_snapshot 注入快照并刷新时间戳；snapshot_age 返回年龄（秒）。"""
+    from pmbot.book_sampler import BookSampler
+
+    s = BookSampler()
+    assert s.snapshot("tok-a") is None
+    assert s.snapshot_age("tok-a") is None  # 无快照
+    s.update_snapshot("tok-a", {"bids": [], "asks": []})
+    assert s.snapshot("tok-a") == {"bids": [], "asks": []}
+    assert s.snapshot_age("tok-a") is not None
+    assert s.snapshot_age("tok-a") >= 0.0  # 刚更新：年龄 ≈ 0
+
+
+def test_light_price_event_parses_best_bid_ask():
+    """轻量事件 best_bid_ask：记录轻量价 + 事件流心跳（无快照也不报错）。"""
+    from pmbot.book_sampler import BookSampler
+
+    s = BookSampler()
+    s._apply_light_event({
+        "event_type": "best_bid_ask", "asset_id": "tok-a",
+        "best_bid": "0.61", "best_ask": "0.62",
+    })
+    # asset（非 asset_id）字段也容错
+    s._apply_light_event({
+        "event_type": "last_trade_price", "asset": "tok-b", "last_trade_price": "0.50",
+    })
+    lp = s.light_price("tok-a")
+    assert lp is not None and lp["best_bid"] == 0.61 and lp["best_ask"] == 0.62
+    assert s.light_price("tok-b")["last_trade_price"] == 0.50
+    assert s.light_price("missing") is None
+
+
+def test_light_event_touches_snapshot_freshness():
+    """轻量事件刷新快照新鲜度：陈旧的快照被判定为新鲜（事件流仍活着）。"""
+    from pmbot.book_sampler import BookSampler
+
+    s = BookSampler()
+    s.update_snapshot("tok-a", {"bids": [], "asks": []})
+    with s._lock:
+        s._snapshot_ts["tok-a"] = time.monotonic() - 30  # 30 秒前 → 陈旧
+    assert s.snapshot_age("tok-a") > 3.0
+    s._apply_light_event({"event_type": "best_bid_ask", "asset_id": "tok-a", "best_bid": "0.6"})
+    assert s.snapshot_age("tok-a") < 3.0  # 心跳刷新
+
+
+def test_health_check_refreshes_stale_snapshot():
+    """健康检查（B）：WS 连接中快照陈旧 → REST 现拉刷新并更新时间戳。"""
+    from pmbot.book_sampler import BookSampler
+
+    calls = {"n": 0}
+
+    def fetch(tok):
+        calls["n"] += 1
+        return fake_book(0.60)
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    with s._lock:
+        s._snapshots["tok-a"] = {"bids": [{"price": "0.40", "size": "10"}],
+                                 "asks": [{"price": "0.41", "size": "10"}]}
+        s._snapshot_ts["tok-a"] = time.monotonic() - 30  # 陈旧
+    s._connected_ws = object()  # 模拟 WS 连接中
+    s._health_check()
+    assert calls["n"] == 1
+    snap = s.snapshot("tok-a")
+    assert float(snap["bids"][0]["price"]) == 0.59  # REST 新快照（0.60-0.01）
+    assert s.snapshot_age("tok-a") < 3.0  # 时间戳已刷新
+
+
+def test_health_check_skips_fresh_snapshot():
+    """健康检查：快照新鲜（≤ STALE_AGE_SEC）→ 不 REST，避免浪费查询。"""
+    from pmbot.book_sampler import BookSampler
+
+    calls = {"n": 0}
+
+    def fetch(tok):
+        calls["n"] += 1
+        return fake_book(0.60)
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    s.update_snapshot("tok-a", {"bids": [{"price": "0.40", "size": "10"}],
+                                "asks": [{"price": "0.41", "size": "10"}]})
+    s._connected_ws = object()
+    s._health_check()
+    assert calls["n"] == 0
+
+
+def test_health_check_skips_when_disconnected():
+    """健康检查：WS 断线期间跳过（_while_disconnected 已有 2s REST 兜底，防重复查询）。"""
+    from pmbot.book_sampler import BookSampler
+
+    calls = {"n": 0}
+
+    def fetch(tok):
+        calls["n"] += 1
+        return fake_book(0.60)
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    with s._lock:
+        s._snapshot_ts["tok-a"] = time.monotonic() - 30  # 陈旧但断线
+    s._health_check()
+    assert calls["n"] == 0
+
+
+def test_health_check_missing_snapshot_refreshes():
+    """健康检查：订阅了但快照缺失（动态订阅失败的场景）→ REST 补齐。"""
+    from pmbot.book_sampler import BookSampler
+
+    calls = {"n": 0}
+
+    def fetch(tok):
+        calls["n"] += 1
+        return fake_book(0.60)
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    s._connected_ws = object()
+    s._health_check()
+    assert calls["n"] == 1
+    assert float(s.snapshot("tok-a")["asks"][0]["price"]) == 0.61
+
+
+def test_rest_fallback_updates_timestamp():
+    """REST 兜底写回同时刷新新鲜度时间戳（断线兜底结果同样被消费方信任）。"""
+    from pmbot.book_sampler import BookSampler
+
+    def fetch(tok):
+        return fake_book(0.50)
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    s._rest_fallback()
+    assert float(s.snapshot("tok-a")["asks"][0]["price"]) == 0.51
+    assert s.snapshot_age("tok-a") < 3.0

@@ -382,7 +382,8 @@ class TradingLoop:
             # 窗口结束判定与结算状态机同源（settler.should_run）。
             if not self.settler.should_run(now_sec, st.position):
                 pos_token = token_for(market, st.position.direction)
-                best_bid = self.book.best_bid(pos_token)
+                # 按持仓股数量级定价：止盈/止损判断贴近实际可卖价（C：定价量级对齐）
+                best_bid = self.book.best_bid(pos_token, size=st.position.size)
         return MarketView(
             remaining_sec=self._window_end_sec(now_sec) - now_sec,
             best_ask=best_ask,

@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
+# 快照新鲜度阈值（秒）：快照年龄超过此值视为陈旧（断线/订阅失效/事件流停摆），
+# 消费方（best_ask/best_bid）与健康检查线程都会触发 REST 现拉刷新。
+# WS 正常时 price_change 秒级到达，age 远小于此值；断线 REST 兜底 2s 一次也不会超。
+STALE_AGE_SEC = 3.0
+
+# 轻量事件也用到的价格字段（best_bid_ask / last_trade_price 事件，格式容错）
+_LIGHT_PRICE_FIELDS = ("best_bid", "best_ask", "last_trade_price")
+
 
 def _apply_price_change(snap: dict, change: dict) -> None:
     """price_change 增量更新快照：side=BUY→bids，SELL→asks，size=0 删档。"""
@@ -48,25 +56,34 @@ class BookSampler(ReconnectingWsThread):
     def __init__(self, fetch_book: Callable[[str], dict] | None = None, interval: float = 2.0,
                  ws_url: str = WS_URL,
                  proxy: str | None = None, book_path: str | None = None,
-                 book_flush_sec: float = 1.0):
+                 book_flush_sec: float = 1.0, health_check_sec: float = 2.0):
         """fetch_book(token_id) -> book dict：WS 断线时的 REST 兜底（可为 None）。
 
         book_path: 落盘文件（data/book.json），供监控面板 1s 级实时盘口。
+        health_check_sec: 健康检查间隔（秒）——WS 连接中快照缺失/陈旧的 token
+        主动 REST 刷新（堵'连接活着但事件流停摆/订阅失效'盲区）。
         """
         super().__init__(name="book-sampler", proxy=proxy)
         self.ws_url = ws_url
         self._fetch = fetch_book
         self._interval = interval
-        # 断线等待期间 REST 兜底的轮询间隔（interval 参数真正生效；上限 2 秒防过频）
-        self.disconnect_poll_sec = min(interval, 2.0)
+        # 断线等待期间 REST 兜底的轮询间隔（interval 参数真正生效；上限 1 秒防过频）。
+        # 实证：本环境代理隧道对 WS 高流量下行在 ~3-5s 内必断（见诊断），WS 可用率低，
+        # REST 兜底是决策价的时效主力，1s 一轮把最坏年龄压在 ~1.5s。
+        self.disconnect_poll_sec = min(interval, 1.0)
         self.ws_url = ws_url
         self._proxy = proxy
         self._tokens: set[str] = set()
         self._snapshots: dict[str, dict] = {}
+        # 每个 token 快照的最后更新时间（monotonic 秒；与 _snapshots 同锁保护）——
+        # 消费方据此判定陈旧，不再无条件信任不知来源年龄的快照
+        self._snapshot_ts: dict[str, float] = {}
         self._direction_map: dict[str, str] = {}  # token_id -> up/down
+        self._light_prices: dict[str, dict] = {}  # token_id -> 轻量事件价（D：best_bid_ask/last_trade_price）
         self._last_subscribed: set[str] = set()  # 已发送给服务端的订阅集合（WS 线程读写）
         self._book_path = Path(book_path) if book_path else None
         self._book_flush_sec = book_flush_sec
+        self._health_check_sec = health_check_sec
         self._lock = threading.Lock()
 
     # ---- 主循环接口（线程安全） ----
@@ -94,6 +111,33 @@ class BookSampler(ReconnectingWsThread):
         with self._lock:
             snap = self._snapshots.get(token_id)
             return dict(snap) if snap else None
+
+    def snapshot_age(self, token_id: str) -> float | None:
+        """快照年龄（秒，monotonic）。None=无快照；手动注入/旧数据无时间戳视为 0（新鲜）。"""
+        with self._lock:
+            if token_id not in self._snapshots:
+                return None
+            ts = self._snapshot_ts.get(token_id)
+            return 0.0 if ts is None else time.monotonic() - ts
+
+    def update_snapshot(self, token_id: str, book: dict) -> None:
+        """消费方 REST 现拉结果回填（线程安全）：更新快照并刷新时间戳。
+
+        回填即节流——下个 tick 读到的快照年龄 < STALE_AGE_SEC，不再重复 REST。
+        """
+        with self._lock:
+            self._snapshots[token_id] = book
+            self._snapshot_ts[token_id] = time.monotonic()
+
+    def light_price(self, token_id: str) -> dict | None:
+        """轻量事件价（best_bid_ask / last_trade_price 事件，格式容错）。
+
+        仅作事件流心跳与展示参考，不参与交易决策价（决策价始终用
+        完整深度加权价，保持免疫垃圾挂单语义）。
+        """
+        with self._lock:
+            p = self._light_prices.get(token_id)
+            return dict(p) if p else None
 
     def _push_update(self) -> None:
         """订阅集合变化且 WS 连接中：推送官方 update 消息动态增删，避免等重连。"""
@@ -147,10 +191,49 @@ class BookSampler(ReconnectingWsThread):
             return
         threading.Thread(target=self._flush_loop, daemon=True, name="book-flush").start()
 
+    # ---- 健康检查（B：堵"连接活着但事件流停摆/订阅失效"盲区） ----
+
+    def _is_stale_locked(self, token_id: str) -> bool:
+        """快照缺失或年龄超过 STALE_AGE_SEC 判定为陈旧（调用方需持锁）。"""
+        if token_id not in self._snapshots:
+            return True
+        ts = self._snapshot_ts.get(token_id)
+        if ts is None:
+            return False  # 手动注入/旧数据：视为新鲜，不主动拉
+        return time.monotonic() - ts > STALE_AGE_SEC
+
+    def _health_check(self) -> None:
+        """WS 连接中：对快照缺失/陈旧的订阅 token 主动 REST 刷新。
+
+        断线期间跳过（_while_disconnected 已有 2s REST 兜底，避免重复查询）；
+        健康检查覆盖的是 WS 显示连接但事件流不推/动态订阅失败的场景。
+        """
+        if self._connected_ws is None:
+            return
+        if self._fetch is None:
+            return
+        with self._lock:
+            tokens = list(self._tokens)
+            stale = [t for t in tokens if self._is_stale_locked(t)]
+        if not stale:
+            return
+        self._rest_fallback(tokens=stale)
+
+    def _health_loop(self) -> None:
+        while not self._stop.wait(self._health_check_sec):
+            try:
+                self._health_check()
+            except Exception:
+                logger.exception("盘口健康检查异常")
+
+    def _start_health(self) -> None:
+        threading.Thread(target=self._health_loop, daemon=True, name="book-health").start()
+
     # ---- WS 客户端 ----
 
     def run(self) -> None:
         self._start_flush()
+        self._start_health()
         super().run()
 
     def _on_disconnect(self) -> None:
@@ -189,7 +272,10 @@ class BookSampler(ReconnectingWsThread):
             self._apply_book_event(data)
         elif etype == "price_change":
             self._apply_price_changes(data.get("price_changes") or [])
-        # last_trade_price / best_bid_ask 等事件不影响盘口快照，忽略
+        elif etype in ("last_trade_price", "best_bid_ask"):
+            # 轻量事件（D）：不重建整本快照，只做事件流心跳（刷新快照新鲜度）
+            # + 记录轻量价。字段名服务端格式容错，解析失败只损失心跳。
+            self._apply_light_event(data)
 
     def _apply_book_event(self, item: dict) -> None:
         asset_id = item.get("asset_id")
@@ -201,6 +287,7 @@ class BookSampler(ReconnectingWsThread):
         }
         with self._lock:
             self._snapshots[asset_id] = snap
+            self._snapshot_ts[asset_id] = time.monotonic()
 
     def _apply_price_changes(self, changes: list) -> None:
         with self._lock:
@@ -212,13 +299,43 @@ class BookSampler(ReconnectingWsThread):
                 if snap is None:
                     continue
                 _apply_price_change(snap, c)
+                self._snapshot_ts[asset_id] = time.monotonic()
 
-    def _rest_fallback(self) -> None:
-        """WS 断开/重连等待期间：用 REST 并行刷新订阅中的快照（失败保留旧快照）。"""
+    def _apply_light_event(self, data: dict) -> None:
+        """轻量行情事件（best_bid_ask / last_trade_price）：心跳 + 轻量价存储（格式容错）。"""
+        asset_id = data.get("asset_id") or data.get("asset")
+        if not asset_id:
+            return
+        self._touch(asset_id)
+        prices = {}
+        for f in _LIGHT_PRICE_FIELDS:
+            v = data.get(f)
+            if v is None:
+                continue
+            try:
+                prices[f] = float(v)
+            except (TypeError, ValueError):
+                pass
+        if prices:
+            with self._lock:
+                self._light_prices[asset_id] = {"ts": time.time(), **prices}
+
+    def _touch(self, asset_id: str) -> None:
+        """刷新 token 的新鲜度时间戳（轻量事件证明事件流仍活着）。"""
+        with self._lock:
+            self._snapshot_ts[asset_id] = time.monotonic()
+
+    def _rest_fallback(self, tokens: list | None = None) -> None:
+        """REST 并行刷新快照（失败保留旧快照）。
+
+        断线/重连等待期间刷新全部订阅（tokens=None）；健康检查只刷陈旧的。
+        写回同时更新新鲜度时间戳——REST 结果同样被消费方信任（时效内）。
+        """
         if self._fetch is None:
             return
-        with self._lock:
-            tokens = list(self._tokens)
+        if tokens is None:
+            with self._lock:
+                tokens = list(self._tokens)
         if not tokens:
             return
         from concurrent.futures import ThreadPoolExecutor
@@ -235,3 +352,4 @@ class BookSampler(ReconnectingWsThread):
                 if book:
                     with self._lock:
                         self._snapshots[tok] = book
+                        self._snapshot_ts[tok] = time.monotonic()

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 from pmbot.book_price import weighted_price
+from pmbot.book_sampler import STALE_AGE_SEC
 from pmbot.executor_protocols import (
     CLOB_HOST,
     Fill,
@@ -55,6 +56,43 @@ class ClobExecutor:
 
     def _sampler_snapshot(self, token_id: str) -> dict | None:
         return self._sampler.snapshot(token_id) if self._sampler else None
+
+    def _sampler_age(self, token_id: str) -> float | None:
+        """采样器快照年龄（秒）；无采样器/不支持时返回 None。"""
+        if self._sampler is None:
+            return None
+        fn = getattr(self._sampler, "snapshot_age", None)
+        return fn(token_id) if fn else None
+
+    def _sampler_update(self, token_id: str, book: dict) -> None:
+        """REST 现拉结果回填采样器（防下个 tick 重复查询；采样器不支持时静默）。"""
+        if self._sampler is None:
+            return
+        fn = getattr(self._sampler, "update_snapshot", None)
+        if fn:
+            try:
+                fn(token_id, book)
+            except Exception:
+                pass
+
+    def _best_price(self, token_id: str, side: str, size: float) -> float | None:
+        """可执行价（单一实现，best_ask/best_bid 共用）：新鲜快照 → 加权价。
+
+        快照缺失或年龄 > STALE_AGE_SEC（陈旧）→ REST 现拉并回填（下个 tick 不再重复）；
+        REST 失败 → None（宁缺毋滥，不报误导价，下 tick 重试）。
+        决策价永远基于时效内（≤3s）的盘口，不再无条件信任不知年龄的快照。
+        """
+        book = self._sampler_snapshot(token_id)
+        age = self._sampler_age(token_id)
+        stale = age is None or age > STALE_AGE_SEC
+        if book is not None and not stale:
+            return weighted_price(book, side, size=size)
+        try:
+            book = self.fetch_book(token_id)
+        except Exception:
+            return None
+        self._sampler_update(token_id, book)
+        return weighted_price(book, side, size=size)
 
     @property
     def sampler(self) -> SamplerProto | None:
@@ -373,8 +411,8 @@ class ClobExecutor:
             return None
         fill = self._parse_fill(resp, side="sell")  # 卖单 making/taking 方向与买单相反
         if fill.avg_price is None:
-            # 价格回退在成交语义内（调用方不再各自 best_bid）
-            fill = Fill(order_id=fill.order_id, avg_price=self.best_bid(token_id) or 0.0)
+            # 价格回退在成交语义内（调用方不再各自 best_bid）；按持仓量级定价
+            fill = Fill(order_id=fill.order_id, avg_price=self.best_bid(token_id, size=size) or 0.0)
         return fill
 
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None:
@@ -431,31 +469,21 @@ class ClobExecutor:
             return False
         return bool(resp)
 
-    def best_bid(self, token_id: str) -> float | None:
-        """持仓卖出可执行价（按 5 股可成交量加权，免疫垃圾挂单）。
+    def best_bid(self, token_id: str, size: float = 5.0) -> float | None:
+        """持仓卖出可执行价（按 size 股可成交量加权，免疫垃圾挂单）。
 
-        优先读 BookSampler 内存快照（高频采样），无快照时回退 REST 查询。
+        优先读 BookSampler 内存快照（高频采样），快照陈旧/缺失时 REST 现拉并回填；
+        size 默认 5 股保守口径，平仓路径按持仓股数传入（决策价贴近实际可卖量）。
         """
-        book = self._sampler_snapshot(token_id)
-        if book is None:
-            try:
-                book = self.fetch_book(token_id)
-            except Exception:
-                return None
-        return weighted_price(book, "bids", size=5)
+        return self._best_price(token_id, "bids", size)
 
-    def best_ask(self, token_id: str) -> float | None:
-        """买入可执行价（按 5 股可成交量加权，免疫垃圾挂单）。
+    def best_ask(self, token_id: str, size: float = 5.0) -> float | None:
+        """买入可执行价（按 size 股可成交量加权，免疫垃圾挂单）。
 
-        优先读 BookSampler 内存快照（高频采样），无快照时回退 REST 查询。
+        优先读 BookSampler 内存快照（高频采样），快照陈旧/缺失时 REST 现拉并回填；
+        size 默认 5 股保守口径，开仓小单路径传 1.0 用最优档近似。
         """
-        book = self._sampler_snapshot(token_id)
-        if book is None:
-            try:
-                book = self.fetch_book(token_id)
-            except Exception:
-                return None
-        return weighted_price(book, "asks", size=5)
+        return self._best_price(token_id, "asks", size)
 
 
 class SimExecutor:
@@ -495,11 +523,11 @@ class SimExecutor:
     def api_auth(self) -> dict | None:
         return self._live.api_auth()
 
-    def best_ask(self, token_id: str) -> float | None:
-        return self._live.best_ask(token_id)
+    def best_ask(self, token_id: str, size: float = 5.0) -> float | None:
+        return self._live.best_ask(token_id, size=size)
 
-    def best_bid(self, token_id: str) -> float | None:
-        return self._live.best_bid(token_id)
+    def best_bid(self, token_id: str, size: float = 5.0) -> float | None:
+        return self._live.best_bid(token_id, size=size)
 
     # ---- 模拟下单 ----
 
@@ -525,15 +553,18 @@ class SimExecutor:
         return self.place_limit(token_id, "sell", price, size)
 
     def market_buy(self, token_id: str, amount: float) -> Fill | None:
-        """模拟市价买入：按 best_ask 估算成交（结构与实盘一致：缺报价放弃建仓）。"""
-        ask = self.best_ask(token_id)
+        """模拟市价买入：按最优档估算成交（结构与实盘一致：缺报价放弃建仓）。
+
+        小单（1 USDC ≈ 1-3 股）用 size=1.0（≈最优档价）估算，贴近实盘实际成交。
+        """
+        ask = self.best_ask(token_id, size=1.0)
         if ask is None:
             return None  # 无报价：不建仓（与实盘"缺成交数据放弃建仓"同语义）
         return Fill(order_id=f"sim-{token_id[:8]}", avg_price=ask, filled_size=amount / ask)
 
     def market_sell(self, token_id: str, size: float) -> Fill | None:
         print(f"[dry-run] 市价卖 {size:.4f} 股 token={token_id[:16]}...")
-        return Fill(order_id=None, avg_price=self.best_bid(token_id))
+        return Fill(order_id=None, avg_price=self.best_bid(token_id, size=size))
 
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None:
         return None  # 模拟无真实订单
