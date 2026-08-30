@@ -14,11 +14,11 @@ import os
 from pathlib import Path
 
 from pmbot.book_price import weighted_price
-from pmbot.book_sampler import STALE_AGE_SEC
 from pmbot.executor_protocols import (
     CLOB_HOST,
     Fill,
     SamplerProto,
+    shares_for_amount,
     validate_limit_order,
 )
 
@@ -57,13 +57,6 @@ class ClobExecutor:
     def _sampler_snapshot(self, token_id: str) -> dict | None:
         return self._sampler.snapshot(token_id) if self._sampler else None
 
-    def _sampler_age(self, token_id: str) -> float | None:
-        """采样器快照年龄（秒）；无采样器/不支持时返回 None。"""
-        if self._sampler is None:
-            return None
-        fn = getattr(self._sampler, "snapshot_age", None)
-        return fn(token_id) if fn else None
-
     def _sampler_update(self, token_id: str, book: dict) -> None:
         """REST 现拉结果回填采样器（防下个 tick 重复查询；采样器不支持时静默）。"""
         if self._sampler is None:
@@ -78,14 +71,14 @@ class ClobExecutor:
     def _best_price(self, token_id: str, side: str, size: float) -> float | None:
         """可执行价（单一实现，best_ask/best_bid 共用）：新鲜快照 → 加权价。
 
-        快照缺失或年龄 > STALE_AGE_SEC（陈旧）→ REST 现拉并回填（下个 tick 不再重复）；
-        REST 失败 → None（宁缺毋滥，不报误导价，下 tick 重试）。
-        决策价永远基于时效内（≤3s）的盘口，不再无条件信任不知年龄的快照。
+        快照缺失/陈旧（新鲜度判定单一事实源：BookSampler.is_fresh 与健康检查共用）
+        → REST 现拉并回填（下个 tick 不再重复）；REST 失败 → None
+        （宁缺毋滥，不报误导价，下 tick 重试）。
+        决策价永远基于时效内盘口，不再无条件信任不知年龄的快照。
         """
         book = self._sampler_snapshot(token_id)
-        age = self._sampler_age(token_id)
-        stale = age is None or age > STALE_AGE_SEC
-        if book is not None and not stale:
+        fresh = self._sampler is not None and self._sampler.is_fresh(token_id)
+        if book is not None and fresh:
             return weighted_price(book, side, size=size)
         try:
             book = self.fetch_book(token_id)
@@ -560,11 +553,13 @@ class SimExecutor:
         ask = self.best_ask(token_id, size=1.0)
         if ask is None:
             return None  # 无报价：不建仓（与实盘"缺成交数据放弃建仓"同语义）
-        return Fill(order_id=f"sim-{token_id[:8]}", avg_price=ask, filled_size=amount / ask)
+        return Fill(order_id=f"sim-{token_id[:8]}", avg_price=ask,
+                    filled_size=shares_for_amount(amount, ask))
 
     def market_sell(self, token_id: str, size: float) -> Fill | None:
         print(f"[dry-run] 市价卖 {size:.4f} 股 token={token_id[:16]}...")
-        return Fill(order_id=None, avg_price=self.best_bid(token_id, size=size))
+        # 卖价取不到时回退 0.0（与实盘 market_sell 的 or 0.0 兜底一致，防成交语义分歧）
+        return Fill(order_id=None, avg_price=self.best_bid(token_id, size=size) or 0.0)
 
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None:
         return None  # 模拟无真实订单

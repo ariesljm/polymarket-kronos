@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from pmbot.executor_protocols import MarketBook, TradeExecutor
+from pmbot.executor_protocols import MarketBook, TradeExecutor, shares_for_amount
 from pmbot.market_discovery import MarketInfo
 from pmbot.state import StateStore, TradeState
 from pmbot.types import (
@@ -116,7 +116,7 @@ class ExecutionDispatcher:
         if ask is None:
             logger.warning("市价买入跳过：盘口无报价 %s", token[:16])
             return
-        target_size = action.amount / ask
+        target_size = shares_for_amount(action.amount, ask)
         filled = self.trade.market_buy(token, action.amount)
         if filled is None:
             logger.warning("市价买入失败/无成交数据：%s，下 tick 重试", token[:16])

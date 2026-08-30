@@ -19,6 +19,15 @@ BREAKER_MESSAGES = {
 }
 
 
+def live_delta_pct(price: float, baseline: float) -> float:
+    """窗口起点至今 Binance 实时移动百分比（单位锁定：0.5 = +0.5%）。
+
+    与 signal_contradicted 的 skip_pct 单位一致（单一书写点，曾散落
+    main_loop._live_delta_pct 的注释与 engine 对比处隐式约定）。
+    """
+    return (price - baseline) / baseline * 100.0
+
+
 def signal_contradicted(direction: Direction, live_delta_pct: float | None, skip_pct: float) -> bool:
     """方向一致性过滤（单一事实源）：信号方向与 Binance 实时移动大幅矛盾。
 

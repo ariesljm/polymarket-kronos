@@ -511,3 +511,14 @@ def test_decide_pause_uses_same_breaker():
                     make_signal("up", 0.95))
     assert action.type is ActionType.PAUSE
     assert action.reason == "consecutive_losses"
+
+
+def test_live_delta_pct_unit_locked():
+    """实时移动百分比单位锁定（0.5 = +0.5%），与 signal_contradicted 的 skip_pct 同单位。"""
+    from pmbot.engine import live_delta_pct
+
+    assert live_delta_pct(101.0, 100.0) == 1.0
+    assert live_delta_pct(99.5, 100.0) == -0.5
+    assert live_delta_pct(100.0, 100.0) == 0.0
+    # 与矛盾过滤联动：delta=-0.2（单位%）对应 skip_pct=0.1 触发
+    assert signal_contradicted(Direction.UP, live_delta_pct(99.8, 100.0), 0.1) is True

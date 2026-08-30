@@ -212,8 +212,12 @@ class FakeSampler:
     def snapshot(self, token):
         return dict(self._snaps[token]) if token in self._snaps else None
 
-    def snapshot_age(self, token):
-        return self._ages.get(token)
+    def is_fresh(self, token):
+        """陈旧判定单一事实源（与 BookSampler.is_fresh 同语义）。"""
+        from pmbot.book_sampler import STALE_AGE_SEC
+
+        age = self._ages.get(token)
+        return age is not None and age <= STALE_AGE_SEC
 
     def update_snapshot(self, token, book):
         self._snaps[token] = book
@@ -313,3 +317,24 @@ def test_market_sell_fallback_uses_position_size(monkeypatch):
     fill = ex.market_sell("111", 2.0)
     assert fill is not None and fill.avg_price == pytest.approx(0.40)
     assert seen["size"] == 2.0  # 卖单股数透传给 best_bid
+
+
+def test_shares_for_amount_shared_formula():
+    """份额换算单一公式（目标份额与模拟成交 filled_size 共用）。"""
+    from pmbot.executor_protocols import shares_for_amount
+
+    assert shares_for_amount(1.0, 0.5) == 2.0
+    assert shares_for_amount(1.0, 0.2) == 5.0
+    assert shares_for_amount(0.5, 0.4) == 1.25
+
+
+def test_sim_sell_price_fallback_matches_live():
+    """模拟卖出价回退 0.0（与实盘 market_sell 的 or 0.0 兜底一致，防成交语义分歧）。
+
+    回归：模拟侧曾返回 avg_price=None 的 Fill，与实盘“取不到价回退 0.0”不一致。"""
+    from pmbot.clob_executor import SimExecutor
+
+    ex = SimExecutor()
+    ex._live = type("L", (), {"best_bid": lambda self, t, size=5.0: None})()
+    fill = ex.market_sell("tok", 2.0)
+    assert fill.avg_price == 0.0

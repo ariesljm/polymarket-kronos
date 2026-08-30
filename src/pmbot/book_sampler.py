@@ -121,6 +121,15 @@ class BookSampler(ReconnectingWsThread):
             ts = self._snapshot_ts.get(token_id)
             return 0.0 if ts is None else time.monotonic() - ts
 
+    def is_fresh(self, token_id: str) -> bool:
+        """快照是否新鲜（陈旧判定单一事实源，消费方不再各自实现）。
+
+        无快照 → 陈旧；手动注入/旧数据（无时间戳）→ 新鲜；年龄 ≤ STALE_AGE_SEC → 新鲜。
+        BookSampler 健康检查与 ClobExecutor 决策价共用同一判定。
+        """
+        with self._lock:
+            return not self._is_stale_locked(token_id)
+
     def update_snapshot(self, token_id: str, book: dict) -> None:
         """消费方 REST 现拉结果回填（线程安全）：更新快照并刷新时间戳。
 

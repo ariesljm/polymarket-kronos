@@ -24,6 +24,7 @@ import logging
 from enum import Enum
 from typing import Callable, Protocol
 
+from pmbot.constants import window_ended_at
 from pmbot.types import Direction, Position
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,7 @@ class Settler:
 
     def should_run(self, now_sec: int, position: Position | None) -> bool:
         """持仓窗口是否已结束（需要进入结算流程）。"""
-        return position is not None and now_sec >= position.window_start + self.step_sec
+        return position is not None and window_ended_at(position.window_start, now_sec, self.step_sec)
 
     def settle(self, now_sec: int, position: Position) -> None:
         """推进结算状态机（引擎每 tick 调用一次；无持仓时不应调用）。"""

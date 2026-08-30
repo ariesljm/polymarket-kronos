@@ -21,6 +21,8 @@ from pmbot.types import (
     window_start_from_slug,
 )
 
+from pmbot.constants import window_ended_at
+
 logger = logging.getLogger(__name__)
 
 # 钱包余额刷新间隔（秒）：余额变化慢，低频查询避免无谓 RPC
@@ -154,7 +156,7 @@ class WalletReconciler:
         if state.position is not None and not mine:
             # 本地有持仓、Polymarket 无本标的持仓 → 疑似幽灵持仓（已平仓/已结算但本地未清除）
             pos = state.position
-            if now_sec >= pos.window_start + self._step_sec:
+            if window_ended_at(pos.window_start, now_sec, self._step_sec):
                 # 窗口已结束的残留仓：不按幽灵清除（会直接丢弃跟踪、丢失结算记账），
                 # 交给窗口切换的 defer_to_settle → Settler 后台结算（记账/超时丢弃）。
                 # 回归：reconcile 抢在 defer 之前幽灵清除 → settle_pending 机制失效
@@ -205,7 +207,7 @@ class WalletReconciler:
         ws = window_start_from_slug(p.get("slug"))
         if ws is None:
             return False  # slug 无窗口起点（非 bot 市场格式）：保守不判死仓
-        return ws + self._step_sec <= now_sec and float(p.get("currentValue") or 0) <= 0
+        return window_ended_at(ws, now_sec, self._step_sec) and float(p.get("currentValue") or 0) <= 0
 
     def _adopt_untracked(self, mine: list[dict], state, now_sec: int) -> bool:
         """从未跟踪持仓重建本地 position（接管）。
@@ -228,7 +230,7 @@ class WalletReconciler:
             window_start = window_start_from_slug(p.get("slug"))
             if window_start is None:
                 continue  # slug 无窗口起点：非 bot 市场格式，不接管
-            if window_start + self._step_sec <= now_sec:
+            if window_ended_at(window_start, now_sec, self._step_sec):
                 continue  # 窗口已结束：结算中/待兑付，交给 settle 记账（占用活跃槽会卡新窗口）
             size = float(p.get("size") or 0)
             entry = float(p.get("avgPrice") or 0)

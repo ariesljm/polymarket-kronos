@@ -201,3 +201,20 @@ def test_default_timeout_scales_with_step():
     assert Settler.default_timeout_sec(300) == 600
     assert Settler.default_timeout_sec(900) == 1800
     assert Settler.default_timeout_sec(60) == 300  # 下限
+
+
+def test_window_ended_at_single_source():
+    """窗口结束判定单一事实源（main_loop/_settle_expired、settler.should_run、
+    wallet 幽灵判定共用同一公式；步长边界在 now == window_end 即视为已结束）。"""
+    from pmbot.constants import window_ended_at
+
+    step = 300  # 5m
+    assert window_ended_at(1_000_000, 1_000_299, step) is False
+    assert window_ended_at(1_000_000, 1_000_300, step) is True   # 恰在窗口终点
+    assert window_ended_at(1_000_000, 1_000_400, step) is True
+    # 与 Settler.should_run 同源：持仓窗口结束 → 进入结算流程
+    s = Settler.__new__(Settler)
+    s.step_sec = step
+    pos = Position(Direction.UP, 0.5, 2.0, entered_remaining_sec=300, window_start=1_000_000)
+    assert window_ended_at(pos.window_start, 1_000_299, s.step_sec) is False
+    assert window_ended_at(pos.window_start, 1_000_300, s.step_sec) is True

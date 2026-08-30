@@ -23,13 +23,14 @@ MIN_ORDER_AMOUNT = 1.0
 class SamplerProto(Protocol):
     """盘口采样器窄接口：取内存快照与新鲜度（BookSampler 隐式实现，可注入 None）。
 
-    snapshot_age: 快照年龄秒（None=无快照）——消费方据此判定陈旧，不无条件信快照；
+    is_fresh: 快照是否新鲜（陈旧判定单一事实源，消费方不自行实现）——决策价读
+    快照前必须先问新鲜度，不无条件信快照；
     update_snapshot: 消费方 REST 现拉结果回填（防重复 REST）；
     light_price: 轻量事件价（best_bid_ask/last_trade_price，仅心跳与展示）。
     """
 
     def snapshot(self, token_id: str) -> dict | None: ...
-    def snapshot_age(self, token_id: str) -> float | None: ...
+    def is_fresh(self, token_id: str) -> bool: ...
     def update_snapshot(self, token_id: str, book: dict) -> None: ...
     def light_price(self, token_id: str) -> dict | None: ...
 
@@ -106,3 +107,9 @@ def min_shares_for_price(price: float) -> float:
     import math
 
     return max(MIN_ORDER_SIZE, math.ceil(MIN_ORDER_AMOUNT / price))
+
+
+def shares_for_amount(amount: float, price: float) -> float:
+    """按美元金额换算份额（amount / price；execution_dispatcher 目标份额与
+    模拟成交 filled_size 共用——曾两处各自手抄同一公式）。"""
+    return amount / price

@@ -485,3 +485,13 @@ def test_rest_fallback_updates_timestamp():
     s._rest_fallback()
     assert float(s.snapshot("tok-a")["asks"][0]["price"]) == 0.51
     assert s.snapshot_age("tok-a") < 3.0
+
+
+def test_is_fresh_single_source():
+    """陈旧判定单一事实源：无快照陈旧、手动注入新鲜、超 STALE_AGE_SEC 陈旧。"""
+    s = BookSampler(fetch_book=None)
+    assert s.is_fresh("tok-a") is False  # 无快照 → 陈旧
+    s.update_snapshot("tok-a", {"bids": [], "asks": []})
+    assert s.is_fresh("tok-a") is True   # 刚注入 → 新鲜
+    s._snapshot_ts["tok-a"] = time.monotonic() - 30.0
+    assert s.is_fresh("tok-a") is False  # 超龄 → 陈旧

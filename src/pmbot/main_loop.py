@@ -13,9 +13,9 @@ from pathlib import Path
 
 from pmbot.executor_protocols import MarketBook, OrderPlacer, TradeExecutor, WalletView
 from pmbot.config import Config
-from pmbot.constants import window_end_sec, window_start_sec
+from pmbot.constants import window_end_sec, window_start_sec, window_ended_at
 from pmbot.control import read_control
-from pmbot.engine import decide, circuit_breaker
+from pmbot.engine import circuit_breaker, decide, live_delta_pct
 from pmbot.execution_dispatcher import ExecutionDispatcher
 from pmbot.market_discovery import MarketDiscovery, MarketInfo
 from pmbot.market_lifecycle import MarketLifecycle, Phase
@@ -343,7 +343,7 @@ class TradingLoop:
             return
 
         st = self.state
-        expired = now_sec >= (st.position.window_start + self.step_sec) if st.position else False
+        expired = window_ended_at(st.position.window_start, now_sec, self.step_sec) if st.position else False
         if expired:
             st.defer_to_settle()
             sp = st.settle_pending
@@ -430,7 +430,7 @@ class TradingLoop:
         price = self._ticker.latest_price()
         if price is None or st.signal.baseline_close <= 0:
             return None
-        return (price - st.signal.baseline_close) / st.signal.baseline_close * 100.0
+        return live_delta_pct(price, st.signal.baseline_close)
 
     def state_view(self) -> StateView:
         st = self.state
