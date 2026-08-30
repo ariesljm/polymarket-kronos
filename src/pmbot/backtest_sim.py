@@ -22,6 +22,7 @@ import requests
 from pmbot.backtest import fetch_klines
 from pmbot.exit_rules import position_exit_levels
 from pmbot.constants import window_start_sec
+from pmbot.executor_protocols import MIN_ORDER_SIZE as PM_MIN_ORDER_SIZE
 from pmbot.predictor import KronosPredictorClient
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
@@ -29,11 +30,13 @@ DATA_API = "https://data-api.polymarket.com/trades"
 # 代理优先环境变量（与 run.py 一致），无则回退本机默认代理
 PROXIES = {"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")}
 
-LIMIT_PRICE = 0.5      # 限价模式挂单价
-TP_PCT = 0.30          # 百分比止盈（相对入场价）
-SL_PCT = 0.20          # 百分比止损
+LIMIT_PRICE = 0.5      # 限价模式挂单价（回测专用研究路径；实盘市价单不用它）
+# 止盈/止损默认与实盘 config.DEFAULTS 同源（曾各自硬编码 0.30/0.20，回测与实盘漂移）
+from pmbot.config import DEFAULTS as _CFG_DEFAULTS
+
+TP_PCT = _CFG_DEFAULTS["take_profit"]
+SL_PCT = _CFG_DEFAULTS["stop_loss"]
 TAKER_FEE_RATE = 0.07  # crypto taker 费率（官方公式参数）
-MIN_ORDER_SIZE = 5     # 限价单最小股数（/book min_order_size）
 
 
 def fetch_window(cid: str, tokens: list[str], win_start: int, win_end: int) -> list[tuple[int, float]]:
@@ -125,8 +128,9 @@ def trade_params(args: argparse.Namespace) -> tuple[float, float, float, float]:
         except Exception:
             tp = tp if tp is not None else TP_PCT
             sl = sl if sl is not None else SL_PCT
-            pub = pub if pub is not None else 0.55
-            pdb = pdb if pdb is not None else 0.50
+            # config 加载失败兜底：与实盘默认同源（曾硬编码 0.55/0.50 → engine 规则第三份）
+            pub = pub if pub is not None else _CFG_DEFAULTS["p_up_buy"]
+            pdb = pdb if pdb is not None else (1 - _CFG_DEFAULTS["p_up_buy"])
     return tp, sl, pub, pdb
 
 
@@ -172,7 +176,7 @@ def run(args: argparse.Namespace) -> int:
         for i, (_, price) in enumerate(path):
             if price <= LIMIT_PRICE:
                 entry_l = price
-                size_l = max(MIN_ORDER_SIZE, int(1 / entry_l) + 1)
+                size_l = max(PM_MIN_ORDER_SIZE, int(1 / entry_l) + 1)
                 tr_l = simulate_path(path[i + 1:], entry_l, size_l, is_taker=True,
                                      tp_pct=tp_pct, sl_pct=sl_pct)
                 break
