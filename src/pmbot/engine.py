@@ -19,6 +19,26 @@ BREAKER_MESSAGES = {
 }
 
 
+def signal_contradicted(direction: Direction, live_delta_pct: float | None, skip_pct: float) -> bool:
+    """方向一致性过滤（单一事实源）：信号方向与 Binance 实时移动大幅矛盾。
+
+    live_delta_pct: 窗口起点至今 Binance 实时移动百分比（如 0.5 = +0.5%）；
+    None（无实时价/信号缺基线）→ False 不过滤（宁缺毋滥，不因数据缺失误杀）。
+    skip_pct: 矛盾阈值百分比（0 = 关闭）。
+
+    依据：Polymarket Up/Down 结算 = 窗口终点价 vs 窗口起点价；live_delta 是
+    结算目标的**部分实现信息**。但 5m 窗口内价格会往返，只能大幅矛盾时跳过，
+    不能线性否决模型（阈值回测标定，默认关）。
+    """
+    if skip_pct <= 0 or live_delta_pct is None:
+        return False
+    if direction is Direction.UP and live_delta_pct <= -skip_pct:
+        return True
+    if direction is Direction.DOWN and live_delta_pct >= skip_pct:
+        return True
+    return False
+
+
 def circuit_breaker(state: StateView, config: EngineConfig) -> tuple[str, str] | None:
     """熔断判定纯函数（单一事实源）：触发返回 (reason_key, 文案)，否则 None。
 
@@ -62,7 +82,8 @@ def decide(config: EngineConfig, state: StateView, market: MarketView, signal: S
         # 每窗口每标的最多一注
         return Action(ActionType.SKIP)
 
-    return _maybe_enter(config, signal, market.best_ask, market.remaining_sec, market.elapsed_sec)
+    return _maybe_enter(config, signal, market.best_ask, market.remaining_sec,
+                        market.elapsed_sec, market.live_delta_pct)
 
 
 def _manage_position(config: EngineConfig, position: Position, best_bid: float | None, remaining_sec: int) -> Action:
@@ -88,7 +109,8 @@ def _manage_position(config: EngineConfig, position: Position, best_bid: float |
 
 
 def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
-                 remaining_sec: int, elapsed_sec: int = 0) -> Action:
+                 remaining_sec: int, elapsed_sec: int = 0,
+                 live_delta_pct: float | None = None) -> Action:
     if signal.direction is Direction.SKIP:
         return Action(ActionType.SKIP)
     # 开仓延迟：市场开始后 N 秒内不开仓（观察早期波动，避免开盘瞬间噪声信号；0 = 关闭）
@@ -97,6 +119,14 @@ def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
     # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓）
     if remaining_sec <= config.no_entry_before_end_sec:
         return Action(ActionType.SKIP)
+    # 方向一致性过滤：信号方向与 Binance 实时移动大幅矛盾（如信号 UP 但实时已跌超阈值）
+    # → 跳过入场（模型窗口起点预测被实时走势证伪，市价追单大概率高位接盘）；默认关
+    if signal_contradicted(signal.direction, live_delta_pct, config.contradiction_skip_pct):
+        return Action(ActionType.SKIP, reason="contradiction")
+    # 入场价上限：盘口 ask 高于此价不入场（追高仓位历史净亏；0 = 关闭）。
+    # 无报价（None）不拦——执行层缺报价本就放弃建仓。
+    if config.max_entry_price > 0 and best_ask is not None and best_ask > config.max_entry_price:
+        return Action(ActionType.SKIP, reason="entry_price_cap")
     # 市价入场：预测后立即按 1 USDC 目标买入（份额=金额/盘口价，可小数，无 5 股限制）
     if signal.direction is Direction.UP and signal.p_up > config.p_up_buy:
         return Action(ActionType.PLACE_MARKET, direction=Direction.UP, amount=config.amount_per_trade)

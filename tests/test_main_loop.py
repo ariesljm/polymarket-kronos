@@ -143,7 +143,8 @@ def make_market(price=0.5):
 
 
 def make_loop(tmp_path, *, state=None, strategy=None, discovery=None, executor=None,
-              user_stream=None, config=None, dry_run=True, poll_sec=1):
+              user_stream=None, config=None, dry_run=True, poll_sec=1,
+              high_freq_poll_sec=2.0, ticker=None):
     st = state or TradeState(symbol="BTC", window_start=None)
     return TradingLoop(
         config=config or CFG,
@@ -157,6 +158,8 @@ def make_loop(tmp_path, *, state=None, strategy=None, discovery=None, executor=N
         dry_run=dry_run,
         user_stream=user_stream,
         poll_sec=poll_sec,
+        high_freq_poll_sec=high_freq_poll_sec,
+        ticker=ticker,
     )
 
 
@@ -166,6 +169,81 @@ def make_position(direction=Direction.UP, entry=0.45, size=2.0, window=999_900):
 
 def make_pending(direction=Direction.UP, price=0.45, order_id="oid-1"):
     return PendingOrder(direction=direction, price=price, size=5.0, order_id=order_id, created_sec=1_000_000)
+
+
+class FakeTicker:
+    """Binance 实时价线程替身（SpotTickerThread 窄接口：latest_price）。"""
+
+    def __init__(self, price=None):
+        self._price = price
+
+    def latest_price(self):
+        return self._price
+
+
+# ---- 动态轮询间隔（活跃持仓高频，止盈/止损及时触发） ----
+
+def test_dynamic_sleep_high_freq_with_position(tmp_path):
+    st = TradeState(symbol="BTC", window_start=999_900)
+    st.position = make_position()
+    loop = make_loop(tmp_path, state=st, poll_sec=10, high_freq_poll_sec=2)
+    assert loop._dynamic_sleep_sec() == 2.0
+
+
+def test_dynamic_sleep_normal_without_position(tmp_path):
+    loop = make_loop(tmp_path, poll_sec=10)
+    assert loop._dynamic_sleep_sec() == 10
+
+
+def test_dynamic_sleep_settle_pending_not_high_freq(tmp_path):
+    """结算等待（settle_pending）不交易不触发止盈止损 → 保持常规间隔。"""
+    st = TradeState(symbol="BTC", window_start=999_900)
+    st.position = make_position()
+    st.defer_to_settle()
+    assert st.settle_pending is not None and st.position is None
+    loop = make_loop(tmp_path, state=st, poll_sec=10, high_freq_poll_sec=2)
+    assert loop._dynamic_sleep_sec() == 10
+
+
+# ---- build_view 方向过滤数据（live_delta_pct） ----
+
+def test_build_view_computes_live_delta(tmp_path):
+    """有实时价 + 信号基线 → delta = (实时价 − 基线)/基线 × 100。"""
+    st = TradeState(symbol="BTC", window_start=999_900)
+    st.signal = Signal(Direction.UP, 0.70, baseline_close=100.0)
+    loop = make_loop(tmp_path, state=st, ticker=FakeTicker(price=101.0))
+    view = loop.build_view(make_market(), now_sec=1_000_000)
+    assert view.live_delta_pct == 1.0
+
+
+def test_build_view_live_delta_none_without_ticker(tmp_path):
+    st = TradeState(symbol="BTC", window_start=999_900)
+    st.signal = Signal(Direction.UP, 0.70, baseline_close=100.0)
+    loop = make_loop(tmp_path, state=st, ticker=None)
+    view = loop.build_view(make_market(), now_sec=1_000_000)
+    assert view.live_delta_pct is None
+
+
+def test_build_view_live_delta_none_without_price(tmp_path):
+    st = TradeState(symbol="BTC", window_start=999_900)
+    st.signal = Signal(Direction.UP, 0.70, baseline_close=100.0)
+    loop = make_loop(tmp_path, state=st, ticker=FakeTicker(price=None))
+    view = loop.build_view(make_market(), now_sec=1_000_000)
+    assert view.live_delta_pct is None
+
+
+def test_build_view_live_delta_none_without_baseline(tmp_path):
+    st = TradeState(symbol="BTC", window_start=999_900)
+    st.signal = Signal(Direction.UP, 0.70)  # 旧信号无基线
+    loop = make_loop(tmp_path, state=st, ticker=FakeTicker(price=101.0))
+    view = loop.build_view(make_market(), now_sec=1_000_000)
+    assert view.live_delta_pct is None
+
+
+def test_build_view_live_delta_none_without_signal(tmp_path):
+    loop = make_loop(tmp_path, ticker=FakeTicker(price=101.0))
+    view = loop.build_view(make_market(), now_sec=1_000_000)
+    assert view.live_delta_pct is None
 
 
 # ---- 入场 ----

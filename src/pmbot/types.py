@@ -25,10 +25,16 @@ class SignalContext(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class Signal:
-    """策略输出的信号。p_up 为预测上涨概率（[0,1]）。"""
+    """策略输出的信号。p_up 为预测上涨概率（[0,1]）。
+
+    baseline_close: 窗口起点 Binance 价（推理基线，最后闭合 K 线 close）——
+    决策引擎算「窗口开始至今实时移动」（live_delta_pct）用，缺失时不启用
+    方向一致性过滤（多样例默认 None 向后兼容）。
+    """
 
     direction: Direction
     p_up: float
+    baseline_close: float | None = None
 
     def __post_init__(self):
         # 兼容字符串形式（如 "up"），统一为枚举，避免裸串穿透类型判断
@@ -153,6 +159,7 @@ class MarketView:
     position: Position | None
     pending_order: PendingOrder | None
     elapsed_sec: int = 0  # 窗口已进行秒数（开仓延迟判断用，0 = 未知）
+    live_delta_pct: float | None = None  # 窗口起点至今 Binance 实时移动 %（None=无实时价，不过滤）
 
 def token_for(market, direction: Direction) -> str:
     """方向 → 市场 token（UP→yes，DOWN→no）。单一事实源（main_loop/lifecycle 共用）。"""

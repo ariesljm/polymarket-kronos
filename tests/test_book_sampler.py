@@ -415,7 +415,7 @@ def test_health_check_refreshes_stale_snapshot():
     assert calls["n"] == 1
     snap = s.snapshot("tok-a")
     assert float(snap["bids"][0]["price"]) == 0.59  # REST 新快照（0.60-0.01）
-    assert s.snapshot_age("tok-a") < 3.0  # 时间戳已刷新
+    assert s.snapshot_age("tok-a") < 1.0  # 时间戳已刷新
 
 
 def test_health_check_skips_fresh_snapshot():

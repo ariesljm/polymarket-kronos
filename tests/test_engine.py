@@ -65,6 +65,7 @@ def make_market(
     position=None,
     pending_order=None,
     elapsed_sec=800,
+    live_delta_pct=None,
 ):
     return MarketView(
         remaining_sec=remaining_sec,
@@ -73,6 +74,7 @@ def make_market(
         position=position,
         pending_order=pending_order,
         elapsed_sec=elapsed_sec,
+        live_delta_pct=live_delta_pct,
     )
 
 
@@ -106,6 +108,100 @@ def test_midband_skips():
 def test_skip_signal_skips():
     action = decide(CFG, make_state(), make_market(), make_signal("skip", 0.50))
     assert action.type is ActionType.SKIP
+
+
+# ---- 方向一致性过滤（Binance 实时移动 vs 信号方向） ----
+
+from pmbot.engine import signal_contradicted  # noqa: E402
+
+
+def test_contradiction_skips_up_when_live_down():
+    """信号 UP 但 Binance 实时已跌超阈值 → 跳过（模型预测被实时走势证伪）。"""
+    cfg = replace(CFG, contradiction_skip_pct=0.1)
+    market = make_market(live_delta_pct=-0.2)  # 窗口起点至今跌 0.2%
+    action = decide(cfg, make_state(), market, make_signal("up", 0.70))
+    assert action.type is ActionType.SKIP
+    assert action.reason == "contradiction"
+
+
+def test_contradiction_skips_down_when_live_up():
+    cfg = replace(CFG, contradiction_skip_pct=0.1)
+    market = make_market(live_delta_pct=0.2)
+    action = decide(cfg, make_state(), market, make_signal("down", 0.30))
+    assert action.type is ActionType.SKIP
+    assert action.reason == "contradiction"
+
+
+def test_contradiction_allows_when_aligned():
+    """信号 UP 且实时也在涨（方向一致）→ 正常入场（盘口滞后时反而便宜）。"""
+    cfg = replace(CFG, contradiction_skip_pct=0.1)
+    market = make_market(live_delta_pct=0.2)
+    action = decide(cfg, make_state(), market, make_signal("up", 0.70))
+    assert action.type is ActionType.PLACE_MARKET
+
+
+def test_contradiction_allows_below_threshold():
+    """矛盾未超阈值（-0.05 < 0.1）→ 放行：软过滤，不过度否决。"""
+    cfg = replace(CFG, contradiction_skip_pct=0.1)
+    market = make_market(live_delta_pct=-0.05)
+    action = decide(cfg, make_state(), market, make_signal("up", 0.70))
+    assert action.type is ActionType.PLACE_MARKET
+
+
+def test_contradiction_off_when_pct_zero():
+    """阈值 0（默认）→ 不过滤，即使实时移动巨大。"""
+    market = make_market(live_delta_pct=-5.0)
+    action = decide(CFG, make_state(), market, make_signal("up", 0.70))
+    assert action.type is ActionType.PLACE_MARKET
+
+
+def test_contradiction_allows_when_delta_unknown():
+    """无实时价（None）→ 不过滤（宁缺毋滥，不因数据缺失误杀）。"""
+    cfg = replace(CFG, contradiction_skip_pct=0.1)
+    action = decide(cfg, make_state(), make_market(), make_signal("up", 0.70))
+    assert action.type is ActionType.PLACE_MARKET
+
+
+def test_signal_contradicted_pure_bounds():
+    """纯函数边界：恰等于阈值即矛盾；略低于不放行；UP/DOWN 各方向独立。"""
+    assert signal_contradicted(Direction.UP, -0.10, 0.10) is True
+    assert signal_contradicted(Direction.UP, -0.09, 0.10) is False
+    assert signal_contradicted(Direction.DOWN, 0.10, 0.10) is True
+    assert signal_contradicted(Direction.DOWN, 0.09, 0.10) is False
+    assert signal_contradicted(Direction.UP, 0.5, 0.10) is False   # 同向不矛盾
+    assert signal_contradicted(Direction.DOWN, -0.5, 0.10) is False
+    assert signal_contradicted(Direction.UP, None, 0.10) is False  # 无实时价不过滤
+    assert signal_contradicted(Direction.UP, -5.0, 0.0) is False  # 关闭
+
+
+# ---- 入场价上限（追高不入场） ----
+
+def test_entry_price_cap_skips_high_ask():
+    """盘口 ask 高于上限 → 跳过（追高仓位历史净亏）；reason 可观测。"""
+    cfg = replace(CFG, max_entry_price=0.6)
+    action = decide(cfg, make_state(), make_market(best_ask=0.65), make_signal("up", 0.70))
+    assert action.type is ActionType.SKIP
+    assert action.reason == "entry_price_cap"
+
+
+def test_entry_price_cap_allows_at_or_below():
+    """ask 恰等于上限 → 放行（≤ 语义）。"""
+    cfg = replace(CFG, max_entry_price=0.6)
+    action = decide(cfg, make_state(), make_market(best_ask=0.60), make_signal("up", 0.70))
+    assert action.type is ActionType.PLACE_MARKET
+
+
+def test_entry_price_cap_off_when_zero():
+    """上限 0（默认）→ 不拦截，即使 ask 很高。"""
+    action = decide(CFG, make_state(), make_market(best_ask=0.95), make_signal("up", 0.70))
+    assert action.type is ActionType.PLACE_MARKET
+
+
+def test_entry_price_cap_allows_unknown_ask():
+    """无报价（None）不拦——执行层缺报价本就放弃建仓。"""
+    cfg = replace(CFG, max_entry_price=0.6)
+    action = decide(cfg, make_state(), make_market(best_ask=None), make_signal("up", 0.70))
+    assert action.type is ActionType.PLACE_MARKET
 
 
 # ---- 入场：市价买入（预测后立即按 1 USDC 目标入场） ----

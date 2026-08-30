@@ -40,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
     from pmbot.market_discovery import MarketDiscovery
     from pmbot.paths import paths_for
     from pmbot.single_instance import run_with_guard
+    from pmbot.spot_ticker import SpotTickerThread
     from pmbot.state import StateStore, TradeState
     from pmbot.strategy import create_strategy
     from pmbot.user_stream import UserStream
@@ -70,6 +71,11 @@ def main(argv: list[str] | None = None) -> int:
     user_stream = UserStream(executor.api_auth() if not args.dry_run else None, proxy=proxy)
     user_stream.start()
 
+    # Binance 实时价线程（方向一致性过滤数据源）：WS miniTicker + REST 兜底。
+    # 镜像端点直连可达（data_source 同款实证），不传 proxy 优先直连。
+    ticker = SpotTickerThread(symbol=symbol)
+    ticker.start()
+
     state = StateStore(paths.status).load()
     mode = paths.mode
     if state is not None and state.mode and state.mode != mode:
@@ -91,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         poll_sec=args.poll,
         user_stream=user_stream,
+        ticker=ticker,
         trades_path=paths.trades,
         status_path=paths.status,
         control_path=f"{data_dir}/control.json",

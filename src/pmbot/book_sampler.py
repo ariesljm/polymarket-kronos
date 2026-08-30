@@ -28,8 +28,9 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 # 快照新鲜度阈值（秒）：快照年龄超过此值视为陈旧（断线/订阅失效/事件流停摆），
 # 消费方（best_ask/best_bid）与健康检查线程都会触发 REST 现拉刷新。
-# WS 正常时 price_change 秒级到达，age 远小于此值；断线 REST 兜底 2s 一次也不会超。
-STALE_AGE_SEC = 3.0
+# WS 正常时 price_change 秒级到达，age 远小于此值；1s 收紧后止盈/止损决策价
+# 最坏 ~1.5s 新鲜（REST 兜底 1s），避免 10s tick + 陈旧快照叠加的漏触发。
+STALE_AGE_SEC = 1.0
 
 # 轻量事件也用到的价格字段（best_bid_ask / last_trade_price 事件，格式容错）
 _LIGHT_PRICE_FIELDS = ("best_bid", "best_ask", "last_trade_price")

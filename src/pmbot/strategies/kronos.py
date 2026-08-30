@@ -73,7 +73,7 @@ class KronosStrategy(Strategy):
         # 记录每次预测结果（含中间带信号），用于统计模型整体方向准确率
         target_ts = int(df["timestamp"].iloc[-1]) + step_ms_for(self.data_source.timeframe)
         self.log.record(target_ts, direction, p_up, current)
-        return Signal(direction=direction, p_up=p_up)
+        return Signal(direction=direction, p_up=p_up, baseline_close=current)
 
     def reset_runtime_data(self) -> None:
         """清除本策略的 K 线与预测记录（下次信号生成自动回填）。"""

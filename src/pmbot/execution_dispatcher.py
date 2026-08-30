@@ -74,6 +74,9 @@ class ExecutionDispatcher:
             self._exec_sell(action, market)
         elif action.type is ActionType.PAUSE:
             self._exec_pause(action)
+        elif action.type is ActionType.SKIP and action.reason:
+            # 带 reason 的 SKIP（如方向一致性过滤 contradiction）：记录供观测/标定
+            logger.info("跳过：%s", action.reason)
 
     def refresh_pending(self, market: MarketInfo, now_sec: int) -> None:
         """挂单成交检测（lifecycle tick 每 tick 调用）。

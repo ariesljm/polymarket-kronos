@@ -51,8 +51,16 @@ class TradingLoop:
         dry_run: bool = True,
         settle_timeout_sec: int | None = None,
         poll_sec: int = 10,
+        high_freq_poll_sec: float = 2.0,
         user_stream: UserStream | None = None,
+        ticker=None,
     ):
+        """ticker: Binance 实时价线程（SpotTickerThread，可选）——build_view 计算
+        live_delta_pct（方向一致性过滤）。None 时不过滤（旧配置兼容）。
+
+        high_freq_poll_sec: 活跃持仓存在时的轮询间隔（止盈/止损及时触发）；
+        无持仓保持 poll_sec（常规编排频率，降低无关开销）。
+        """
         self.config = config
         self.symbol = symbol
         self.strategy = strategy
@@ -75,7 +83,9 @@ class TradingLoop:
             settle_timeout_sec = Settler.default_timeout_sec(self.step_sec)
         self.settle_timeout_sec = settle_timeout_sec
         self.poll_sec = poll_sec
+        self.high_freq_poll_sec = high_freq_poll_sec
         self.user_stream = user_stream
+        self._ticker = ticker  # Binance 实时价线程（None = 不启用方向过滤）
         # 执行分派器：动作执行与挂单成交检测（深模块提取）。
         # state 经 getter 注入：reset 重建 TradeState 后自动跟随，无需手工回写。
         self._exec_dispatcher = ExecutionDispatcher(
@@ -168,9 +178,19 @@ class TradingLoop:
                 self._shutdown = True
             except Exception:
                 logger.exception("tick 异常，跳过")
-            time.sleep(self.poll_sec)
+            time.sleep(self._dynamic_sleep_sec())
         self.shutdown(now_sec=int(time.time()))
         logger.info("优雅停机完成")
+
+    def _dynamic_sleep_sec(self) -> float:
+        """活跃持仓存在时高频轮询（止盈/止损及时触发，避免 10s 粒度错过
+        止盈峰值/止损时机），否则常规间隔。结算等待（settle_pending）不交易
+        无需高频。tick 内查询均有节流/缓存（wallet 30s / gamma 缓存 / book
+        内存快照），高频不放大 API 负载。
+        """
+        if self.state.position is not None:
+            return self.high_freq_poll_sec
+        return self.poll_sec
 
     def tick(self, now_ms: int) -> None:
         """引擎 tick：控制指令 → 日界/熔断 → 窗口切换编排 → 当前生命周期推进。"""
@@ -392,7 +412,25 @@ class TradingLoop:
             pending_order=st.pending_order,
             # 窗口已进行秒数（开仓延迟判断：now − 窗口起点）
             elapsed_sec=max(0, now_sec - (self._window_end_sec(now_sec) - self.discovery.step_ms // 1000)),
+            # 窗口起点至今 Binance 实时移动 %（方向一致性过滤；无实时价 None 不过滤）
+            live_delta_pct=self._live_delta_pct(),
         )
+
+    def _live_delta_pct(self) -> float | None:
+        """窗口起点至今 Binance 实时移动 %（None = 无实时价/无信号基线，不过滤）。
+
+        baseline_close = 信号生成时最后闭合 K 线 close（窗口起点价，与 Polymarket
+        结算基准同源）；实时价来自 SpotTickerThread（WS + REST 兜底）。
+        """
+        if self._ticker is None:
+            return None
+        st = self.state
+        if st.signal is None or st.signal.baseline_close is None:
+            return None
+        price = self._ticker.latest_price()
+        if price is None or st.signal.baseline_close <= 0:
+            return None
+        return (price - st.signal.baseline_close) / st.signal.baseline_close * 100.0
 
     def state_view(self) -> StateView:
         st = self.state

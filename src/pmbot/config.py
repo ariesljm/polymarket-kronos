@@ -24,6 +24,8 @@ DEFAULTS: dict = {
     "hold_until_end_sec": 60,        # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
     "no_entry_before_end_sec": 60,
     "open_delay_sec": 0,          # 市场开始后 N 秒内不开仓（观察早期波动；0 = 关闭）
+    "contradiction_skip_pct": 0.0,  # 方向一致性过滤：信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
+    "max_entry_price": 0.0,      # 入场价上限：盘口 ask 高于此价不入场（追高无意义；0 = 关闭）
     "take_profit": 0.30,
     "take_profit_max": 0.95,
     "stop_loss": 0.20,
@@ -53,6 +55,8 @@ class EngineConfig:
     max_daily_loss: float
     no_entry_before_end_sec: int = 0
     open_delay_sec: int = 0
+    contradiction_skip_pct: float = 0.0  # 信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
+    max_entry_price: float = 0.0  # 入场价上限：盘口 ask 高于此价不入场（0 = 关闭)
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,10 @@ class Config:
     no_entry_before_end_sec: int = 0
     # 市场开始后 N 秒内不开仓（0-300，0 = 关闭）
     open_delay_sec: int = 0
+    # 信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
+    contradiction_skip_pct: float = 0.0
+    # 入场价上限：盘口 ask 高于此价不入场（追高无意义；0 = 关闭）
+    max_entry_price: float = 0.0
 
     def to_engine_config(self) -> EngineConfig:
         return EngineConfig(
@@ -105,6 +113,8 @@ class Config:
             max_daily_loss=self.max_daily_loss,
             no_entry_before_end_sec=self.no_entry_before_end_sec,
             open_delay_sec=self.open_delay_sec,
+            contradiction_skip_pct=self.contradiction_skip_pct,
+            max_entry_price=self.max_entry_price,
         )
 
     def to_strategy_config(self) -> StrategyConfig:
@@ -180,6 +190,16 @@ def load_config(path: str | Path) -> Config:
     if not 0 <= ods <= 300:
         raise ConfigError("open_delay_sec 必须在 0-300 秒之间（0 表示关闭开仓延迟）")
 
+    csp = _as_float(s.get("contradiction_skip_pct", DEFAULTS["contradiction_skip_pct"]),
+                    "contradiction_skip_pct")
+    if csp < 0:
+        raise ConfigError("contradiction_skip_pct 必须 ≥ 0（0 表示关闭方向一致性过滤）")
+
+    mep = _as_float(s.get("max_entry_price", DEFAULTS["max_entry_price"]),
+                    "max_entry_price")
+    if mep < 0:
+        raise ConfigError("max_entry_price 必须 ≥ 0（0 表示关闭入场价上限）")
+
     mcl = _as_int(s["max_consecutive_losses"], "max_consecutive_losses")
     mdl = _as_float(s["max_daily_loss"], "max_daily_loss")
     if mcl <= 0 or mdl <= 0:
@@ -219,6 +239,8 @@ def load_config(path: str | Path) -> Config:
         max_klines=mk,
         model_variant=variant,
         sample_count=sample_count,
+        contradiction_skip_pct=csp,
+        max_entry_price=mep,
     )
 
 
