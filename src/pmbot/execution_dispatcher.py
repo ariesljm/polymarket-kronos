@@ -26,6 +26,11 @@ from pmbot.types import (
 
 logger = logging.getLogger(__name__)
 
+# 盘口无报价建仓冷却（秒）：窗口内建仓尝试因无盘口失败后，暂停重试这么久，
+# 防止缺失盘口/市场无订单簿时每 tick 每秒重试刷屏（窗口内信号不变会反复触发
+# PLACE_MARKET，靠 retry_until_sec 冷却拦截）。
+BUY_RETRY_COOLDOWN_SEC = 10
+
 
 class ExecutionDispatcher:
     """动作执行与挂单成交检测。
@@ -115,6 +120,10 @@ class ExecutionDispatcher:
         ask = self.book.best_ask(token, size=1.0)
         if ask is None:
             logger.warning("市价买入跳过：盘口无报价 %s", token[:16])
+            # 无报价冷却：本窗口 N 秒内不再重试（信号不变时每 tick 都会再触发
+            # PLACE_MARKET，无冷却则缺失盘口时每秒重试；冷却后短暂恢复仍能入场）
+            st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
+            self._save()
             return
         target_size = shares_for_amount(action.amount, ask)
         filled = self.trade.market_buy(token, action.amount)
@@ -127,6 +136,7 @@ class ExecutionDispatcher:
             action.direction, entry, size, st.window_start, now_sec, self.step_sec,
         )
         st.window_bet_placed = True
+        st.retry_until_sec = None  # 建仓成功：清除无报价冷却
         self._save()
         src = "API" if filled.avg_price and filled.filled_size else "盘口估算"
         logger.info(
@@ -220,6 +230,12 @@ class ExecutionDispatcher:
         self._save()
 
     # ---- 盘口采样器订阅 ----
+
+    def unsubscribe_sampler(self) -> None:
+        """退订当前窗口 token（熔断/暂停/停机时停盘口轮询，防空转刷屏）。"""
+        sampler = self.book.sampler
+        if sampler is not None:
+            sampler.subscribe([])
 
     def subscribe_sampler(self, market: MarketInfo, user_stream=None) -> None:
         """BookSampler 订阅当前窗口 token。"""

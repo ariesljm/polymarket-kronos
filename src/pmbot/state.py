@@ -45,6 +45,7 @@ class TradeState:
     live_positions: list | None = None  # Polymarket 实时持仓快照（/positions，UI 展示 + 幽灵持仓核对）
     skip_until_sec: int | None = None  # 启动跳过进行中窗口：此时间戳起恢复交易（面板提示用）
     mode: str = ""  # 运行模式标记："dry-run"/"live"（空 = 旧数据，不校验）
+    retry_until_sec: int | None = None  # 盘口无报价建仓失败冷却截止（秒）；None=无冷却
 
     def roll_window(self, window_start: int) -> None:
         """窗口切换：重置本窗口下注标记与挂单（持仓不应跨窗口，结算兜底）。"""
@@ -54,6 +55,7 @@ class TradeState:
         self.window_bet_placed = False
         self.pending_order = None
         self.signal = None
+        self.retry_until_sec = None  # 冷却仅限当前窗口，换窗重置
 
     def roll_day(self, day: str) -> None:
         """跨天重置当日亏损与今日盈亏基准（新基准由下一次余额刷新捕获）。"""

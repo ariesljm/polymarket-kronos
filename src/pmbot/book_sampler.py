@@ -35,6 +35,11 @@ STALE_AGE_SEC = 1.0
 # 轻量事件也用到的价格字段（best_bid_ask / last_trade_price 事件，格式容错）
 _LIGHT_PRICE_FIELDS = ("best_bid", "best_ask", "last_trade_price")
 
+# REST 兜底失败退避（秒）：指数增长，上限 RETRY_MAX。市场已结算/无订单簿（404）
+# 与网络抖动都收敛到低频重试，避免断线/空转期间每秒刷屏（见 _rest_fallback）。
+RETRY_BASE = 1.0
+RETRY_MAX = 30.0
+
 
 def _apply_price_change(snap: dict, change: dict) -> None:
     """price_change 增量更新快照：side=BUY→bids，SELL→asks，size=0 删档。"""
@@ -79,6 +84,9 @@ class BookSampler(ReconnectingWsThread):
         # 每个 token 快照的最后更新时间（monotonic 秒；与 _snapshots 同锁保护）——
         # 消费方据此判定陈旧，不再无条件信任不知来源年龄的快照
         self._snapshot_ts: dict[str, float] = {}
+        # REST 兜底失败退避（同锁保护）：token -> 下次可重试时间 / 当前退避间隔（秒）
+        self._retry_after: dict[str, float] = {}
+        self._retry_backoff: dict[str, float] = {}
         self._direction_map: dict[str, str] = {}  # token_id -> up/down
         self._light_prices: dict[str, dict] = {}  # token_id -> 轻量事件价（D：best_bid_ask/last_trade_price）
         self._last_subscribed: set[str] = set()  # 已发送给服务端的订阅集合（WS 线程读写）
@@ -98,8 +106,10 @@ class BookSampler(ReconnectingWsThread):
         changed = False
         with self._lock:
             changed = wanted != self._tokens
-            for t in set(self._snapshots) - wanted:
+            for t in self._tokens - wanted:
                 self._snapshots.pop(t, None)
+                self._retry_after.pop(t, None)
+                self._retry_backoff.pop(t, None)
             self._tokens = wanted
             if direction_map is not None:
                 self._direction_map = dict(direction_map)
@@ -336,10 +346,13 @@ class BookSampler(ReconnectingWsThread):
             self._snapshot_ts[asset_id] = time.monotonic()
 
     def _rest_fallback(self, tokens: list | None = None) -> None:
-        """REST 并行刷新快照（失败保留旧快照）。
+        """REST 并行刷新快照（失败保留旧快照 + 按 token 指数退避）。
 
         断线/重连等待期间刷新全部订阅（tokens=None）；健康检查只刷陈旧的。
         写回同时更新新鲜度时间戳——REST 结果同样被消费方信任（时效内）。
+        失败 token 进入指数退避（RETRY_BASE → 翻倍 → RETRY_MAX），成功清零：
+        - 网络抖动：短暂重试即可恢复；
+        - 市场已结算/无订单簿（404）：退避到上限后低频重试，不再每秒刷屏。
         """
         if self._fetch is None:
             return
@@ -348,18 +361,33 @@ class BookSampler(ReconnectingWsThread):
                 tokens = list(self._tokens)
         if not tokens:
             return
+        now = time.monotonic()
+        with self._lock:
+            pending = [t for t in tokens if now >= self._retry_after.get(t, 0.0)]
+        if not pending:
+            return
         from concurrent.futures import ThreadPoolExecutor
 
-        with ThreadPoolExecutor(max_workers=min(len(tokens), 4)) as pool:
-            futures = {pool.submit(self._fetch, t): t for t in tokens}
+        with ThreadPoolExecutor(max_workers=min(len(pending), 4)) as pool:
+            futures = {pool.submit(self._fetch, t): t for t in pending}
             for fut in futures:
                 tok = futures[fut]
                 try:
                     book = fut.result()
                 except Exception:
-                    logger.warning("盘口 REST 兜底失败 token=%s", tok[:16] if tok else tok)
+                    with self._lock:
+                        backoff = self._retry_backoff.get(tok, 0.0) or RETRY_BASE
+                        self._retry_after[tok] = now + backoff
+                        self._retry_backoff[tok] = min(backoff * 2, RETRY_MAX)
+                    logger.warning(
+                        "盘口 REST 兜底失败 token=%s（%.0fs 后重试）",
+                        tok[:16] if tok else tok, backoff,
+                    )
                     continue
                 if book:
                     with self._lock:
                         self._snapshots[tok] = book
-                        self._snapshot_ts[tok] = time.monotonic()
+                        self._snapshot_ts[tok] = now
+                        # 成功清零退避（下次再失败从 RETRY_BASE 重新开始）
+                        self._retry_after.pop(tok, None)
+                        self._retry_backoff.pop(tok, None)

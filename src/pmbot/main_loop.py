@@ -25,6 +25,7 @@ from pmbot.strategy import Strategy
 from pmbot.trade_history import TradeHistorySource
 from pmbot.types import (
     Action,
+    ActionType,
     Direction,
     MarketView,
     StateView,
@@ -307,6 +308,8 @@ class TradingLoop:
         窗口未结束的持仓保留（status.json 持久化，重启后继续管理）。
         """
         st = self.state
+        # 退订盘口采样器（独立线程）：停机后停止旧 token 空转轮询
+        self._exec_dispatcher.unsubscribe_sampler()
         # 引擎级兜底：撤遗留挂单（不依赖 lifecycle 对象存在）
         if st.pending_order is not None:
             self.trade.cancel(st.pending_order.order_id)
@@ -358,6 +361,9 @@ class TradingLoop:
         st = self.state
         if st.paused:
             st.was_paused = True
+            # 手动暂停/熔断恢复前不交易：退订盘口采样器，停掉旧 token 空转轮询
+            # （subscribe([]) 幂等：已退订则无 diff 不推消息，重复调用安全）
+            self._exec_dispatcher.unsubscribe_sampler()
             self.save_status()
             return True
         if st.was_paused:
@@ -372,6 +378,9 @@ class TradingLoop:
             st.pause_reason = message
             logger.warning("熔断触发：%s。恢复：编辑 %s 将 paused 改为 false",
                            message, self.status_path)
+            # 熔断/暂停期间不交易：退订盘口采样器，停掉旧 token 的空转轮询
+            # （BookSampler 独立线程，不退订会持续对已关闭市场 REST 兜底刷屏）
+            self._exec_dispatcher.unsubscribe_sampler()
             self.save_status()
             return True
         return False
@@ -498,6 +507,10 @@ class TradingLoop:
 
     def decide(self, view: MarketView) -> Action:
         """决策引擎调用（lifecycle 使用）。"""
+        st = self.state
+        # 盘口无报价建仓失败冷却：本窗口冷却期内不再决策建仓（防缺失盘口每秒重试）
+        if st.retry_until_sec is not None and self._now_sec() < st.retry_until_sec:
+            return Action(ActionType.SKIP)
         return decide(self.config.to_engine_config(), self.state_view(), view, self.state.signal)
 
     def execute(self, action: Action, market: MarketInfo, now_sec: int) -> None:

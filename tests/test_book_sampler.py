@@ -495,3 +495,65 @@ def test_is_fresh_single_source():
     assert s.is_fresh("tok-a") is True   # 刚注入 → 新鲜
     s._snapshot_ts["tok-a"] = time.monotonic() - 30.0
     assert s.is_fresh("tok-a") is False  # 超龄 → 陈旧
+
+
+def test_rest_fallback_backoff_after_failure():
+    """REST 兜底失败后按 token 指数退避：退避期内不再重复请求。"""
+    calls = {"n": 0}
+
+    def fetch(tok):
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    s._rest_fallback()  # 第一次失败
+    assert calls["n"] == 1
+    assert s._retry_after["tok-a"] > 0
+    assert s._retry_backoff["tok-a"] == 2.0  # 下次等待 1s，翻倍为 2s
+    s._rest_fallback()  # 退避期内 → 跳过，不重复请求
+    assert calls["n"] == 1
+    # 退避期过后重试，间隔再翻倍（4s）
+    s._retry_after["tok-a"] = 0.0
+    s._rest_fallback()
+    assert calls["n"] == 2
+    assert s._retry_backoff["tok-a"] == 4.0
+
+
+def test_rest_fallback_backoff_cleared_on_success():
+    """REST 兜底成功后清零退避（下次再失败从 RETRY_BASE 重新开始）。"""
+    calls = {"n": 0}
+
+    def fetch(tok):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise RuntimeError("boom")
+        return fake_book(0.50)
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    s._rest_fallback()  # 失败
+    assert "tok-a" in s._retry_after
+    s._retry_after["tok-a"] = 0.0
+    s._retry_backoff["tok-a"] = 2.0
+    s._rest_fallback()  # 成功
+    assert "tok-a" not in s._retry_after
+    assert "tok-a" not in s._retry_backoff
+    assert float(s.snapshot("tok-a")["bids"][0]["price"]) == 0.49
+
+
+def test_rest_fallback_skips_dead_token_backoff():
+    """退订的 token 其退避记录被清除（subscribe 清理，防残留死 token）。"""
+    calls = {"n": 0}
+
+    def fetch(tok):
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    s = BookSampler(fetch)
+    s.subscribe(["tok-a"])
+    s._rest_fallback()
+    assert "tok-a" in s._retry_after
+    s.subscribe([])  # 退订
+    assert "tok-a" not in s._retry_after
+    assert "tok-a" not in s._retry_backoff

@@ -1620,3 +1620,68 @@ def test_user_event_trade_buy_ignored(tmp_path):
     loop.tick(now_ms=(999_900 + 900) * 1000 + 60_000)
     assert st.position is not None or st.settle_pending is not None,         "BUY 事件不触发持仓清理"
 
+
+
+class FakeSampler:
+    """盘口采样器替身：记录 subscribe 调用（验证订阅/退订）。"""
+
+    def __init__(self):
+        self.subscribed = []
+
+    def subscribe(self, tokens, direction_map=None):
+        self.subscribed.append(list(tokens))
+
+
+def test_circuit_breaker_unsubscribes_sampler(tmp_path):
+    """熔断触发时退订盘口采样器（停旧 token 空转轮询，防 404 刷屏）。"""
+    ex = FakeExecutor()
+    sampler = FakeSampler()
+    ex.attach_sampler(sampler)
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(symbol="BTC", window_start=999_900, consecutive_losses=10),
+        executor=ex,
+    )
+    loop.tick(now_ms=1_000_000_000)
+    assert loop.state.paused is True
+    assert sampler.subscribed and sampler.subscribed[-1] == []  # 已退订
+
+
+def test_paused_state_unsubscribes_sampler(tmp_path):
+    """加载即 paused 的状态同样退订采样器（手动暂停启动不空转）。"""
+    ex = FakeExecutor()
+    sampler = FakeSampler()
+    ex.attach_sampler(sampler)
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(symbol="BTC", window_start=999_900, paused=True),
+        executor=ex,
+    )
+    loop.tick(now_ms=1_000_000_000)
+    assert sampler.subscribed and sampler.subscribed[-1] == []
+
+
+def test_no_quote_buy_sets_cooldown_then_skips_reentry(tmp_path):
+    """盘口无报价买入失败：本窗口冷却期内不再重试（防缺失盘口每秒重试刷屏）。"""
+    ex = FakeExecutor()
+    ex.best_ask_value = None  # 盘口无报价
+    loop = make_loop(tmp_path, executor=ex)
+    loop.tick(now_ms=1_000_000_000)
+    assert loop.state.retry_until_sec is not None  # 冷却已设置
+    assert ex.calls == []  # 无报价未下单
+    loop.tick(now_ms=1_000_005_000)  # +5s，冷却期内
+    assert ex.calls == []  # 冷却期内不重试
+
+
+def test_no_quote_cooldown_expires_and_retries(tmp_path):
+    """冷却期过后盘口恢复可再次入场；建仓成功清除冷却。"""
+    ex = FakeExecutor()
+    ex.best_ask_value = None
+    loop = make_loop(tmp_path, executor=ex)
+    loop.tick(now_ms=1_000_000_000)
+    assert ex.calls == []
+    ex.best_ask_value = 0.42  # 盘口恢复
+    loop.state.retry_until_sec = 1_000_000  # 冷却已过期（now=1_000_100_000）
+    loop.tick(now_ms=1_000_100_000)
+    assert ex.calls and ex.calls[0][0] == "market_buy"
+    assert loop.state.retry_until_sec is None  # 建仓成功清除冷却

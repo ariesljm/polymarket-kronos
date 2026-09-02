@@ -211,3 +211,10 @@ def test_trades_log_appends_csv(tmp_path):
     lines = store.trades_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 3  # 表头 + 2 行
     assert "settle" in lines[1]
+
+
+def test_roll_window_resets_retry_cooldown():
+    """窗口切换重置无报价建仓冷却（冷却仅限当前窗口）。"""
+    st = make_state(retry_until_sec=12345)
+    st.roll_window(2_000_000)
+    assert st.retry_until_sec is None
