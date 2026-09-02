@@ -13,11 +13,23 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
 
 WINDOW_MS = 300_000  # 5m
+
+
+def wilson(agree: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson 95% 置信区间。"""
+    if total == 0:
+        return 0.0, 0.0
+    p = agree / total
+    denom = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denom
+    half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denom
+    return center - half, center + half
 
 
 def load_windows(csv_path: Path) -> dict[int, list[tuple[int, float]]]:
@@ -100,17 +112,29 @@ def analyze(wins: dict[int, list[tuple[int, float]]]) -> None:
     for off in (30, 60, 120, 180):
         a, t = agree_by_offset[off]
         if t:
-            print(f"  起点后 {off:3d}s 突破方向预测结算: {a}/{t} = {a/t*100:.1f}%  （>55% 才有信号）")
+            lo, hi = wilson(a, t)
+            sig = "显著 区间>50%" if lo > 0.50 else "不显著 区间含50%" if lo <= 0.50 <= hi else "反方向"
+            near_bias = "  接近结算可能有惯性自相关" if off >= 120 else ""
+            print(f"  起点后 {off:3d}s 突破预测结算: {a}/{t}={a/t*100:.1f}%  Wilson95 {lo*100:.0f}~{hi*100:.0f}%  {sig}{near_bias}")
     if big_win_agree[1]:
         a, t = big_win_agree
-        print(f"  大波动窗口(振幅>0.10%) 60s 突破预测: {a}/{t} = {a/t*100:.1f}%")
+        print(f"  大波动窗口 振幅>0.10% 的 60s 突破预测: {a}/{t}={a/t*100:.1f}%  样本仅{t} 不可靠")
 
-    print("\n=== 定论判读 ===")
-    best = max(agree_by_offset.values(), key=lambda x: x[1] and x[0]/x[1] if x[1] else 0) if any(agree_by_offset.values()) else [0,0]
-    if best[1] and best[0]/best[1] > 0.55:
-        print("  ✓ BTC 前段突破方向对结算有预测力 → 盘口滞后套利有基础，建议补采盘口数据进阶标定")
+    # 仅用离结算远的 30/60s（排除接近性偏差）判读真领先信号
+    far_sig = False
+    for off in (30, 60):
+        a, t = agree_by_offset[off]
+        if t:
+            lo, _ = wilson(a, t)
+            if lo > 0.50:
+                far_sig = True
+    print("\n=== 定论判读（仅看 30/60s 真领先信号，排除接近性偏差）===")
+    if far_sig:
+        print("  ✓ BTC 窗口前段(30-60s)突破方向对结算有统计显著预测力 → 盘口滞后套利有信号基础")
+        print("    但大波动窗口(套利空间最大)预测力反而弱 → 需补采盘口数据标定『滞后幅度 vs 滑点』")
     else:
-        print("  ✗ BTC 前段突破方向对结算无预测力（≈掷硬币）→ 盘口滞后无可套利信号，方向C（动态tp/sl锚定BTC）也无基础")
+        print("  ✗ BTC 前段突破对结算无显著预测力(Wilson区间含50%) → 盘口滞后无可套利信号")
+        print("    120/180s 的高预测力是接近结算的惯性自相关,非领先信号")
 
 
 def main() -> int:
