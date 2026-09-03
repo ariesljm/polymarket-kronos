@@ -18,7 +18,7 @@ from pathlib import Path
 
 # 展示逻辑（build_view/render/PanelView/PanelConfig）与实时价在深模块：
 # panel_view.py / spot_ticker.py，本模块只负责 CLI 入口与 TUI/Web 渲染循环。
-from pmbot.panel_view import REFRESH_SEC, build_live_view
+from pmbot.panel_view import REFRESH_SEC, build_live_view, render
 from pmbot.spot_ticker import SpotTickerThread
 
 

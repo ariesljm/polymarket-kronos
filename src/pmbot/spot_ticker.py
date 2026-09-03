@@ -39,6 +39,9 @@ class SpotTickerThread(ReconnectingWsThread):
     """Binance 实时价线程：WS miniTicker → 内存最新价；断线 REST 兜底。"""
 
     disconnect_poll_sec = REST_POLL_SEC
+    # Binance 单流 WS 无应用层 PING 心跳（协议层 ping 由 websockets 库自动
+    # 处理）；发应用层 PING 文本无益且可能被当作未知消息，禁用 _ping_loop。
+    app_heartbeat_sec = None
 
     def __init__(self, symbol: str = "BTC", *, proxy: str | None = None,
                  fetch_ticker=None):

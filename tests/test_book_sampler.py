@@ -3,10 +3,12 @@
 import json
 import threading
 import time
+import asyncio
 
 import pytest
 
 from pmbot.book_sampler import BookSampler, _apply_price_change
+from pmbot.spot_ticker import SpotTickerThread
 
 
 def fake_book(price):
@@ -557,3 +559,34 @@ def test_rest_fallback_skips_dead_token_backoff():
     s.subscribe([])  # 退订
     assert "tok-a" not in s._retry_after
     assert "tok-a" not in s._retry_backoff
+
+
+def test_app_heartbeat_enabled_for_polymarket_disabled_for_binance():
+    """Polymarket Market/User Channel 需客户端主动发 PING；Binance 单流禁用。"""
+    assert BookSampler.app_heartbeat_sec == 10.0
+    assert SpotTickerThread.app_heartbeat_sec is None
+
+
+def test_ping_loop_sends_app_ping():
+    """_ping_loop 每隔 app_heartbeat_sec 主动发 PING（Polymarket 保活规则）。"""
+    sent = []
+
+    class FakeWs:
+        async def send(self, msg):
+            sent.append(msg)
+
+    s = BookSampler()
+    s.app_heartbeat_sec = 0.02
+
+    async def run():
+        task = asyncio.create_task(s._ping_loop(FakeWs()))
+        await asyncio.sleep(0.07)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    assert sent and all(m == "PING" for m in sent)
+    assert len(sent) >= 2  # 0.07s / 0.02s → 至少两次

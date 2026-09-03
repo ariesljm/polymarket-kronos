@@ -29,6 +29,10 @@ class ReconnectingWsThread(threading.Thread):
     reconnect_base: float = RECONNECT_BASE
     reconnect_max: float = RECONNECT_MAX
     disconnect_poll_sec: float = 2.0  # 断线等待期间子类兜底钩子的轮询间隔（秒）
+    # 应用层心跳间隔（秒）：Polymarket Market/User Channel 要求客户端每 10s
+    # 主动发 PING（不发会被 ~10s 后断开）。None=禁用（Binance 单流靠协议层
+    # ping，发应用层 PING 文本无益且可能被当作未知消息）。
+    app_heartbeat_sec: float | None = 10.0
 
     def __init__(self, *, name: str | None = None, proxy: str | None = None):
         super().__init__(daemon=True, name=name or self.__class__.__name__)
@@ -68,13 +72,23 @@ class ReconnectingWsThread(threading.Thread):
                     self._loop = asyncio.get_running_loop()
                     try:
                         await self._send_subscribe(ws)
+                        # 应用层心跳：客户端每 N 秒主动发 PING（Polymarket
+                        # Market/User Channel 官方规则：不发会被服务端 ~10s 后
+                        # 断开）。旧实现误判“服务端主动发 PING/客户端只应答”，
+                        # 实为当时频率/格式问题，现行规则要求 10s 间隔纯文本 PING。
+                        # Binance 单流（app_heartbeat_sec=None）靠协议层 ping，不启用。
+                        ping_task = (
+                            asyncio.create_task(self._ping_loop(ws))
+                            if self.app_heartbeat_sec else None
+                        )
                         try:
                             async for msg in ws:
                                 if await self._answer_heartbeat(ws, msg):
                                     continue  # 心跳应答不交给子类
                                 self._handle_message(msg)
                         finally:
-                            pass
+                            if ping_task is not None:
+                                ping_task.cancel()
                     finally:
                         self._connected_ws = None
                         self._loop = None
@@ -92,12 +106,31 @@ class ReconnectingWsThread(threading.Thread):
                     waited += wait
                 backoff = min(backoff * 2, self.reconnect_max)
 
-    async def _answer_heartbeat(self, ws: ClientConnection, msg) -> bool:
-        """Polymarket 应用层心跳应答：服务端发 PING 文本 → 回 PONG（应答即保活）。
+    async def _ping_loop(self, ws: ClientConnection) -> None:
+        """应用层心跳：每 app_heartbeat_sec 秒主动发 PING（Polymarket 规则）。
 
-        客户端**不主动发** PING：曾每 3s 发 PING 文本被服务端判非法
-        （1008 policy violation）→ WS 每 3s 断开重连（回归：20:51 盘口流
-        连接后 ~3s 必断，REST 兜底救场）。返回 True 表示已应答、消息不交子类。
+        官方文档要求客户端每 10s 发 PING、服务端回 PONG；不发则 ~10s 后被断开
+        （回归：盘口流连接后 ~10s 必断、反复重连刷屏）。PONG 由子类
+        _handle_message 忽略（BookSampler/UserStream 均已处理）。连接已断时
+        send 抛异常 → 静默退出，外层 _ws_loop 捕获异常重连。
+        """
+        interval = self.app_heartbeat_sec or 10.0
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(interval)
+                try:
+                    await ws.send("PING")
+                except Exception:
+                    return  # 连接已断，外层会重连
+        except asyncio.CancelledError:
+            return
+
+    async def _answer_heartbeat(self, ws: ClientConnection, msg) -> bool:
+        """应用层心跳应答（兼容）：服务端发 PING 文本 → 回 PONG。
+
+        现行 Polymarket 规则以客户端主动发 PING 为心跳主路径（见 _ping_loop），
+        服务端不再主动发 PING；但保留本应答作为双向兼容（万一服务端仍会发 PING
+        要求回 PONG）。返回 True 表示已应答、消息不交子类。
         """
         if isinstance(msg, str) and msg.strip() == "PING":
             try:
