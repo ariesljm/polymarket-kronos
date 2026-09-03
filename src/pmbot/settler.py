@@ -62,6 +62,7 @@ class Settler:
         step_sec: int,
         settle_timeout_sec: int | None = None,
         dry_run: bool = True,
+        simulated_settle: Callable[[Position], float | None] | None = None,
     ):
         self.symbol = symbol
         self.source = source
@@ -69,6 +70,10 @@ class Settler:
         self._on_settle = on_settle
         self._on_abandon = on_abandon
         self.step_sec = step_sec
+        # 模拟结算判定（dry-run 注入）：按本地 K 线判定的窗口实际方向直接给出
+        # 二元结算价（赢=1.0/输=0.0），不查 gamma、不等中间价、不超时兜底中间价。
+        # 返回 None（判定数据未就绪）时回退 gamma 流程；None 时实盘与不注入等价。
+        self._simulated_settle = simulated_settle
         # 结算超时按窗口步长自适应：5m 窗口 10 分钟，15m 窗口 30 分钟。
         # 固定 1800s 对 5m 市场过长（gamma 结算几分钟即出结果）——残留持仓
         # 最多卡 6 个窗口不交易，不符合常理；下限 300s 防小步长配置过激。
@@ -91,6 +96,17 @@ class Settler:
     def settle(self, now_sec: int, position: Position) -> None:
         """推进结算状态机（引擎每 tick 调用一次；无持仓时不应调用）。"""
         pos = position
+        # 模拟环境优先用本地判定的二元结算价：模拟环境没有真实 Polymarket 结算，
+        # 窗口实际涨跌由 Binance K 线确定（方向对=1/方向错=0）。曾因查 gamma 拿到
+        # 未结算中间价、超时后按中间价兜底记账，导致 settle 记录出现 0.245/0.525
+        # 等非二元 exit_price（模拟语义错误）。返回 None 时回退下方 gamma 流程。
+        if self._simulated_settle is not None:
+            sim = self._simulated_settle(pos)
+            if sim is not None:
+                logger.info("窗口 %d 模拟结算（本地判定）：%.3f", pos.window_start, sim)
+                self.phase = SettlePhase.DONE
+                self._on_settle(pos, sim, None)
+                return
         market = self.source.find_window(self.symbol, pos.window_start, require_tradable=False)
         if market is None:
             # 清除负缓存：首次查询可能网络瞬时失败，让下一 tick 重新查询（防结算死循环）

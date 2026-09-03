@@ -42,7 +42,7 @@ def make_pos(direction=Direction.UP, entry=0.45, size=2.0, window_start=999_900)
 
 
 def make_settler(source, *, dry_run=True, timeout=None, step=300,
-                 proceeds_fn=None):
+                 proceeds_fn=None, simulated_settle=None):
     calls = {"settle": [], "abandon": 0}
 
     def on_settle(pos, exit_price, proceeds):
@@ -60,6 +60,7 @@ def make_settler(source, *, dry_run=True, timeout=None, step=300,
         step_sec=step,
         settle_timeout_sec=timeout,
         dry_run=dry_run,
+        simulated_settle=simulated_settle,
     )
     return s, calls
 
@@ -201,6 +202,38 @@ def test_default_timeout_scales_with_step():
     assert Settler.default_timeout_sec(300) == 600
     assert Settler.default_timeout_sec(900) == 1800
     assert Settler.default_timeout_sec(60) == 300  # 下限
+
+
+def test_simulated_settle_short_circuits_binary():
+    """模拟结算优先于 gamma：方向对→1.0、方向错→0.0，不查 gamma。"""
+    src = FakeSource(price=0.55)  # gamma 中间价（曾致超时兑底）
+    # UP 仓位、实际 UP → 赢 1.0
+    s_win, calls = make_settler(
+        src, dry_run=True,
+        simulated_settle=lambda pos: 1.0 if pos.direction is Direction.UP else 0.0)
+    s_win.settle(1_000_000, make_pos(direction=Direction.UP))
+    assert len(calls["settle"]) == 1
+    assert calls["settle"][0][1] == 1.0
+    assert calls["settle"][0][2] is None  # 模拟无兑付
+    assert s_win.phase is SettlePhase.DONE
+    # DOWN 仓位、实际 UP → 输 0.0
+    s_lose, calls2 = make_settler(
+        src, dry_run=True,
+        simulated_settle=lambda pos: 1.0 if pos.direction is Direction.UP else 0.0)
+    s_lose.settle(1_000_000, make_pos(direction=Direction.DOWN))
+    assert calls2["settle"][0][1] == 0.0
+    # gamma 不应被查询（source 未被访问）
+    assert not src.invalidated
+
+
+def test_simulated_settle_none_falls_back_to_gamma():
+    """模拟结算返回 None（K 线未就绪）→ 回退 gamma 现有流程。"""
+    src = FakeSource(price=0.55)  # 中间价 → PRICE_WAIT
+    s, calls = make_settler(src, dry_run=True, timeout=600,
+                            simulated_settle=lambda pos: None)
+    s.settle(1_000_000, make_pos())
+    assert s.phase is SettlePhase.PRICE_WAIT  # 回退 gamma 中间价等待
+    assert calls["settle"] == []
 
 
 def test_window_ended_at_single_source():

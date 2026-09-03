@@ -446,6 +446,66 @@ def test_settle_waits_when_market_not_settled(tmp_path):
     assert loop.state.settle_pending is not None  # 待结算在等中间价
 
 
+class OutcomeStrategy(FakeStrategy):
+    """带 window_outcome 的假策略：模拟本地 K 线判定的窗口实际方向。"""
+    def __init__(self, signal, outcome):
+        super().__init__(signal)
+        self._outcome = outcome
+
+    def window_outcome(self, window_start):
+        return self._outcome
+
+
+def test_sim_settle_binary_win_ignores_gamma_midprice(tmp_path):
+    """模拟环境结算：方向对→1.0，gamma 中间价不再污染账本。"""
+    ex = FakeExecutor()
+    settled = make_market(price=0.55)  # gamma 仍中间价（旧路径会超时兑底）
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(
+            symbol="BTC",
+            window_start=999_900,
+            window_bet_placed=True,
+            position=make_position(direction=Direction.UP),
+        ),
+        discovery=FakeDiscovery(None, settled=settled),
+        executor=ex,
+        strategy=OutcomeStrategy(Signal(Direction.UP, 0.70), Direction.UP),
+    )
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
+    assert loop.state.position is None and loop.state.settle_pending is None
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    row = rows[-1]
+    assert row["reason"] == "settle"
+    assert float(row["exit_price"]) == 1.0  # 赢：1 USDC/股
+    assert loop.state.consecutive_losses == 0
+
+
+def test_sim_settle_binary_loss_zeros_out(tmp_path):
+    """模拟环境结算：方向错→0.0 归零，熔断计数增加。"""
+    ex = FakeExecutor()
+    settled = make_market(price=0.55)  # gamma 中间价（被模拟判定覆盖）
+    loop = make_loop(
+        tmp_path,
+        state=TradeState(
+            symbol="BTC",
+            window_start=999_900,
+            window_bet_placed=True,
+            position=make_position(direction=Direction.DOWN),
+        ),
+        discovery=FakeDiscovery(None, settled=settled),
+        executor=ex,
+        strategy=OutcomeStrategy(Signal(Direction.DOWN, 0.30), Direction.UP),
+    )
+    loop.tick(now_ms=999_900_000 + WINDOW_MS + 60_000)
+    assert loop.state.position is None and loop.state.settle_pending is None
+    rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
+    row = rows[-1]
+    assert row["reason"] == "settle"
+    assert float(row["exit_price"]) == 0.0  # 输：归零
+    assert loop.state.consecutive_losses == 1
+
+
 # ---- 熔断 ----
 
 def test_circuit_breaker_pauses(tmp_path):

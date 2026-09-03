@@ -28,6 +28,7 @@ from pmbot.types import (
     ActionType,
     Direction,
     MarketView,
+    Position,
     StateView,
     token_for,
 )
@@ -112,6 +113,7 @@ class TradingLoop:
             step_sec=self.step_sec,
             settle_timeout_sec=settle_timeout_sec,
             dry_run=dry_run,
+            simulated_settle=self._sim_settle if dry_run else None,
         )
         # 钱包核对（余额/实时持仓/幽灵持仓）：外部世界同步关注点，独立可测
         self.wallet_sync = WalletReconciler(
@@ -386,6 +388,20 @@ class TradingLoop:
         return False
 
     # ---- 内部 ----
+
+    def _sim_settle(self, pos: Position) -> float | None:
+        """模拟环境结算判定（dry-run）：复用策略的窗口实际方向判定。
+
+        方向对 → 1.0 USDC/股，方向错 → 0；策略不支持（无 window_outcome）或
+        K 线未就绪返回 None，Settler 回退 gamma 流程。实盘不注入本回调。
+        """
+        outcome = getattr(self.strategy, "window_outcome", None)
+        if outcome is None:
+            return None
+        actual = outcome(pos.window_start)
+        if actual is None:
+            return None
+        return 1.0 if pos.direction is actual else 0.0
 
     @property
     def step_sec(self) -> int:

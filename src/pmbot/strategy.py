@@ -9,7 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable
 
-from pmbot.types import Signal, SignalContext
+from pmbot.types import Direction, Signal, SignalContext
 
 _REGISTRY: dict[str, type["Strategy"]] = {}
 
@@ -22,6 +22,14 @@ class Strategy(ABC):
 
     def reset_runtime_data(self) -> None:
         """清空策略运行时数据（K线/预测记录）；无持久化状态的策略无需覆写。"""
+
+    def window_outcome(self, window_start: int) -> Direction | None:
+        """窗口实际结算方向（UP/DOWN）；不支持的策略返回 None。
+
+        模拟环境（dry-run）结算判定单一事实源：窗口实际涨跌由标的 K 线决定，
+        不依赖真实 Polymarket 市场结算。返回 None 时 Settler 回退 gamma 流程。
+        """
+        return None
 
 
 

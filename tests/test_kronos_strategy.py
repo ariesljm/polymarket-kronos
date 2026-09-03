@@ -47,6 +47,7 @@ def make_strategy(tmp_path, closes, pred_closes, symbol="BTC", **kw):
         predict_fn=lambda d, sample_count: pred_closes,
         log_dir=Path(tmp_path),
         symbol=symbol,
+        settle_price_fn=kw.pop("settle_price_fn", lambda t: None),
         **kw,
     )
 
@@ -133,3 +134,65 @@ def test_no_thresholds_records_all(tmp_path):
     strat = make_strategy(tmp_path, [100.0] * 10, [101.0] * 7 + [99.0] * 8)
     strat.generate_signal()
     assert len(strat.log._load()) == 1
+
+
+def _make_rolling_ds(dfs):
+    """FakeDataSource：每次 update 返回下一段数据（模拟窗口推进）。"""
+    class FakeDataSource:
+        timeframe = "15m"
+        def __init__(self, dfs):
+            self._dfs = dfs
+            self._i = 0
+        def update(self, sym):
+            df = self._dfs[min(self._i, len(self._dfs) - 1)]
+            self._i += 1
+            return df
+    return FakeDataSource(dfs)
+
+
+def test_settle_price_fn_feeds_evaluation(tmp_path):
+    """注入的 settle_price_fn 均价进入评估：高于基线则模型方向判对（TWAP 口径）。"""
+    dfs = [
+        make_df([100.0] * 10),               # 首轮：预测 ts=10_000_000（baseline 100）
+        make_df([100.0] * 10 + [102.0]),     # 推进：次轮记录新目标
+        make_df([100.0] * 10 + [102.0, 102.0]),  # 再推进：首轮目标闭合成评估
+    ]
+    strat = KronosStrategy(
+        strategy_config=StrategyConfig(model_variant="kronos-mini", sample_count=20,
+                                       max_klines=2048, market_interval="15m"),
+        data_source=_make_rolling_ds(dfs),
+        predict_fn=lambda d, sample_count: [101.0],
+        log_dir=Path(tmp_path),
+        symbol="BTC",
+        settle_price_fn=lambda t: 101.0,  # 结算均价 101 > baseline 100 → up
+    )
+    strat.generate_signal()
+    strat.generate_signal()
+    strat.generate_signal()
+    acc = strat.log.accuracy()
+    assert acc["total"] == 1
+    assert acc["correct"] == 1  # 预测 up，TWAP 口径 101>100 up → 对
+
+
+def test_settle_price_fn_low_flips_to_wrong(tmp_path):
+    """结算均价低于基线 → TWAP 口径 down，预测 up 判错（覆盖 close 口径误判）。"""
+    dfs = [
+        make_df([100.0] * 10),
+        make_df([100.0] * 10 + [102.0]),
+        make_df([100.0] * 10 + [102.0, 102.0]),
+    ]
+    strat = KronosStrategy(
+        strategy_config=StrategyConfig(model_variant="kronos-mini", sample_count=20,
+                                       max_klines=2048, market_interval="15m"),
+        data_source=_make_rolling_ds(dfs),
+        predict_fn=lambda d, sample_count: [101.0],
+        log_dir=Path(tmp_path),
+        symbol="BTC",
+        settle_price_fn=lambda t: 99.0,  # 结算均价 99 < baseline 100 → down
+    )
+    strat.generate_signal()
+    strat.generate_signal()
+    strat.generate_signal()
+    acc = strat.log.accuracy()
+    assert acc["total"] == 1
+    assert acc["correct"] == 0  # 预测 up，TWAP 口径 down → 错
