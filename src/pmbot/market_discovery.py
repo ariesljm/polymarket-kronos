@@ -8,6 +8,7 @@ outcomes/clobTokenIds/outcomePrices 是 JSON 编码字符串，需二次解析�
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -51,6 +52,8 @@ class MarketDiscovery:
         self.interval = interval
         self.step_ms = step_ms_for(interval)
         self._cache: dict[tuple, MarketInfo | None] = {}  # (symbol, window_start, require_tradable)
+        # 网络失败后的重试退避（秒）：避免高频 tick 每秒重打 gamma
+        self._retry_after = 0.0
 
     def _slug_for(self, symbol: str, window_start: int) -> str:
         return f"{symbol.lower()}-updown-{self.interval}-{window_start}"
@@ -64,10 +67,12 @@ class MarketDiscovery:
                 timeout=self._timeout,
             )
             r.raise_for_status()
-            return r.json()
+            data = r.json()
         except (requests.RequestException, ValueError):
-            # 网络失败/非 JSON 响应 → 优雅降级为空
-            return []
+            # 网络失败/非 JSON 响应：抛给 find_window 区分「未找到」与「查询失败」
+            # —— 失败的 None 若被缓存会永久否决整个窗口（9-03 全天市场不可交易的根因）
+            raise
+        return data if isinstance(data, list) else []
 
     @staticmethod
     def _parse_json_field(value) -> list:
@@ -94,11 +99,19 @@ class MarketDiscovery:
         """定位指定 15m 窗口的 Up/Down 市场；不存在/不可交易返回 None。
 
         require_tradable=False 时允许查询已结算（closed）市场——结算时使用。
+        查询失败（网络）不缓存：失败窗口下一 tick 自动重试，不会像 9-03 那样
+        因一次 SSL 失败把整个窗口负缓存死。测试注入桩返回 [] 仍按「未找到」缓存。
         """
         key = (symbol, window_start, require_tradable)
         if key in self._cache:
             return self._cache[key]
-        result = self._fetch_window(symbol, window_start, require_tradable)
+        if time.monotonic() < self._retry_after:
+            return None  # 网络失败退避期内不再重打 gamma
+        try:
+            result = self._fetch_window(symbol, window_start, require_tradable)
+        except (requests.RequestException, ValueError):
+            self._retry_after = time.monotonic() + 30.0
+            return None
         self._cache[key] = result
         return result
 

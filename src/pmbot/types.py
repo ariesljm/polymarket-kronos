@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TypedDict
+from typing import Callable, TypedDict
 
 
 class Direction(str, Enum):
@@ -21,6 +21,9 @@ class SignalContext(TypedDict, total=False):
     """Strategy.generate_signal 的上下文入参（键均为可选，策略自行兜底）。"""
 
     now_ms: int
+    # 盘口查询：方向 → 最优卖一价（ask）。cheap-side 需要比较两方向报价选低者；
+    # 其余策略（Kronos）没用到此键，不需改。
+    best_ask: Callable[[Direction], float | None]
 
 
 @dataclass(frozen=True)

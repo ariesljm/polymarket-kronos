@@ -13,7 +13,7 @@ import yaml
 
 from pmbot.variant_map import DEFAULT_VARIANT, VARIANT_CONTEXT
 
-KNOWN_STRATEGIES = ("kronos",)
+KNOWN_STRATEGIES = ("kronos", "cheap_side")
 
 DEFAULTS: dict = {
     "symbols": ["BTC"],
@@ -26,6 +26,9 @@ DEFAULTS: dict = {
     "open_delay_sec": 0,          # 市场开始后 N 秒内不开仓（观察早期波动；0 = 关闭）
     "contradiction_skip_pct": 0.0,  # 方向一致性过滤：信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
     "max_entry_price": 0.0,      # 入场价上限：盘口 ask 高于此价不入场（追高无意义；0 = 关闭）
+    "min_entry_price": 0.0,      # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 档历史净亏；0 = 关闭）
+    "taker_fee_pct": 0.0,        # dry-run 模拟 taker 手续费率（按成交金额，买卖各一次；实盘 pnl=余额差已含费）
+    "entry_price_threshold": 0.35,  # cheap-side：只买 ask ≤ 此价的方向（盘口审计低估带）
     "take_profit": 0.30,
     "take_profit_max": 0.95,
     "stop_loss": 0.20,
@@ -56,7 +59,9 @@ class EngineConfig:
     no_entry_before_end_sec: int = 0
     open_delay_sec: int = 0
     contradiction_skip_pct: float = 0.0  # 信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
-    max_entry_price: float = 0.0  # 入场价上限：盘口 ask 高于此价不入场（0 = 关闭)
+    max_entry_price: float = 0.0  # 入场价上限：盘口 ask 高于此价不入场（0 = 关闭）
+    min_entry_price: float = 0.0  # 入场价下限：盘口 ask 低于此价不入场（0 = 关闭）
+    taker_fee_pct: float = 0.0    # dry-run 模拟 taker 手续费率（按成交金额，买卖各一次；实盘 pnl=余额差已含费）
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,8 @@ class StrategyConfig:
     max_klines: int = 2048  # 跟随 mini 上下文（显式覆盖见 Config.to_strategy_config）
     market_interval: str = "15m"
     thresholds: dict | None = None
+    # cheap-side：只买 ask ≤ 该价的方向（市场定价滞后低估带）；kronos 不用
+    entry_price_threshold: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,12 @@ class Config:
     contradiction_skip_pct: float = 0.0
     # 入场价上限：盘口 ask 高于此价不入场（追高无意义；0 = 关闭）
     max_entry_price: float = 0.0
+    # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 档历史净亏；0 = 关闭）
+    min_entry_price: float = 0.0
+    # dry-run 模拟 taker 手续费率（按成交金额，买卖各一次；实盘 pnl=余额差已含费）
+    taker_fee_pct: float = 0.0
+    # cheap-side 策略门槛：只买 ask ≤ 此价的方向（基于盘口审计的低估带；kronos 忽略）
+    entry_price_threshold: float = 0.35
 
     def to_engine_config(self) -> EngineConfig:
         return EngineConfig(
@@ -115,6 +128,8 @@ class Config:
             open_delay_sec=self.open_delay_sec,
             contradiction_skip_pct=self.contradiction_skip_pct,
             max_entry_price=self.max_entry_price,
+            min_entry_price=self.min_entry_price,
+            taker_fee_pct=self.taker_fee_pct,
         )
 
     def to_strategy_config(self) -> StrategyConfig:
@@ -124,6 +139,7 @@ class Config:
             max_klines=self.max_klines,
             market_interval=self.market_interval,
             thresholds={"p_up_buy": self.p_up_buy, "p_down_buy": self.p_down_buy},
+            entry_price_threshold=self.entry_price_threshold,
         )
 
 
@@ -200,6 +216,23 @@ def load_config(path: str | Path) -> Config:
     if mep < 0:
         raise ConfigError("max_entry_price 必须 ≥ 0（0 表示关闭入场价上限）")
 
+    miep = _as_float(s.get("min_entry_price", DEFAULTS["min_entry_price"]),
+                     "min_entry_price")
+    if miep < 0:
+        raise ConfigError("min_entry_price 必须 ≥ 0（0 表示关闭入场价下限）")
+    if 0 < miep and 0 < mep and miep >= mep:
+        raise ConfigError("min_entry_price 必须 < max_entry_price")
+
+    tfp = _as_float(s.get("taker_fee_pct", DEFAULTS["taker_fee_pct"]),
+                    "taker_fee_pct")
+    if not (0 <= tfp < 1):
+        raise ConfigError("taker_fee_pct 必须在 [0,1) 之间（0 表示不模拟手续费）")
+
+    ept = _as_float(s.get("entry_price_threshold", DEFAULTS["entry_price_threshold"]),
+                    "entry_price_threshold")
+    if not (0 < ept < 1):
+        raise ConfigError("entry_price_threshold 必须在 (0,1) 之间")
+
     mcl = _as_int(s["max_consecutive_losses"], "max_consecutive_losses")
     mdl = _as_float(s["max_daily_loss"], "max_daily_loss")
     if mcl <= 0 or mdl <= 0:
@@ -241,6 +274,9 @@ def load_config(path: str | Path) -> Config:
         sample_count=sample_count,
         contradiction_skip_pct=csp,
         max_entry_price=mep,
+        min_entry_price=miep,
+        taker_fee_pct=tfp,
+        entry_price_threshold=ept,
     )
 
 

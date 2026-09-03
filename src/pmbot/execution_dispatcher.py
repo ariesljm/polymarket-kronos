@@ -49,6 +49,7 @@ class ExecutionDispatcher:
         dry_run: bool,
         step_sec: int,
         save_status,
+        taker_fee_pct: float = 0.0,
     ):
         # state 可传 TradeState 实例或 () -> TradeState；统一收敛为 getter：
         # 每次 self.state 都取当前对象，reset 重建状态无需手工同步。
@@ -61,6 +62,7 @@ class ExecutionDispatcher:
         self.dry_run = dry_run
         self.step_sec = step_sec
         self._save = save_status
+        self.taker_fee_pct = taker_fee_pct
 
     @property
     def state(self) -> TradeState:
@@ -203,6 +205,13 @@ class ExecutionDispatcher:
         pnl = None
         if proceeds is not None:
             pnl = proceeds - pos.size * pos.entry_price
+        elif self.dry_run and self.taker_fee_pct > 0:
+            # dry-run 模拟 taker 手续费（实盘 pnl=余额差已含费，此处对齐口径）：
+            # 买入成本 = 份额×入场价×(1+fee)，卖出收入 = 份额×平仓价×(1−fee)。
+            # entry/exit 保持纯成交价（与实盘统计口径一致），费用只体现在 pnl。
+            cost = pos.size * pos.entry_price * (1 + self.taker_fee_pct)
+            proceeds = pos.size * exit_price * (1 - self.taker_fee_pct)
+            pnl = proceeds - cost
         result = st.close_position(exit_price, actual_pnl=pnl, pos=pos)
         self._store.log_trade(
             st,

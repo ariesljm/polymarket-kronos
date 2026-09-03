@@ -99,6 +99,7 @@ class TradingLoop:
             dry_run=dry_run,
             step_sec=self.step_sec,
             save_status=self.save_status,
+            taker_fee_pct=self.config.taker_fee_pct,
         )
         # 结算状态机（持仓窗口结束后的结算等待/兑付）：深模块，规则独立可测。
         # 窄接口注入：市场查询（find_window/invalidate）+ 兑付查询 + 平仓/丢弃回调。
@@ -249,7 +250,11 @@ class TradingLoop:
         # 4. 市场发现（引擎级：市场不存在时窗口逻辑整体跳过）
         market = self.discovery.find_current_window(self.symbol, now_ms)
         if market is None:
-            logger.info("窗口 %d 市场不可交易/未找到，跳过", new_window)
+            # 市场未创建/不可交易的日志节流：窗口未开始时常持续数分钟，
+            # 每秒刷屏无信息量（此前日志全被该噪声淹没）
+            if now_ms >= getattr(self, "_market_na_log_until_ms", 0):
+                logger.info("窗口 %d 市场不可交易/未找到，跳过（节流 60s）", new_window)
+                self._market_na_log_until_ms = now_ms + 60_000
             self.save_status()
             return
 

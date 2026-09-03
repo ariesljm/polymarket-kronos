@@ -136,6 +136,10 @@ def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
     # 无报价（None）不拦——执行层缺报价本就放弃建仓。
     if config.max_entry_price > 0 and best_ask is not None and best_ask > config.max_entry_price:
         return Action(ActionType.SKIP, reason="entry_price_cap")
+    # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 五五开档历史净亏 -2.52/31 笔，
+    # 该档位无信息优势且买卖价差双向吞噬；0 = 关闭）。
+    if config.min_entry_price > 0 and best_ask is not None and best_ask < config.min_entry_price:
+        return Action(ActionType.SKIP, reason="entry_price_floor")
     # 市价入场：预测后立即按 1 USDC 目标买入（份额=金额/盘口价，可小数，无 5 股限制）
     if signal.direction is Direction.UP and signal.p_up > config.p_up_buy:
         return Action(ActionType.PLACE_MARKET, direction=Direction.UP, amount=config.amount_per_trade)

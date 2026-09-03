@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import math
+import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,40 @@ class Stats:
     span_days: float
     n_windows: int
     accuracy: dict
+    mean_pnl: float = 0.0       # 每笔均值
+    t_stat: float = 0.0         # 均值 t 统计量（H0: 期望=0；|t|≥1.96 才与噪声可区分）
+    ci_low: float = 0.0         # 均值 95% 置信区间下界
+    ci_high: float = 0.0        # 均值 95% 置信区间上界
+    win_rate_z: float = 0.0     # 胜率 z 统计量（H0: 胜率=50%；|z|≥1.96 才显著）
+
+
+def significance_stats(pnls: list[float]) -> dict:
+    """盈亏序列的显著性指标（单一事实源）：每笔均值 / t / 95% CI / 胜率 z。
+
+    依据：124 笔累计 +9.12 但 t≈1.0（95% CI 跨 0）——笔数门槛（200）之外
+    还需边际显著，否则把噪声波动当优势上实盘。|t|<1.96 且 |z|<1.96 时
+    报告中给出明确警示。
+    """
+    n = len(pnls)
+    out = {"mean_pnl": 0.0, "t_stat": 0.0, "ci_low": 0.0, "ci_high": 0.0, "win_rate_z": 0.0}
+    if n < 2:
+        return out
+    mean = statistics.fmean(pnls)
+    stdev = statistics.stdev(pnls)
+    se = stdev / math.sqrt(n)
+    out["mean_pnl"] = mean
+    if se == 0.0:
+        # 常数序列（每笔盈亏相同）：样本确定性，t 趋于无穷（报告显示 inf 即完全确定）
+        out["t_stat"] = float("inf") if mean > 0 else (float("-inf") if mean < 0 else 0.0)
+        out["ci_low"] = out["ci_high"] = mean
+    else:
+        out["t_stat"] = mean / se
+        out["ci_low"] = mean - 1.96 * se
+        out["ci_high"] = mean + 1.96 * se
+    wins = sum(1 for p in pnls if p > 0)
+    p = wins / n
+    out["win_rate_z"] = (p - 0.5) / math.sqrt(0.25 / n)
+    return out
 
 
 def aggregate(records, match=None) -> dict:
@@ -74,6 +110,7 @@ def compute_stats(records: list[dict], accuracy: dict) -> Stats:
     total_pnl = ag["pnl"]
     total_cost = sum(r.entry_price * r.size for r in records)
     n_windows = len({r.window_start for r in records})
+    sig = significance_stats([r.pnl for r in records])
 
     span_days = 0.0
     try:
@@ -93,6 +130,11 @@ def compute_stats(records: list[dict], accuracy: dict) -> Stats:
         span_days=span_days,
         n_windows=n_windows,
         accuracy=accuracy,
+        mean_pnl=sig["mean_pnl"],
+        t_stat=sig["t_stat"],
+        ci_low=sig["ci_low"],
+        ci_high=sig["ci_high"],
+        win_rate_z=sig["win_rate_z"],
     )
 
 
@@ -115,6 +157,14 @@ def write_report(
     done = is_validation_done(stats, min_trades, min_days)
     acc = stats.accuracy
     acc_text = f"{acc['accuracy']:.1%}（{acc['correct']}/{acc['total']}）" if acc["total"] else "—（暂无评估样本）"
+    sig_text = (
+        f"每笔均值 {stats.mean_pnl:+.4f}（t={stats.t_stat:.2f}，95% CI "
+        f"[{stats.ci_low:+.3f}, {stats.ci_high:+.3f}]，胜率 z={stats.win_rate_z:.2f}）"
+    )
+    # 显著性警示：|t| / |z| 均 < 1.96 时利润与掷硬币不可区分（历史 124 笔实证）
+    sig_warn = ""
+    if stats.total_trades >= 30 and abs(stats.t_stat) < 1.96 and abs(stats.win_rate_z) < 1.96:
+        sig_warn = "⚠️ 边际不显著：盈亏与噪声不可区分，未达上实盘的标准（|t| 与 |z| 均 < 1.96）"
     lines = [
         "# 验证报告",
         "",
@@ -126,7 +176,9 @@ def write_report(
         f"- 时间跨度: {stats.span_days:.1f} 天",
         f"- **胜率: {stats.win_rate:.1%}**",
         f"- **ROI: {stats.roi:.2%}**（总盈亏 {stats.total_pnl:+.2f} / 总投入 {stats.total_cost:.2f}）",
+        f"- **显著性: {sig_text}**",
         f"- **Kronos 方向准确率: {acc_text}**（与交易盈亏解耦）",
+        f"- {sig_warn}" if sig_warn else "",
         "",
         f"**验证状态: {'✅ 达到门槛' if done else '⏳ 未达门槛'}"
         f"（{stats.total_trades}/{min_trades} 笔，{stats.span_days:.1f}/{min_days} 天）**",

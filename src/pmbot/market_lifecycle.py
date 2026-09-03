@@ -36,9 +36,11 @@ class Phase(Enum):
 
 
 class CancelExecutor(Protocol):
-    """执行器的最小能力：撤单（TradingLoop 隐式实现，测试可注入 fake）。"""
+    """执行器的最小能力：撤单 + 盘口询价（cheap-side 策略信号阶段用；TradingLoop 隐式实现）。"""
 
     def cancel(self, order_id: str) -> bool: ...
+
+    def best_ask(self, token_id: str, size: float = 5.0) -> float | None: ...
 
 
 class LifecycleDeps(Protocol):
@@ -86,7 +88,12 @@ class MarketLifecycle:
             st.predict_start_sec = now_sec
             self.deps.save_status()  # 推理开始即落盘（面板可实时显示）
             try:
-                st.signal = self.deps.strategy.generate_signal({"now_ms": now_sec * 1000})
+                # 信号上下文注入盘口询价（方向 → 最优卖一价）：cheap-side 策略
+                # 在信号生成阶段比较两方向报价决定方向；Kronos 无需该键，忽略即可。
+                best_ask = lambda d: self.deps.executor.best_ask(token_for(market, d))  # noqa: E731
+                st.signal = self.deps.strategy.generate_signal(
+                    {"now_ms": now_sec * 1000, "best_ask": best_ask}
+                )
             finally:
                 st.predicting = False
                 st.last_predict_sec = now_sec

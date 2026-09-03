@@ -31,6 +31,9 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # 降噪：httpx/py_clob 每 tick 刷屏的请求日志提升到 WARNING（曾占满日志 90%+）
+    for noisy in ("httpx", "py_clob_client_v2.http_helpers.helpers", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # 依赖集中导入（函数内：入口模块冷启动不加载重型依赖链）
     from pmbot.book_sampler import BookSampler

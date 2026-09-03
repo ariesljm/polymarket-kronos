@@ -154,3 +154,35 @@ def test_aggregate_skips_bad_rows():
                     entry_price=0.5, exit_price=0.6, size=5.0, pnl=0.5, reason="settle"),
     ]
     assert aggregate(rows, match=today_only)["n"] == 1
+
+
+def test_significance_detects_pnl_edge():
+    """显著性统计:恒定正盈序列 t/z 显著,恒定平局不显著,随机序列 CI 跨零。"""
+    from pmbot.stats import significance_stats, compute_stats
+    from pmbot.ledger import TradeRecord
+
+    # 恒定小正盈(t 大但均值小) → 显著
+    s1 = significance_stats([0.1] * 50)
+    assert s1["t_stat"] > 10
+    assert s1["ci_low"] > 0
+
+    # 交替正负 → 均值≈0 不显著
+    s2 = significance_stats([0.1, -0.1] * 25)
+    assert abs(s2["t_stat"]) < 0.5
+    assert s2["ci_low"] < 0 < s2["ci_high"]
+
+    # 全 +1 胜率 100% → 胜率 z 显著为正
+    s3 = significance_stats([1.0] * 50)
+    assert s3["win_rate_z"] > 3
+
+    # 无样本/单样本 → 默认零值(防除零)
+    assert significance_stats([])["t_stat"] == 0.0
+    assert significance_stats([1.0])["t_stat"] == 0.0
+
+    # compute_stats 路径打通(字段透传)
+    recs = [TradeRecord(ts="2026-08-14T00:00:00+00:00", window_start=1, symbol="BC", direction="up",
+                        entry_price=0.5, exit_price=0.6, size=5.0, pnl=0.1, reason="settle")] * 50
+    st = compute_stats(recs, accuracy={"correct": 0, "total": 0, "accuracy": 0.0})
+    assert st.t_stat > 10
+    assert st.ci_low > 0
+    assert st.win_rate_z > 3
