@@ -102,13 +102,14 @@ def _parse_spot(strategy_state: str | None) -> tuple[float, float] | None:
     return base * (1 + dev / 100), dev
 
 
-def _sparkline(seq: list[float]) -> str:
-    """价格轨迹 → 7 级字符图（▁▂▃▄▅▆▇█）。"""
-    if len(seq) < 2:
+def _sparkline(seq: list) -> str:
+    """价格轨迹 → 7 级字符图（▁▂▃▄▅▆▇█）。None 值（盘口半边清空）跳过。"""
+    vals = [x for x in seq if x is not None]
+    if len(vals) < 2:
         return ""
-    lo, hi = min(seq), max(seq)
+    lo, hi = min(vals), max(vals)
     span = hi - lo or 1
-    return "".join(_SPARK[min(7, int((x - lo) / span * 7))] for x in seq)
+    return "".join(_SPARK[min(7, int((x - lo) / span * 7))] for x in vals)
 
 
 def _read_book(data_dir: str | Path) -> dict:
@@ -212,7 +213,9 @@ def _symbol_block(v: PanelView, online: bool, trail: deque, threshold: float) ->
 
     lines = [head, Group(probs, info)]
     if len(trail) >= 2:
-        lines.append(Text(f"  {_sparkline(list(trail))} (近4分钟)", style="dim"))
+        sp = _sparkline(list(trail))
+        if sp:
+            lines.append(Text(f"  {sp} (近4分钟)", style="dim"))
 
     if v.paused:
         lines.append(Text(f"  ⚠ 已暂停: {v.pause_reason or '熔断'}", style="bold red"))
@@ -362,8 +365,9 @@ def main(argv: list[str] | None = None) -> int:
 
             for d in dirs:
                 book = _read_book(ROOT / d)
-                if "up_ask" in book:
-                    trails[d].append(book["up_ask"])
+                ask = book.get("up_ask")
+                if ask is not None:
+                    trails[d].append(ask)
 
             body = Group(
                 _title_bar(views, mode),
