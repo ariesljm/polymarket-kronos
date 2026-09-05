@@ -1,7 +1,7 @@
 """终端监控面板（只读 TUI）：并行于主循环，每 2 秒刷新运行状态。
 
 用法: uv run python -m pmbot.monitor [--status data/status.json]
-数据只读自 status.json / trades.csv / PredictionLog，不改主循环。
+数据只读自 status.json / trades.csv，不改主循环。
 
 展示逻辑（build_view / render / PanelView / PanelConfig）见 panel_view.py；
 实时价轮询见 spot_price.py；本模块只负责 CLI 入口与 TUI 渲染循环。

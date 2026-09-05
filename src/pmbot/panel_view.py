@@ -1,4 +1,4 @@
-"""展示视图构建：从 TradeState / trades / PredictionLog 构建 PanelView。
+"""展示视图构建：从 TradeState / trades 构建 PanelView。
 
 从 monitor.py 提取的展示逻辑深模块：build_view（纯函数）+ PanelView（类型化视图）
 + render（纯文本渲染）+ _build_live_view（数据加载与视图编排）。
@@ -70,8 +70,8 @@ class PanelView:
     today_stats: dict | None = None
     recent_trades: list = field(default_factory=list)
     recent_stats: dict | None = None
-    accuracy: dict | None = None
     model_variant: str = "—"
+    strategy_state: str | None = None  # 策略专属状态文案（momentum 基准/偏离等）
     last_predict_sec: int | None = None
     predicting: bool = False
     predict_start_sec: int | None = None
@@ -137,10 +137,9 @@ def _fmt_uptime(sec: int | None) -> str:
 
 # ---- build_view 内部填充 ----
 
-def _view_defaults(accuracy, model_variant, tp_sl, uptime_sec, now_sec, config_summary) -> PanelView:
+def _view_defaults(model_variant, tp_sl, uptime_sec, now_sec, config_summary) -> PanelView:
     """视图默认值（build_view 入口骨架）。"""
     return PanelView(
-        accuracy=accuracy,
         model_variant=model_variant,
         tp_sl=tp_sl,
         uptime_sec=uptime_sec,
@@ -203,15 +202,15 @@ def _fill_trades(v: PanelView, trades: list, today: str, tz,
 
 # ---- 公开入口 ----
 
-def build_view(status: TradeState | None, trades: list, accuracy: dict | None,
+def build_view(status: TradeState | None, trades: list,
                now_sec: int, today: str | None = None, local_tz=None,
                panel: PanelConfig | None = None, recent_limit: int | None = RECENT_LIMIT) -> PanelView:
-    """从 TradeState / trades / PredictionLog 构建视图数据（纯函数）。"""
+    """从 TradeState / trades 构建视图数据（纯函数）。"""
     today = today or _today_local()
     tz = local_tz
     panel = panel or PanelConfig()
     th = panel.thresholds or {"p_up_buy": 0.60, "p_down_buy": 0.40}
-    v = _view_defaults(accuracy, panel.model_variant, panel.tp_sl, panel.uptime_sec,
+    v = _view_defaults(panel.model_variant, panel.tp_sl, panel.uptime_sec,
                        now_sec, panel.config_summary)
     if status:
         v.symbol = status.symbol
@@ -263,6 +262,7 @@ def build_view(status: TradeState | None, trades: list, accuracy: dict | None,
         v.predicting = bool(status.predicting)
         v.predict_start_sec = status.predict_start_sec
         v.prices = status.market_prices
+        v.strategy_state = getattr(status, "strategy_state", None)
         if status.skip_until_sec and status.skip_until_sec > now_sec:
             v.startup_wait_sec = status.skip_until_sec - now_sec
         v.live_positions = status.live_positions or []
@@ -286,16 +286,22 @@ def render(v: PanelView) -> str:
     lines.append(
         f"标的: {v.symbol}    暂停: {'⚠️ 是（' + v.pause_reason + '）' if v.paused and v.pause_reason else ('⚠️ 是' if v.paused else '否')}"
     )
-    if v.predicting:
-        secs = v.now_sec - v.predict_start_sec if v.predict_start_sec else 0
-        kronos_state = f"🔄 推理中（已 {max(0, secs)} 秒）"
-    else:
-        inferred = v.last_predict_sec or v.signal is not None
-        kronos_state = "✅ 已推理" if inferred else "⏳ 等待首次推理"
-    lines.append(f"模型: {v.model_variant}    Kronos: {kronos_state}")
-    if v.last_predict_sec:
-        t = datetime.fromtimestamp(v.last_predict_sec, tz=timezone.utc).astimezone(None)
-        lines.append(f"上次预测: {t:%m-%d %H:%M:%S}（本地）")
+    # 模型/推理状态块：有模型时显示模型名；推理中/已推理状态独立显示
+    # （momentum 等无模型策略：model_variant="—" 且永不 predicting → 本块跳过，只显示 strategy_state）
+    if v.model_variant != "—" or v.predicting or v.last_predict_sec or v.signal is not None:
+        model_name = f"模型: {v.model_variant}   " if v.model_variant != "—" else ""
+        if v.predicting:
+            secs = v.now_sec - v.predict_start_sec if v.predict_start_sec else 0
+            model_state = f"🔄 推理中（已 {max(0, secs)} 秒）"
+        else:
+            inferred = v.last_predict_sec or v.signal is not None
+            model_state = "✅ 已推理" if inferred else "⏳ 等待首次推理"
+        lines.append(f"{model_name}{model_state}")
+        if v.last_predict_sec and v.model_variant != "—":
+            t = datetime.fromtimestamp(v.last_predict_sec, tz=timezone.utc).astimezone(None)
+            lines.append(f"上次预测: {t:%m-%d %H:%M:%S}（本地）")
+    if v.strategy_state:
+        lines.append(v.strategy_state)
     lines.append(f"当前窗口: {v.window_label}")
     prices = v.prices
     if prices:
@@ -375,11 +381,6 @@ def render(v: PanelView) -> str:
             )
     else:
         lines.append("  （暂无）")
-    acc = v.accuracy
-    if acc and acc["total"]:
-        lines.append(f"方向准确率: {acc['accuracy']:.1%} ({acc['correct']}/{acc['total']})")
-    else:
-        lines.append("方向准确率: —（暂无评估样本）")
     lines.append(f"运行时长 {_fmt_uptime(v.uptime_sec)}")
     bal = v.balance
     lines.append(f"钱包余额: {bal if bal is not None else '—'} USDC")
@@ -412,7 +413,6 @@ def build_live_view(symbol: str | None, config: str, paths,
 
     symbol = symbol or (st.symbol if st else None)
     from pmbot.config import load_config
-    from pmbot.prediction_log import PredictionLog
 
     model_variant = "—"
     thresholds = None
@@ -421,23 +421,31 @@ def build_live_view(symbol: str | None, config: str, paths,
     tp_sl = None
     try:
         cfg = load_config(config)
-        model_variant = cfg.model_variant
         thresholds = {"p_up_buy": cfg.p_up_buy, "p_down_buy": cfg.p_down_buy}
         window_seconds = step_ms_for(cfg.market_interval) // 1000
         tp_sl = {"pct": cfg.take_profit, "max": cfg.take_profit_max, "sl": cfg.stop_loss}
-        config_summary = (
-            f"{cfg.strategy} | {','.join(cfg.symbols)} | {cfg.market_interval} | "
-            f"注{cfg.amount_per_trade} | P(up)≥{cfg.p_up_buy} | "
-            f"止盈+{cfg.take_profit * 100:.0f}%（封顶{cfg.take_profit_max:.2f}） | "
-            f"止损-{cfg.stop_loss * 100:.0f}% | 亏损离场{cfg.exit_loss_before_end_sec}s | "
-            f"盈利持有{cfg.hold_until_end_sec}s | 禁入{cfg.no_entry_before_end_sec}s | "
-            f"开仓延迟{cfg.open_delay_sec}s | "
-            f"连亏熔断{cfg.max_consecutive_losses} | 日亏熔断{cfg.max_daily_loss}"
-        )
+        if cfg.strategy == "momentum":
+            config_summary = (
+                f"{cfg.strategy} | {','.join(cfg.symbols)} | {cfg.market_interval} | "
+                f"注{cfg.amount_per_trade} | 穿越±{cfg.threshold_pct}% | "
+                f"止盈+{cfg.take_profit * 100:.0f}%（封顶{cfg.take_profit_max:.2f}） | "
+                f"止损-{cfg.stop_loss * 100:.0f}% | 盈利持有{cfg.hold_until_end_sec}s | "
+                f"禁入{cfg.no_entry_before_end_sec}s | 开仓延迟{cfg.open_delay_sec}s | "
+                f"连亏熔断{cfg.max_consecutive_losses} | 日亏熔断{cfg.max_daily_loss}"
+            )
+        else:
+            config_summary = (
+                f"{cfg.strategy} | {','.join(cfg.symbols)} | {cfg.market_interval} | "
+                f"注{cfg.amount_per_trade} | P(up)≥{cfg.p_up_buy} | "
+                f"止盈+{cfg.take_profit * 100:.0f}%（封顶{cfg.take_profit_max:.2f}） | "
+                f"止损-{cfg.stop_loss * 100:.0f}% | 亏损离场{cfg.exit_loss_before_end_sec}s | "
+                f"盈利持有{cfg.hold_until_end_sec}s | 禁入{cfg.no_entry_before_end_sec}s | "
+                f"开仓延迟{cfg.open_delay_sec}s | "
+                f"连亏熔断{cfg.max_consecutive_losses} | 日亏熔断{cfg.max_daily_loss}"
+            )
     except Exception:
         pass
-    acc = PredictionLog(paths.log_dir, symbol).accuracy() if symbol else None
-    v = build_view(st, trades, acc, now_sec=int(time.time()),
+    v = build_view(st, trades, now_sec=int(time.time()),
                    panel=PanelConfig(
                        model_variant=model_variant, thresholds=thresholds,
                        window_seconds=window_seconds, config_summary=config_summary,
@@ -445,3 +453,16 @@ def build_live_view(symbol: str | None, config: str, paths,
                    recent_limit=recent_limit)
     v.mode = paths.mode  # 面板数据来源模式（防混淆）
     return v
+
+
+def build_multi_view(path_configs: list["RuntimePaths"], config: str,
+                     recent_limit: int | None = RECENT_LIMIT) -> list[PanelView]:
+    """多标的聚合视图：每 data_dir 一个 build_live_view（monitor 与 multi_panel 共用）。
+
+    path_configs: 各标的的 RuntimePaths（模式感知由调用方统一定——路径派生单一
+    事实源在 RuntimePaths，聚合面板不再自行硬编码 mode/目录）。
+    """
+    return [
+        build_live_view(symbol=None, config=config, paths=p, recent_limit=recent_limit)
+        for p in path_configs
+    ]

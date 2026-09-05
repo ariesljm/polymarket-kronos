@@ -364,24 +364,6 @@ def test_update_snapshot_and_age():
     assert s.snapshot_age("tok-a") >= 0.0  # 刚更新：年龄 ≈ 0
 
 
-def test_light_price_event_parses_best_bid_ask():
-    """轻量事件 best_bid_ask：记录轻量价 + 事件流心跳（无快照也不报错）。"""
-    from pmbot.book_sampler import BookSampler
-
-    s = BookSampler()
-    s._apply_light_event({
-        "event_type": "best_bid_ask", "asset_id": "tok-a",
-        "best_bid": "0.61", "best_ask": "0.62",
-    })
-    # asset（非 asset_id）字段也容错
-    s._apply_light_event({
-        "event_type": "last_trade_price", "asset": "tok-b", "last_trade_price": "0.50",
-    })
-    lp = s.light_price("tok-a")
-    assert lp is not None and lp["best_bid"] == 0.61 and lp["best_ask"] == 0.62
-    assert s.light_price("tok-b")["last_trade_price"] == 0.50
-    assert s.light_price("missing") is None
-
 
 def test_light_event_touches_snapshot_freshness():
     """轻量事件刷新快照新鲜度：陈旧的快照被判定为新鲜（事件流仍活着）。"""

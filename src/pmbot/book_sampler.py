@@ -32,9 +32,6 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 # 最坏 ~1.5s 新鲜（REST 兜底 1s），避免 10s tick + 陈旧快照叠加的漏触发。
 STALE_AGE_SEC = 1.0
 
-# 轻量事件也用到的价格字段（best_bid_ask / last_trade_price 事件，格式容错）
-_LIGHT_PRICE_FIELDS = ("best_bid", "best_ask", "last_trade_price")
-
 # REST 兜底失败退避（秒）：指数增长，上限 RETRY_MAX。市场已结算/无订单簿（404）
 # 与网络抖动都收敛到低频重试，避免断线/空转期间每秒刷屏（见 _rest_fallback）。
 RETRY_BASE = 1.0
@@ -77,8 +74,6 @@ class BookSampler(ReconnectingWsThread):
         # 实证：本环境代理隧道对 WS 高流量下行在 ~3-5s 内必断（见诊断），WS 可用率低，
         # REST 兜底是决策价的时效主力，1s 一轮把最坏年龄压在 ~1.5s。
         self.disconnect_poll_sec = min(interval, 1.0)
-        self.ws_url = ws_url
-        self._proxy = proxy
         self._tokens: set[str] = set()
         self._snapshots: dict[str, dict] = {}
         # 每个 token 快照的最后更新时间（monotonic 秒；与 _snapshots 同锁保护）——
@@ -88,7 +83,6 @@ class BookSampler(ReconnectingWsThread):
         self._retry_after: dict[str, float] = {}
         self._retry_backoff: dict[str, float] = {}
         self._direction_map: dict[str, str] = {}  # token_id -> up/down
-        self._light_prices: dict[str, dict] = {}  # token_id -> 轻量事件价（D：best_bid_ask/last_trade_price）
         self._last_subscribed: set[str] = set()  # 已发送给服务端的订阅集合（WS 线程读写）
         self._book_path = Path(book_path) if book_path else None
         self._book_flush_sec = book_flush_sec
@@ -148,16 +142,6 @@ class BookSampler(ReconnectingWsThread):
         with self._lock:
             self._snapshots[token_id] = book
             self._snapshot_ts[token_id] = time.monotonic()
-
-    def light_price(self, token_id: str) -> dict | None:
-        """轻量事件价（best_bid_ask / last_trade_price 事件，格式容错）。
-
-        仅作事件流心跳与展示参考，不参与交易决策价（决策价始终用
-        完整深度加权价，保持免疫垃圾挂单语义）。
-        """
-        with self._lock:
-            p = self._light_prices.get(token_id)
-            return dict(p) if p else None
 
     def _push_update(self) -> None:
         """订阅集合变化且 WS 连接中：推送官方 update 消息动态增删，避免等重连。"""
@@ -322,23 +306,11 @@ class BookSampler(ReconnectingWsThread):
                 self._snapshot_ts[asset_id] = time.monotonic()
 
     def _apply_light_event(self, data: dict) -> None:
-        """轻量行情事件（best_bid_ask / last_trade_price）：心跳 + 轻量价存储（格式容错）。"""
+        """轻量行情事件（best_bid_ask / last_trade_price）：仅作事件流心跳（_touch 刷新新鲜度）。"""
         asset_id = data.get("asset_id") or data.get("asset")
         if not asset_id:
             return
         self._touch(asset_id)
-        prices = {}
-        for f in _LIGHT_PRICE_FIELDS:
-            v = data.get(f)
-            if v is None:
-                continue
-            try:
-                prices[f] = float(v)
-            except (TypeError, ValueError):
-                pass
-        if prices:
-            with self._lock:
-                self._light_prices[asset_id] = {"ts": time.time(), **prices}
 
     def _touch(self, asset_id: str) -> None:
         """刷新 token 的新鲜度时间戳（轻量事件证明事件流仍活着）。"""

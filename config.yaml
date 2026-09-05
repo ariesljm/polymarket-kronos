@@ -1,58 +1,43 @@
-# pmbot 配置文件 —— 所有策略参数集中在此，改参数无需改代码
+# ============================================================
+# polymarket-kronos 交易框架 —— 唯一配置源（config.py 读取）
+#
+# 【切换策略】只改顶层 strategy 字段 + 重启：
+#   strategy: momentum        # 当前内置策略
+#
+# 【新增策略】三步，无需改引擎/执行层代码：
+#   1) src/pmbot/strategies/ 写策略类继承 Strategy + @register("名字")
+#   2) strategies/__init__.py 加一行 import（触发注册）
+#   3) config.yaml 加「名字: {...}」分节放策略专属参数（覆盖下方通用默认）
+#   策略构造收到 StrategyConfig（market_interval / threshold_pct），
+#   其余参数从自己分节读或由引擎层（EngineConfig）消费。
+#
+# 【多标的并行】每个标的一个进程（--symbol 覆盖 symbols[0]）：
+#   uv run python -m pmbot.run --symbol BTC --data-dir data_btc --poll 2
+#   数据/pid/日志按 data_dir 隔离；聚合面板: uv run python scripts/multi_panel.py
+# ============================================================
 
-strategy: cheap_side     # kronos（模型信号） / cheap_side（盘口低价低估带，实验）
-                         # 切换后读对应参数节（kronos: / cheap_side:），未写字段用默认值
+strategy: momentum     # 策略名（切换策略只改这一行）
 market_interval: 5m        # 市场/K线频率：5m / 15m / 1h（Polymarket slug 与窗口对齐随此）
 
-# kronos 策略参数（模型信号；cheap_side 未启用时不消费）
-kronos:
-  symbols: [BTC]
-  amount_per_trade: 1        # 每注金额（USDC）：市价买入按金额换算份额 = 1/盘口价，可小数
-                              # （市价单无 5 股限制；如盘口价 0.2 → 5 股 = 1 USDC）
-  p_up_buy: 0.6             # P(up) 高于此值买 Up；低于 1−此值（0.40）自动买 Down，无需另配
-                              # （0.55 → 0.60：标定显示 0.5-0.6 置信带准确率仅 45.5%，低于掷硬币）
-  cancel_before_end_sec: 60   # 挂单未成交时窗口结束前 N 秒撤单（当前市价模式不产生新挂单，仅兼容旧状态恢复）
-  exit_loss_before_end_sec: 60   # 窗口结束前 N 秒内浮亏 → 市价平仓离场（0 = 关闭）
-  hold_until_end_sec: 60         # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
-  no_entry_before_end_sec: 60  # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓；0 = 关闭）
-  open_delay_sec: 0          # 市场开始后 N 秒内不开仓（观察早期波动，避开开盘噪声信号；0-300，0 = 关闭）
-  contradiction_skip_pct: 0.0  # 方向一致性过滤：信号方向与 Binance 实时移动矛盾超此百分比（%）则跳过入场（0 = 关闭）
-                              # 暂不启用：5m 窗口标定显示实时移动几乎 <0.05%，阈值无区分度；机制就绪，待真实秒级数据积累后标定
-  min_entry_price: 0.0        # 入场价下限：盘口 ask 低于此价不入场（0 = 关闭）
-                              # 暂不启用，依据已更新：docs/reports/market_audit.md 盘口实证（498 候选）显示
-                              # 唯一显著正期望档是 down@0.2-0.3（144 笔，+1.19/笔，t=6.59）——低价档是 mainl 获利来源，
-                              # 设下限会砍掉它。真实出血点是 0.6+ 追高档（up@0.7-0.8 t=-8.19、down@0.6-0.7 t=-2.76），
-                              # 该由 max_entry_price 收紧处理，而非 min。
-  max_entry_price: 0.7        # 入场价上限：盘口 ask 高于此价不入场（0 = 关闭）
-                              # 审计建议收紧至 0.55-0.60（0.6+ 各方向档全部显著负/持平）；0.7 保留待 2 周录音复验后再定
-  taker_fee_pct: 0.03        # dry-run 模拟 taker 手续费率（按成交金额，买卖各一次；0 = 关闭）
-                              # 依据：CONTEXT 实测实盘 1 USDC 订单实际扣款 1.0301 ≈ 3%/边。实盘 pnl=余额差已含费，不受此参数影响。
-
-# cheap_side 策略参数（盘口低价低估带；依据 docs/reports/market_audit.md）
-cheap_side:
-  symbols: [BTC]
-  amount_per_trade: 1
-  entry_price_threshold: 0.35  # 只买 ask ≤ 此价的方向（0.2-0.3 档为审计唯一显著正期望带；
-                               # 方向选择 = up_ask vs down_ask 取低者，与模型无关）
-  max_entry_price: 0.7        # 兜底上限（策略门槛 0.35 已更紧，此处防配置误改）
-  take_profit: 0.7            # 与 kronos 一致的止盈/止损（低价档多数走结算，参数影响小）
-  take_profit_max: 0.95
-  stop_loss: 0.6
-  max_consecutive_losses: 5
-  max_daily_loss: 10
-  taker_fee_pct: 0.03         # 手续费模拟与 kronos 一致（评估必须扣费）
-  exit_loss_before_end_sec: 60
-  hold_until_end_sec: 60
-  no_entry_before_end_sec: 60
-  take_profit: 0.7          # 百分比止盈：入场价 +50% 卖出（如入场 0.50 → 0.75）
-  take_profit_max: 0.95      # 止盈封顶价：算出的止盈价 > 此值则按此价止盈（如入场 0.60 → 0.90；0.95 与 max_entry_price 配合保证止盈价恒高于入场价）
-  stop_loss: 0.6         # 百分比止损：入场价 -60% 卖出（0 = 关闭；如入场 0.50 → 0.20）
-  max_consecutive_losses: 5 # 连亏 N 笔熔断
-  max_daily_loss: 100         # 单日亏损 N USDC 熔断
-
-data:
-  # max_klines: 不显式配置时自动跟随 model.variant（mini=2048, small/base=512）
-
-model:
-  variant: kronos-base      # 模型变体：kronos-mini / kronos-small / kronos-base
-  sample_count: 100          # P(up) 采样次数（每次独立推理，取预测涨的占比；100 → 粒度 1%，方向更稳定）
+# ---------- momentum 策略（动量/Breakout：穿越阈值后同向入场） ----------
+# 研究依据：docs/reports/momentum_strategy.md —— 窗口内标的强动量
+# （穿越阈值后方向延续 72-97%，大样本 robust）；执行专注低价档：
+# 首日实证穿越后 Polymarket 秒级极化、taker 追高档 EV 负，
+# 低价档（0-0.65）全部正 EV → max_entry_price 0.65 拦截高追。
+momentum:
+  symbols: [BTC, ETH, SOL]   # 标的池（运行时每进程 --symbol X 取其一）
+  amount_per_trade: 1        # 每注金额（USDC）
+  threshold_pct: 0.08        # 穿越阈值 %%：Binance 相对窗口开盘偏离此值 → 同向入场
+                             # （5m 回测 EV +0.15~0.40/笔；0.05-0.10 均显著，0.08 平衡触发率与命中率）
+  take_profit: 0.95          # 实质持有到结算（赢收 1.0 输收 0，redeem 无费）
+  take_profit_max: 0.999     # 止盈封顶价：保证高入场价也不立即平仓（修复瞬时止盈 bug）
+  stop_loss: 0.0             # 关闭止损（动量持有到结算；极端反转由熔断兜底）
+  exit_loss_before_end_sec: 0   # 关闭浮亏离场（持有到结算，窗口末不卖）
+  hold_until_end_sec: 60     # 窗口结束前浮盈 → 持有到结算（默认开启）
+  no_entry_before_end_sec: 60   # 窗口结束前 60s 禁入（穿越太晚来不及结算）
+  open_delay_sec: 10         # 窗口开始 10s 后开始检测（避开开盘噪声）
+  max_entry_price: 0.65      # 入场价上限（首日实证：穿越后盘口秒级极化 ask 直接 0.9+，
+                             # taker 追单 EV 负——0.65 拦截高追，待真实入场价分布重估）
+  taker_fee_pct: 0.03        # dry-run 模拟 taker 手续费率（按成交金额；比真实费 1.7-2.5%% 保守）
+  max_consecutive_losses: 8  # 连亏 N 笔熔断
+  max_daily_loss: 20         # 单日亏损 N USDC 熔断

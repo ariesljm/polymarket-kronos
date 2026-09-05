@@ -45,14 +45,10 @@ class SpotTickerThread(ReconnectingWsThread):
 
     def __init__(self, symbol: str = "BTC", *, proxy: str | None = None,
                  fetch_ticker=None):
-        sym = symbol.lower().replace("/", "")
-        if not sym.endswith("usdt"):
-            sym += "usdt"
         super().__init__(name="spot-ticker", proxy=proxy)
         self.symbol = normalize_symbol(symbol)
-        self.ws_url = WS_URL_TMPL.format(sym=sym)
+        self.ws_url = WS_URL_TMPL.format(sym=self.symbol.lower())
         self._rest_url = REST_URL_TMPL.format(sym=self.symbol)
-        self._proxy = proxy  # REST 兜底也走环境代理（与调度一致）；WS 直连时传 None
         self._fetch = fetch_ticker or self._rest_fetch  # 测试注入点（同 BookSampler）
         self._lock = threading.Lock()
         self._price: float | None = None

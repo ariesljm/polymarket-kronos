@@ -100,6 +100,7 @@ class TradingLoop:
             step_sec=self.step_sec,
             save_status=self.save_status,
             taker_fee_pct=self.config.taker_fee_pct,
+            breaker_cfg=self.config.to_engine_config(),
         )
         # 结算状态机（持仓窗口结束后的结算等待/兑付）：深模块，规则独立可测。
         # 窄接口注入：市场查询（find_window/invalidate）+ 兑付查询 + 平仓/丢弃回调。
@@ -207,8 +208,9 @@ class TradingLoop:
         self.wallet_sync.reconcile(now_sec, st)
         self._drain_user_events()
 
-        # 1. 窗口结束后结算持仓（引擎级兜底，跨生命周期；见 _settle_expired）
-        self._settle_expired(now_sec)
+        # 1. 窗口结束后结算持仓（引擎级兜底，跨生命周期；显式 defer→advance 顺序）
+        self._defer_expired_position(now_sec)
+        self._advance_settlement(now_sec)
 
         # 2. 熔断/暂停：不交易（生命周期暂停推进，恢复后继续）
         if self._check_circuit_breaker(now_sec):
@@ -218,8 +220,9 @@ class TradingLoop:
         step = self.discovery.step_ms // 1000
         new_window = window_start_sec(now_ms // 1000, step)
         if st.window_start != new_window:
-            # 旧窗口持仓转待结算/推进结算（同上；窗口切换即旧窗口结束）
-            self._settle_expired(now_sec, defer_only=True)
+            # 旧窗口持仓转待结算（切换即旧窗口结束的权威信号，无条件 defer；
+            # 不重复推进 Settler——步骤1 已推进过同一 settle_pending）
+            self._defer_expired_position(now_sec, force=True)
             # 跨窗口遗留挂单先撤单（基于 state 判断，兼容预置旧挂单场景）
             if st.pending_order is not None:
                 self.trade.cancel(st.pending_order.order_id)
@@ -325,41 +328,34 @@ class TradingLoop:
         if self._lifecycle is not None:
             self._lifecycle.stop(now_sec)
             self._lifecycle = None
-        self._settle_expired(now_sec)
+        self._defer_expired_position(now_sec)
+        self._advance_settlement(now_sec)
         self.save_status()
         if self.history_sync is not None:
             self.history_sync.stop()
 
-    def _settle_expired(self, now_sec: int, *, defer_only: bool = False) -> None:
-        """窗口结束后持仓的结算兜底（引擎级关注点，tick×2 + shutdown 共用）。
+    def _defer_expired_position(self, now_sec: int, *, force: bool = False) -> None:
+        """窗口到期持仓 → 转待结算槽（幂等：无持仓即 no-op）。
 
-        活跃持仓已过窗口终点 → 先转待结算槽（释放 position，新窗口不阻塞开仓），
-        再把待结算仓交给 Settler 后台推进（等结算价/兑付），出结果后记账清空。
-        defer_only=True：窗口切换分支调用——切换本身即旧窗口结束的权威信号，
-        持仓无条件转待结算（state.window_start 与市场窗口错位时也正确）；
-        只 defer 不推进 Settler（步骤1 已推进过同一 settle_pending，
-        避免同 tick 重复查询；shutdown 语境传默认值走完整推进）。
+        force=True：窗口切换分支——切换本身即旧窗口结束的权威信号，无条件转
+        （state.window_start 与市场窗口错位时也正确）；正常路径按 window_ended_at
+        判定（省去 bool 双语义与同 tick 双调用顺序约定）。
         """
-        if defer_only:
-            # 窗口切换分支：切换本身即旧窗口结束的权威信号，无条件 defer；
-            # 不推进 Settler（步骤1 已推进过同一 settle_pending，避免同 tick 重复查询）
-            st = self.state
-            if st.position is not None:
-                st.defer_to_settle()
-                sp = st.settle_pending
-                logger.info(
-                    "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
-                    sp.window_start, sp.direction.value, sp.size, sp.entry_price)
-            return
-
         st = self.state
-        expired = window_ended_at(st.position.window_start, now_sec, self.step_sec) if st.position else False
-        if expired:
-            st.defer_to_settle()
-            sp = st.settle_pending
-            logger.info(
-                "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
-                sp.window_start, sp.direction.value, sp.size, sp.entry_price)
+        if st.position is None:
+            return
+        expired = force or window_ended_at(st.position.window_start, now_sec, self.step_sec)
+        if not expired:
+            return
+        st.defer_to_settle()
+        sp = st.settle_pending
+        logger.info(
+            "窗口 %d 已结束：持仓转待结算（%s %.4f 股 @ %.4f）",
+            sp.window_start, sp.direction.value, sp.size, sp.entry_price)
+
+    def _advance_settlement(self, now_sec: int) -> None:
+        """待结算仓交给 Settler 后台推进（幂等：无待结算/时机未到即 no-op）。"""
+        st = self.state
         if self.settler.should_run(now_sec, st.settle_pending):
             self.settler.settle(now_sec, st.settle_pending)
 
@@ -423,7 +419,7 @@ class TradingLoop:
         target_token = (
             market.yes_token_id if direction is Direction.UP else market.no_token_id
         )
-        best_ask = self.book.best_ask(target_token)
+        best_ask = self.book.best_ask(target_token, size=1.0)
         best_bid = None
         if st.position is not None:
             # 持仓窗口已结束（结算等待期）→ 不报价不卖出：Polymarket 后端可能已结算
@@ -469,6 +465,7 @@ class TradingLoop:
             daily_loss=st.daily_loss,
             window_bet_placed=st.window_bet_placed,
             paused=st.paused,
+            retry_until_sec=st.retry_until_sec,
         )
 
     def _drain_user_events(self) -> None:
@@ -529,14 +526,18 @@ class TradingLoop:
     def decide(self, view: MarketView) -> Action:
         """决策引擎调用（lifecycle 使用）。"""
         st = self.state
-        # 盘口无报价建仓失败冷却：本窗口冷却期内不再决策建仓（防缺失盘口每秒重试）
-        if st.retry_until_sec is not None and self._now_sec() < st.retry_until_sec:
-            return Action(ActionType.SKIP)
-        return decide(self.config.to_engine_config(), self.state_view(), view, self.state.signal)
+        return decide(self.config.to_engine_config(), self.state_view(), view, self.state.signal,
+                      now_sec=self._now_sec())
 
     def execute(self, action: Action, market: MarketInfo, now_sec: int) -> None:
         """动作分派（lifecycle 使用，委托 ExecutionDispatcher）。"""
         self._exec_dispatcher.execute(action, market, now_sec)
 
     def save_status(self) -> None:
-        self._store.save(self.state)
+        extra = None
+        st_fn = getattr(self.strategy, "status_text", None)
+        if st_fn is not None:
+            text = st_fn()
+            if text:
+                extra = {"strategy_state": text}
+        self._store.save(self.state, extra=extra)

@@ -1,7 +1,12 @@
 """配置加载与校验。
 
-唯一配置源为 config.yaml，策略参数按策略名分节（如 kronos: {...}）。
+唯一配置源为 config.yaml：顶层为通用（引擎/执行/风控）参数，
+策略专属参数按策略名分节（如 momentum: {...}）覆盖同名通用默认值。
 所有字段有默认值；启动时校验合法性，非法参数抛出 ConfigError。
+
+新增策略：在 src/pmbot/strategies/ 写策略类 + @register("名字")，
+config.yaml 顶层 strategy: 名字 即可切换（专属参数放同名分节）——
+config.py 本身无需改动。
 """
 
 from __future__ import annotations
@@ -11,9 +16,17 @@ from pathlib import Path
 
 import yaml
 
-from pmbot.variant_map import DEFAULT_VARIANT, VARIANT_CONTEXT
+KNOWN_STRATEGIES = ("momentum",)
 
-KNOWN_STRATEGIES = ("kronos", "cheap_side")
+# 引擎参数白名单（Config → EngineConfig 自动映射字段名；与 EngineConfig 字段一致，
+# 加新引擎参数 = EngineConfig 加字段 + 本白名单加名，不再手抄构造映射）
+_ENGINE_FIELDS = (
+    "amount_per_trade", "p_up_buy", "p_down_buy", "cancel_before_end_sec",
+    "exit_loss_before_end_sec", "hold_until_end_sec", "take_profit",
+    "take_profit_max", "stop_loss", "max_consecutive_losses", "max_daily_loss",
+    "no_entry_before_end_sec", "open_delay_sec", "contradiction_skip_pct",
+    "max_entry_price", "min_entry_price", "taker_fee_pct",
+)
 
 DEFAULTS: dict = {
     "symbols": ["BTC"],
@@ -24,11 +37,11 @@ DEFAULTS: dict = {
     "hold_until_end_sec": 60,        # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
     "no_entry_before_end_sec": 60,
     "open_delay_sec": 0,          # 市场开始后 N 秒内不开仓（观察早期波动；0 = 关闭）
-    "contradiction_skip_pct": 0.0,  # 方向一致性过滤：信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
+    "contradiction_skip_pct": 0.0,  # 信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
     "max_entry_price": 0.0,      # 入场价上限：盘口 ask 高于此价不入场（追高无意义；0 = 关闭）
-    "min_entry_price": 0.0,      # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 档历史净亏；0 = 关闭）
-    "taker_fee_pct": 0.0,        # dry-run 模拟 taker 手续费率（按成交金额，买卖各一次；实盘 pnl=余额差已含费）
-    "entry_price_threshold": 0.35,  # cheap-side：只买 ask ≤ 此价的方向（盘口审计低估带）
+    "min_entry_price": 0.0,      # 入场价下限：盘口 ask 低于此价不入场（0 = 关闭）
+    "taker_fee_pct": 0.0,        # dry-run 模拟 taker 手续费率（按成交金额；实盘 pnl=余额差已含费）
+    "threshold_pct": 0.08,     # momentum 策略：Binance 相对窗口开盘穿越阈值 %%——穿越后同向入场
     "take_profit": 0.30,
     "take_profit_max": 0.95,
     "stop_loss": 0.20,
@@ -61,20 +74,15 @@ class EngineConfig:
     contradiction_skip_pct: float = 0.0  # 信号与 Binance 实时移动矛盾超此百分比跳过入场（0 = 关闭）
     max_entry_price: float = 0.0  # 入场价上限：盘口 ask 高于此价不入场（0 = 关闭）
     min_entry_price: float = 0.0  # 入场价下限：盘口 ask 低于此价不入场（0 = 关闭）
-    taker_fee_pct: float = 0.0    # dry-run 模拟 taker 手续费率（按成交金额，买卖各一次；实盘 pnl=余额差已含费）
+    taker_fee_pct: float = 0.0    # dry-run 模拟 taker 手续费率（按成交金额；实盘 pnl=余额差已含费）
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
     """策略所需参数窄视图（Strategy 构造消费）。"""
 
-    model_variant: str = DEFAULT_VARIANT
-    sample_count: int = 20
-    max_klines: int = 2048  # 跟随 mini 上下文（显式覆盖见 Config.to_strategy_config）
-    market_interval: str = "15m"
-    thresholds: dict | None = None
-    # cheap-side：只买 ask ≤ 该价的方向（市场定价滞后低估带）；kronos 不用
-    entry_price_threshold: float = 0.35
+    market_interval: str = "5m"
+    threshold_pct: float = 0.08  # momentum：穿越阈值 %%（相对窗口开盘）
 
 
 @dataclass(frozen=True)
@@ -93,9 +101,6 @@ class Config:
     stop_loss: float
     max_consecutive_losses: int
     max_daily_loss: float
-    max_klines: int
-    model_variant: str
-    sample_count: int
     # 窗口结束前 N 秒禁止买入（中途启动时避免窗口末仓，0 = 关闭）
     no_entry_before_end_sec: int = 0
     # 市场开始后 N 秒内不开仓（0-300，0 = 关闭）
@@ -104,42 +109,25 @@ class Config:
     contradiction_skip_pct: float = 0.0
     # 入场价上限：盘口 ask 高于此价不入场（追高无意义；0 = 关闭）
     max_entry_price: float = 0.0
-    # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 档历史净亏；0 = 关闭）
+    # 入场价下限：盘口 ask 低于此价不入场（0 = 关闭）
     min_entry_price: float = 0.0
-    # dry-run 模拟 taker 手续费率（按成交金额，买卖各一次；实盘 pnl=余额差已含费）
+    # dry-run 模拟 taker 手续费率（按成交金额；实盘 pnl=余额差已含费）
     taker_fee_pct: float = 0.0
-    # cheap-side 策略门槛：只买 ask ≤ 此价的方向（基于盘口审计的低估带；kronos 忽略）
-    entry_price_threshold: float = 0.35
+    # momentum 策略：Binance 相对窗口开盘穿越阈值 %%（穿越后同向入场）
+    threshold_pct: float = 0.08
 
     def to_engine_config(self) -> EngineConfig:
-        return EngineConfig(
-            amount_per_trade=self.amount_per_trade,
-            p_up_buy=self.p_up_buy,
-            p_down_buy=self.p_down_buy,
-            cancel_before_end_sec=self.cancel_before_end_sec,
-            exit_loss_before_end_sec=self.exit_loss_before_end_sec,
-            hold_until_end_sec=self.hold_until_end_sec,
-            take_profit=self.take_profit,
-            take_profit_max=self.take_profit_max,
-            stop_loss=self.stop_loss,
-            max_consecutive_losses=self.max_consecutive_losses,
-            max_daily_loss=self.max_daily_loss,
-            no_entry_before_end_sec=self.no_entry_before_end_sec,
-            open_delay_sec=self.open_delay_sec,
-            contradiction_skip_pct=self.contradiction_skip_pct,
-            max_entry_price=self.max_entry_price,
-            min_entry_price=self.min_entry_price,
-            taker_fee_pct=self.taker_fee_pct,
-        )
+        """引擎窄视图派生：字段与 EngineConfig 一一对应（白名单自动映射，
+
+        加新引擎参数 = EngineConfig 加字段 + 白名单加名，不再手抄构造映射；
+        字段名在 Config 与 EngineConfig 间必须一致（getattr 取同名属性）。
+        """
+        return EngineConfig(**{f: getattr(self, f) for f in _ENGINE_FIELDS})
 
     def to_strategy_config(self) -> StrategyConfig:
         return StrategyConfig(
-            model_variant=self.model_variant,
-            sample_count=self.sample_count,
-            max_klines=self.max_klines,
             market_interval=self.market_interval,
-            thresholds={"p_up_buy": self.p_up_buy, "p_down_buy": self.p_down_buy},
-            entry_price_threshold=self.entry_price_threshold,
+            threshold_pct=self.threshold_pct,
         )
 
 
@@ -152,15 +140,15 @@ def load_config(path: str | Path) -> Config:
     except yaml.YAMLError as e:
         raise ConfigError(f"配置文件解析失败: {e}") from e
 
-    strategy = raw.get("strategy", "kronos")
-    if strategy not in KNOWN_STRATEGIES:
-        raise ConfigError(f"未知 strategy: {strategy}，可用: {KNOWN_STRATEGIES}")
+    strategy = raw.get("strategy", "momentum")
+    known = _known_strategies()
+    if known and strategy not in known:
+        raise ConfigError(f"未知 strategy: {strategy}，可用: {known}")
 
-    interval = str(raw.get("market_interval", "15m"))
+    interval = str(raw.get("market_interval", "5m"))
     from pmbot.constants import step_ms_for
 
     step_ms_for(interval)  # 校验合法值
-
 
     # 策略分节覆盖默认值
     s = {**DEFAULTS, **raw.get(strategy, {})}
@@ -228,29 +216,15 @@ def load_config(path: str | Path) -> Config:
     if not (0 <= tfp < 1):
         raise ConfigError("taker_fee_pct 必须在 [0,1) 之间（0 表示不模拟手续费）")
 
-    ept = _as_float(s.get("entry_price_threshold", DEFAULTS["entry_price_threshold"]),
-                    "entry_price_threshold")
-    if not (0 < ept < 1):
-        raise ConfigError("entry_price_threshold 必须在 (0,1) 之间")
+    thr = _as_float(s.get("threshold_pct", DEFAULTS["threshold_pct"]),
+                    "threshold_pct")
+    if thr <= 0:
+        raise ConfigError("threshold_pct 必须 > 0（momentum 穿越阈值，如 0.08 = 0.08%%）")
 
     mcl = _as_int(s["max_consecutive_losses"], "max_consecutive_losses")
     mdl = _as_float(s["max_daily_loss"], "max_daily_loss")
     if mcl <= 0 or mdl <= 0:
         raise ConfigError("max_consecutive_losses / max_daily_loss 必须 > 0")
-
-    model_cfg = raw.get("model", {})
-    variant = model_cfg.get("variant", DEFAULT_VARIANT)
-    if variant not in VARIANT_CONTEXT:
-        raise ConfigError(f"未知模型变体: {variant}，可用: {sorted(VARIANT_CONTEXT)}")
-    sample_count = _as_int(model_cfg.get("sample_count", 20), "model.sample_count")
-    if sample_count <= 0:
-        raise ConfigError("model.sample_count 必须 > 0")
-
-    # 数据拉取/存储数量跟随模型上下文长度（mini=2048, small/base=512），可显式覆盖
-    data_cfg = raw.get("data") or {}
-    mk = _as_int(data_cfg.get("max_klines", VARIANT_CONTEXT[variant]), "max_klines")
-    if mk <= 0:
-        raise ConfigError("max_klines 必须 > 0")
 
     return Config(
         strategy=strategy,
@@ -269,15 +243,21 @@ def load_config(path: str | Path) -> Config:
         stop_loss=sl,
         max_consecutive_losses=mcl,
         max_daily_loss=mdl,
-        max_klines=mk,
-        model_variant=variant,
-        sample_count=sample_count,
         contradiction_skip_pct=csp,
         max_entry_price=mep,
         min_entry_price=miep,
         taker_fee_pct=tfp,
-        entry_price_threshold=ept,
+        threshold_pct=thr,
     )
+
+
+def _known_strategies() -> tuple[str, ...]:
+    """已注册策略名单：registry 单一事实源（延迟导入避免 config↔策略循环）。"""
+    import pmbot.strategies  # noqa: F401  触发各策略 @register
+
+    from pmbot.strategy import strategies
+
+    return strategies()
 
 
 def _as_float(value, name: str) -> float:

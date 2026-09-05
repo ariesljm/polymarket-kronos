@@ -18,12 +18,10 @@ import csv
 import logging
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from pmbot.ledger import RECORD_COLUMNS, TradeRecord
-from pmbot.types import symbol_from_slug, window_start_from_slug
 logger = logging.getLogger(__name__)
 
 
@@ -53,89 +51,6 @@ MAX_PAGES = 20
 
 # 交易记录 schema 单一事实源在 ledger（引擎写入/展示/统计共用）
 # （本模块不再手抄 RECORD_COLUMNS——曾与 ledger 同 schema 双份维护）
-
-def build_records(rows: list[dict]) -> list["TradeRecord"]:
-    """API 流水 → 交易记录（配对聚合，TradeRecord 类型化载体）。
-
-    配对键 = conditionId（同一市场的买入/卖出/兑付归为一笔）：
-    - 成本 = Σ BUY 金额（usdc_size，缺回退 size×price）
-    - 收入 = Σ SELL 金额 + Σ REDEEM 到账（usdc_size，缺回退 size×price）
-    - 盈亏 = 收入 − 成本（**含手续费的真实口径**）；进行中窗口（有 BUY 无出场）跳过
-    - ts = 组内最后流水时间（ISO）；direction = 买入 outcome；
-      reason：组内有 SELL → sell，仅 REDEEM → settle（API 无法区分止盈/止损）
-
-    返回按 ts 升序的记录；坏行（无 conditionId/窗口解析失败）跳过。
-    """
-    groups: dict[str, dict] = {}
-    for r in rows:
-        cid = str(r.get("condition_id") or "")
-        if not cid:
-            continue
-        g = groups.setdefault(cid, {"buys": [], "exits": [], "max_ts": 0, "slug": "", "outcome": ""})
-        rtype = str(r.get("type") or "trade")
-        try:
-            ts = int(r.get("ts") or 0)
-        except (TypeError, ValueError):
-            ts = 0
-        g["max_ts"] = max(g["max_ts"], ts)
-        if r.get("slug"):
-            g["slug"] = r["slug"]
-        if r.get("outcome"):
-            g["outcome"] = r["outcome"]
-        side = str(r.get("side") or "").upper()
-        if rtype == "trade" and side == "BUY":
-            g["buys"].append(r)
-        elif rtype == "redeem" or (rtype == "trade" and side == "SELL"):
-            g["exits"].append(r)
-
-    records = []
-    for cid, g in groups.items():
-        if not g["buys"] or not g["exits"]:
-            continue  # 未平仓（进行中窗口/纯兑付）不构成交易记录
-        size = sum(float(b.get("size") or 0) for b in g["buys"])
-        cost = sum(_amount(b) for b in g["buys"])
-        income = sum(_amount(e) for e in g["exits"])
-        if size <= 0 or cost <= 0:
-            continue
-        has_sell = any(str(e.get("side") or "").upper() == "SELL" for e in g["exits"])
-        window_start = _window_from_slug(g["slug"])
-        records.append(TradeRecord(
-            ts=datetime.fromtimestamp(g["max_ts"], tz=timezone.utc).isoformat(timespec="seconds"),
-            window_start=window_start,
-            symbol=_symbol_from_slug(g["slug"]),
-            direction=str(g["outcome"] or "").lower(),
-            entry_price=round(cost / size, 6),
-            exit_price=round(income / size, 6),
-            size=round(size, 6),
-            pnl=round(income - cost, 6),
-            reason="sell" if has_sell else "settle",
-        ))
-    records.sort(key=lambda r: r.ts)
-    return records
-
-
-def _amount(row: dict) -> float:
-    """流水金额：usdc_size（含手续费）优先，缺回退 size×price。"""
-    try:
-        usdc = float(row.get("usdc_size"))
-        if usdc or row.get("usdc_size") is not None:
-            return usdc
-    except (TypeError, ValueError):
-        pass
-    try:
-        return float(row.get("size") or 0) * float(row.get("price") or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _window_from_slug(slug: str) -> int:
-    """slug → 窗口起点秒（解析失败返回 0，流水配对按窗口 0 丢弃语义）。"""
-    return window_start_from_slug(slug) or 0
-
-
-def _symbol_from_slug(slug: str) -> str:
-    return symbol_from_slug(slug)
-
 
 class TradeHistorySyncer:
     """增量同步 Polymarket 交易流水到本地 CSV（后台线程，节流轮询）。"""

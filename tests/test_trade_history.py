@@ -125,7 +125,7 @@ def _api_redeem(ts, cid, size, usdc):
 
 def test_build_records_sell_pair(tmp_path):
     """BUY + SELL 配对：盈亏 = 卖出收入 − 买入成本（含手续费 usdc 口径）。"""
-    from pmbot.trade_history import build_records
+    from pmbot.ledger import build_records
     rows = [
         _api_buy(100, "c1", "eth-updown-5m-1786897500", "Down", 2.0, 0.5, usdc=1.04),  # 含手续费
         _api_sell(200, "c1", 2.0, 0.9, usdc=1.8),  # 卖出收入（已扣卖出手续费）
@@ -145,7 +145,7 @@ def test_build_records_sell_pair(tmp_path):
 
 def test_build_records_settle_pair(tmp_path):
     """BUY + REDEEM 配对：结算兑付（usdc_size = 实际到账）→ reason=settle。"""
-    from pmbot.trade_history import build_records
+    from pmbot.ledger import build_records
     rows = [
         _api_buy(100, "c1", "eth-updown-5m-1786897500", "Up", 2.0, 0.45, usdc=0.94),
         _api_redeem(300, "c1", 2.0, 2.0),  # 赢：每份兑 1 USDC
@@ -158,14 +158,14 @@ def test_build_records_settle_pair(tmp_path):
 
 def test_build_records_open_window_skipped(tmp_path):
     """进行中窗口（有 BUY 无出场）→ 不构成交易记录。"""
-    from pmbot.trade_history import build_records
+    from pmbot.ledger import build_records
     rows = [_api_buy(100, "c1", "eth-updown-5m-1786897500", "Down", 2.0, 0.5, usdc=1.04)]
     assert build_records(rows) == []
 
 
 def test_build_records_usdc_fallback(tmp_path):
     """usdc_size 缺失（旧数据/无字段）→ 回退 size×price。"""
-    from pmbot.trade_history import build_records
+    from pmbot.ledger import build_records
     rows = [
         _api_buy(100, "c1", "eth-updown-5m-1786897500", "Down", 2.0, 0.5),  # 无 usdc
         _api_sell(200, "c1", 2.0, 0.9),  # 无 usdc
@@ -176,7 +176,7 @@ def test_build_records_usdc_fallback(tmp_path):
 
 def test_build_records_partial_sell_plus_redeem(tmp_path):
     """部分卖出 + 剩余结算兑付 → 合并为一笔（收入 = 卖出 + 兑付）。"""
-    from pmbot.trade_history import build_records
+    from pmbot.ledger import build_records
     rows = [
         _api_buy(100, "c1", "eth-updown-5m-1786897500", "Down", 2.0, 0.5, usdc=1.04),
         _api_sell(200, "c1", 1.0, 0.9, usdc=0.9),
@@ -190,7 +190,7 @@ def test_build_records_partial_sell_plus_redeem(tmp_path):
 
 def test_build_records_multiple_windows(tmp_path):
     """多窗口多笔 → 按 ts 升序返回多条记录。"""
-    from pmbot.trade_history import build_records
+    from pmbot.ledger import build_records
     rows = [
         _api_buy(100, "c2", "eth-updown-5m-100", "Up", 1.0, 0.5, usdc=0.52),
         _api_redeem(150, "c2", 1.0, 1.0),

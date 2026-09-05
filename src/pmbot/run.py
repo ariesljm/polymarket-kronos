@@ -15,7 +15,7 @@ import time
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Kronos PM 交易主循环")
+    parser = argparse.ArgumentParser(description="Polymarket 策略交易主循环")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--data-dir", default=None, help="数据目录（默认按模式派生：dry-run=data/，live=data_live/）")
     parser.add_argument(
@@ -24,6 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", dest="dry_run", action="store_false", help="实盘运行（真钱）")
     parser.set_defaults(dry_run=True)  # 安全默认：忘记传参也不碰真钱
     parser.add_argument("--poll", type=int, default=1, help="轮询间隔秒数（tick 频率，1s = 止盈止损秒级响应）")
+    parser.add_argument("--symbol", default=None, help="覆盖 config symbols[0]（多标的并行：各进程 --symbol BTC/ETH/SOL --data-dir data_X）")
     parser.add_argument("--once", action="store_true", help="只跑一个 tick 后退出（调试）")
     args = parser.parse_args(argv)
 
@@ -45,19 +46,29 @@ def main(argv: list[str] | None = None) -> int:
     from pmbot.single_instance import run_with_guard
     from pmbot.spot_ticker import SpotTickerThread
     from pmbot.state import StateStore, TradeState
-    from pmbot.strategy import create_strategy
+    from pmbot.strategy import create_strategy, strategy_class
     from pmbot.user_stream import UserStream
 
     cfg = load_config(args.config)
-    symbol = cfg.symbols[0]
+    symbol = args.symbol or cfg.symbols[0]
     paths = paths_for(not args.dry_run, args.data_dir)
     data_dir = paths.data_dir
 
+    # Binance 实时价线程提前创建：momentum 策略用它做穿越检测（WS ~1s 推送，
+    # 比每 tick REST 快；更早发现穿越 → 更可能抓做市商未调价的便宜档）。
+    ticker = SpotTickerThread(symbol=symbol)
+    strat_kwargs = {}
+    # 依赖注入按策略声明（needs_fetch_price）：新策略声明即可，run.py 不再
+    # 按策略名硬编码 if（策略名单单一事实源在 registry + 策略类自身）。
+    strat_cls = strategy_class(cfg.strategy)
+    if getattr(strat_cls, "needs_fetch_price", False):
+        strat_kwargs["fetch_price"] = ticker.latest_price
     strategy = create_strategy(
         cfg.strategy,
         symbol=symbol,
         log_dir=data_dir,
-        config=cfg.to_strategy_config(),  # 策略参数窄视图（变体/采样/上下文/间隔/阈值）
+        config=cfg.to_strategy_config(),  # 策略参数窄视图（间隔/阈值）
+        **strat_kwargs,
     )
     discovery = MarketDiscovery(interval=cfg.market_interval)
     executor = SimExecutor() if args.dry_run else ClobExecutor()  # 两个适配器：模拟 / 实盘
@@ -74,9 +85,9 @@ def main(argv: list[str] | None = None) -> int:
     user_stream = UserStream(executor.api_auth() if not args.dry_run else None, proxy=proxy)
     user_stream.start()
 
-    # Binance 实时价线程（方向一致性过滤数据源）：WS miniTicker + REST 兜底。
+    # Binance 实时价线程（方向一致性过滤数据源 + momentum 穿越检测）：WS miniTicker + REST 兜底。
     # 镜像端点直连可达（data_source 同款实证），不传 proxy 优先直连。
-    ticker = SpotTickerThread(symbol=symbol)
+    # ticker 已提前创建（momentum 注入用），此处启动。
     ticker.start()
 
     state = StateStore(paths.status).load()

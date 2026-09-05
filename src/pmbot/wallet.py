@@ -11,8 +11,9 @@ state 由 reconcile 入参传入（引擎 reset 会重建 TradeState 对象，�
 from __future__ import annotations
 
 import logging
-from typing import Callable, Protocol
+from typing import Callable
 
+from pmbot.executor_protocols import WalletView
 from pmbot.types import (
     Direction,
     Position,
@@ -32,15 +33,9 @@ BALANCE_REFRESH_SEC = 30
 GHOST_GRACE_SEC = 180
 
 
-class WalletSource(Protocol):
-    """钱包能力窄接口：余额与实时持仓（执行器隐式实现，测试可注入 fake）。
-
-    live_positions 返回 None 表示查询失败（调用方必须区分「无持仓」与
-    「查询失败」——后者不核对，防误清真实持仓）。
-    """
-
-    def collateral_balance(self) -> float | None: ...
-    def live_positions(self, user: str | None = None) -> list[dict] | None: ...
+# 钱包能力面与 executor_protocols.WalletView 同面（单一事实源，双声明防接口漂移）：
+# 执行器实现一面对应两面消费（WalletReconciler / 面板），别名保持消费方命名语义。
+WalletSource = WalletView
 
 
 class WalletReconciler:

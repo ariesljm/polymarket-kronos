@@ -12,7 +12,7 @@ from pmbot.types import Action, ActionType, Direction, MarketView, Position, Sig
 
 
 # 熔断原因 key（Action.reason 与状态 pause_reason 共用的枚举）：
-# 断言文案唯一出处见 breaker_message（tick/decide/执行共用，禁止各自拼 f-string）
+# 断言文案唯一出处见 BREAKER_MESSAGES（tick/decide/执行共用，禁止各自拼 f-string）
 BREAKER_MESSAGES = {
     "consecutive_losses": lambda st, cfg: f"连亏 {st.consecutive_losses} 笔（上限 {cfg.max_consecutive_losses}）",
     "daily_loss": lambda st, cfg: f"日亏 {st.daily_loss:.2f} USDC（上限 {cfg.max_daily_loss}）",
@@ -61,16 +61,22 @@ def circuit_breaker(state: StateView, config: EngineConfig) -> tuple[str, str] |
     return None
 
 
-def decide(config: EngineConfig, state: StateView, market: MarketView, signal: Signal) -> Action:
+def decide(config: EngineConfig, state: StateView, market: MarketView, signal: Signal,
+            now_sec: int | None = None) -> Action:
     """根据当前状态与信号决定下一个动作。
 
-    state: 连续亏损、当日亏损、本窗口是否已下注、是否暂停。
+    state: 连续亏损、当日亏损、本窗口是否已下注、是否暂停、建仓冷却截止。
     market: 距窗口结束秒数、目标方向 best ask/bid、当前持仓、挂单。
+    now_sec: 墙钟秒（冷却判定注入，纯函数不自行取时）；None = 不做冷却判断。
     """
     # 熔断优先于一切交易动作；人工暂停时不产生任何交易动作
     # （判定与文案与 tick 共用 circuit_breaker 单一事实源——tick 先跑故此处
     # 正常序列不可达，保留为决策引擎防守兜底，不再自写一版阈值）
     if state.paused:
+        return Action(ActionType.SKIP)
+    # 盘口无报价建仓失败冷却：本窗口冷却期内不再决策建仓（防缺失盘口每秒重试）；
+    # now 由调用方注入（与 elapsed_sec 分流同模式），置 None 时跳过判定
+    if state.retry_until_sec is not None and now_sec is not None and now_sec < state.retry_until_sec:
         return Action(ActionType.SKIP)
     trip = circuit_breaker(state, config)
     if trip is not None:

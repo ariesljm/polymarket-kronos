@@ -1,7 +1,7 @@
 """策略接口与工厂测试。
 
 测试接缝：create_strategy —— 按名称实例化已注册策略，未注册名称明确报错。
-真实策略（kronos）在票 02 实现；此处用测试内注册的 FakeStrategy 验证机制。
+内置策略（momentum）见 strategies/ 包；此处用测试内注册的 FakeStrategy 验证注册机制。
 """
 
 import pytest

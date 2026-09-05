@@ -46,6 +46,7 @@ class TradeState:
     skip_until_sec: int | None = None  # 启动跳过进行中窗口：此时间戳起恢复交易（面板提示用）
     mode: str = ""  # 运行模式标记："dry-run"/"live"（空 = 旧数据，不校验）
     retry_until_sec: int | None = None  # 盘口无报价建仓失败冷却截止（秒）；None=无冷却
+    strategy_state: str | None = None  # 策略专属状态文案（momentum 基准/偏离等；面板显示）
 
     def roll_window(self, window_start: int) -> None:
         """窗口切换：重置本窗口下注标记与挂单（持仓不应跨窗口，结算兜底）。"""
@@ -121,20 +122,22 @@ class StateStore:
 
     # ---- 快照 ----
 
-    def save(self, state: TradeState) -> None:
+    def save(self, state: TradeState, extra: dict | None = None) -> None:
         data = asdict(state)
         if state.signal is not None:
             data["signal"] = {
                 "direction": state.signal.direction.value,
                 "p_up": state.signal.p_up,
             }
+        if extra:
+            data.update(extra)
         # JSON 不支持注释：用 _comment 字段说明关键操作（load 时忽略未知字段）
         data["_comment"] = (
             "本文件由机器人自动维护，请勿手工修改非 _comment 字段。"
             "暂停/熔断后恢复：把 paused 改为 false 并重启 start_bot.bat。"
             "字段含义：paused=熔断暂停；daily_loss=当日累计亏损；"
             "consecutive_losses=连亏笔数；window_bet_placed=当前窗口已下注；"
-            "signal=最近一次 Kronos 信号；position=当前持仓（无持仓为 null）；"
+            "signal=最近一次策略信号；position=当前持仓（无持仓为 null）；"
             "settle_pending=窗口结束后待结算的旧持仓（结算完成自动清空）；"
             "balance=钱包余额快照（实盘时定时刷新）；day_start_balance=今日起始余额基准"
             "（今日盈亏 = 现余额 − 基准，跨天重置）；mode=运行模式（dry-run/live）。"

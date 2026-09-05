@@ -58,15 +58,13 @@ class ClobExecutor:
         return self._sampler.snapshot(token_id) if self._sampler else None
 
     def _sampler_update(self, token_id: str, book: dict) -> None:
-        """REST 现拉结果回填采样器（防下个 tick 重复查询；采样器不支持时静默）。"""
+        """REST 现拉结果回填采样器（防下个 tick 重复查询；采样器缺位时静默）。"""
         if self._sampler is None:
             return
-        fn = getattr(self._sampler, "update_snapshot", None)
-        if fn:
-            try:
-                fn(token_id, book)
-            except Exception:
-                pass
+        try:
+            self._sampler.update_snapshot(token_id, book)
+        except Exception:
+            pass
 
     def _best_price(self, token_id: str, side: str, size: float) -> float | None:
         """可执行价（单一实现，best_ask/best_bid 共用）：新鲜快照 → 加权价。

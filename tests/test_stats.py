@@ -40,7 +40,7 @@ def read_records(path):
 
 
 def test_empty_trades_gives_zero_stats(tmp_path):
-    stats = compute_stats([], accuracy={"correct": 0, "total": 0, "accuracy": 0.0})
+    stats = compute_stats([])
     assert stats.total_trades == 0
     assert stats.win_rate == 0.0
     assert stats.roi == 0.0
@@ -56,7 +56,7 @@ def test_win_rate_and_roi(tmp_path):
         trade_row("2026-08-01T01:00:00+00:00", -2.25),
     ]
     make_trades(p, rows)
-    stats = compute_stats(read_records(p), accuracy={"correct": 3, "total": 5, "accuracy": 0.6})
+    stats = compute_stats(read_records(p))
     assert stats.total_trades == 5
     assert stats.wins == 3
     assert stats.losses == 2
@@ -66,14 +66,7 @@ def test_win_rate_and_roi(tmp_path):
     assert stats.total_cost == pytest.approx(11.25)
     assert stats.total_pnl == pytest.approx(-2.85)
     assert stats.roi == pytest.approx(-2.85 / 11.25)
-    assert stats.accuracy["correct"] == 3
 
-
-def test_accuracy_come_from_prediction_log(tmp_path):
-    p = Path(tmp_path) / "trades.csv"
-    make_trades(p, [trade_row("2026-08-01T00:00:00+00:00", +0.55)])
-    stats = compute_stats(read_records(p), accuracy={"correct": 10, "total": 20, "accuracy": 0.5})
-    assert stats.accuracy == {"correct": 10, "total": 20, "accuracy": 0.5}
 
 
 def test_validation_threshold_trades(tmp_path):
@@ -84,11 +77,11 @@ def test_validation_threshold_trades(tmp_path):
         for d in range(8) for i in range(25)
     ]
     make_trades(p, rows)
-    stats = compute_stats(read_records(p), accuracy={"correct": 0, "total": 0, "accuracy": 0.0})
+    stats = compute_stats(read_records(p))
     assert is_validation_done(stats, min_trades=200, min_days=7) is True
     # 199 笔
     make_trades(p, rows[:199])
-    stats = compute_stats(read_records(p), accuracy={"correct": 0, "total": 0, "accuracy": 0.0})
+    stats = compute_stats(read_records(p))
     assert is_validation_done(stats, min_trades=200, min_days=7) is False
 
 
@@ -101,7 +94,7 @@ def test_validation_threshold_days(tmp_path):
         for d in range(5) for h in range(40)
     ]
     make_trades(p, rows)
-    stats = compute_stats(read_records(p), accuracy={"correct": 0, "total": 0, "accuracy": 0.0})
+    stats = compute_stats(read_records(p))
     assert stats.span_days < 7.0  # 跨度不足 7 天
     assert is_validation_done(stats, min_trades=200, min_days=7) is False  # 笔数够但天数不够
 
@@ -109,14 +102,13 @@ def test_validation_threshold_days(tmp_path):
 def test_report_contains_metrics_and_config(tmp_path):
     p = Path(tmp_path) / "trades.csv"
     make_trades(p, [trade_row("2026-08-01T00:00:00+00:00", +0.55)])
-    stats = compute_stats(read_records(p), accuracy={"correct": 1, "total": 2, "accuracy": 0.5})
-    report = write_report(stats, symbol="BTC", strategy="kronos",
+    stats = compute_stats(read_records(p))
+    report = write_report(stats, symbol="BTC", strategy="momentum",
                           params={"p_up_buy": 0.60, "limit_price": 0.45}, path=Path(tmp_path) / "report.md")
     assert "BTC" in report
     assert "胜率" in report
     assert "ROI" in report
-    assert "方向准确率" in report
-    assert "kronos" in report
+    assert "momentum" in report
     assert "p_up_buy" in report
     assert Path(tmp_path, "report.md").is_file()
 
@@ -182,7 +174,7 @@ def test_significance_detects_pnl_edge():
     # compute_stats 路径打通(字段透传)
     recs = [TradeRecord(ts="2026-08-14T00:00:00+00:00", window_start=1, symbol="BC", direction="up",
                         entry_price=0.5, exit_price=0.6, size=5.0, pnl=0.1, reason="settle")] * 50
-    st = compute_stats(recs, accuracy={"correct": 0, "total": 0, "accuracy": 0.0})
+    st = compute_stats(recs)
     assert st.t_stat > 10
     assert st.ci_low > 0
     assert st.win_rate_z > 3

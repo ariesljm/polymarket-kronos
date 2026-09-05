@@ -19,23 +19,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from pmbot.config import load_config
-    from pmbot.prediction_log import PredictionLog
     from pmbot.stats import compute_stats, write_report
 
     cfg = load_config(args.config)
     symbol = cfg.symbols[0]
-    acc = PredictionLog(args.data_dir, symbol).accuracy()
     # 统一读面（账本）：实盘 API 流水优先，缺回退引擎业务记录
     from pmbot.ledger import load_records
 
-    stats = compute_stats(load_records(args.data_dir), acc)
+    stats = compute_stats(load_records(args.data_dir))
     params = {
         "amount_per_trade": cfg.amount_per_trade,
         "p_up_buy": cfg.p_up_buy,
         "p_down_buy": cfg.p_down_buy,
         "take_profit": cfg.take_profit,
         "stop_loss": cfg.stop_loss,
-        "model_variant": cfg.model_variant,
     }
     report = write_report(
         stats, symbol=symbol, strategy=cfg.strategy, params=params, path=args.out

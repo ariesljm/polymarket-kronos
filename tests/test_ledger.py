@@ -22,7 +22,7 @@ def _write_csv(path, header, rows):
 def test_schema_single_source():
     """schema 单一事实源：引擎写入与流水配对共用同一列定义。"""
     from pmbot.state import TRADE_COLUMNS
-    from pmbot.trade_history import build_records  # noqa: F401（模块可导入即引用成立）
+    from pmbot.ledger import build_records  # noqa: F401（读面单一事实源收在账本）
 
     assert TRADE_COLUMNS == RECORD_COLUMNS
     assert RECORD_COLUMNS == [
@@ -69,7 +69,11 @@ def test_load_records_empty_dir(tmp_path):
 
 
 def test_load_records_empty_api_file(tmp_path):
-    """api_trades.csv 只有表头 → 空列表（不误读 trades.csv）。"""
+    """api_trades.csv 只有表头（同步中断半写）→ 回退 trades.csv 的完整业务记录。
+
+    深化（架构候选 E3）：is_file 存在性判据曾导致半写空表头静默覆盖完整
+    引擎业务记录；现判据提升为「含数据行」——空表头视为未完成同步。
+    """
     _write_csv(tmp_path / "api_trades.csv", ["ts", "type", "side", "size", "price",
                                              "usdc_size", "condition_id", "title", "slug", "outcome", "tx_hash"], [])
     _write_csv(tmp_path / "trades.csv", RECORD_COLUMNS, [{
@@ -77,7 +81,8 @@ def test_load_records_empty_api_file(tmp_path):
         "direction": "up", "entry_price": "0.5", "exit_price": "0.9",
         "size": "2", "pnl": "0.8", "reason": "take_profit",
     }])
-    assert load_records(tmp_path) == []
+    recs = load_records(tmp_path)
+    assert len(recs) == 1 and recs[0].reason == "take_profit"
 
 
 def test_records_from_csv_skips_bad_rows(tmp_path):

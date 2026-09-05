@@ -3,7 +3,7 @@
 参考 polymarket-trade-engine 的 EarlyBird + MarketLifecycle 架构：
 INIT → RUNNING → DONE
 
-- INIT: 信号生成（Kronos 推理），完成后进入 RUNNING
+- INIT: 信号生成（策略推理），完成后进入 RUNNING
 - RUNNING: 成交检测、持仓管理、决策执行（每 tick）
 - DONE: 生命周期结束（对象可丢弃，stop() 直接置 DONE）
 
@@ -36,11 +36,9 @@ class Phase(Enum):
 
 
 class CancelExecutor(Protocol):
-    """执行器的最小能力：撤单 + 盘口询价（cheap-side 策略信号阶段用；TradingLoop 隐式实现）。"""
+    """执行器的最小能力：撤单（TradingLoop 隐式实现，测试可注入 fake）。"""
 
     def cancel(self, order_id: str) -> bool: ...
-
-    def best_ask(self, token_id: str, size: float = 5.0) -> float | None: ...
 
 
 class LifecycleDeps(Protocol):
@@ -88,12 +86,7 @@ class MarketLifecycle:
             st.predict_start_sec = now_sec
             self.deps.save_status()  # 推理开始即落盘（面板可实时显示）
             try:
-                # 信号上下文注入盘口询价（方向 → 最优卖一价）：cheap-side 策略
-                # 在信号生成阶段比较两方向报价决定方向；Kronos 无需该键，忽略即可。
-                best_ask = lambda d: self.deps.executor.best_ask(token_for(market, d))  # noqa: E731
-                st.signal = self.deps.strategy.generate_signal(
-                    {"now_ms": now_sec * 1000, "best_ask": best_ask}
-                )
+                st.signal = self.deps.strategy.generate_signal({"now_ms": now_sec * 1000})
             finally:
                 st.predicting = False
                 st.last_predict_sec = now_sec
@@ -102,9 +95,17 @@ class MarketLifecycle:
         self.phase = Phase.RUNNING
 
     def tick(self, now_sec: int, market: MarketInfo) -> None:
-        """RUNNING：每 tick 的窗口级逻辑（成交检测 → 决策 → 执行）。"""
+        """RUNNING：每 tick 的窗口级逻辑（信号刷新 → 成交检测 → 决策 → 执行）。"""
         if self.phase is not Phase.RUNNING:
             return
+        # 窗口内信号刷新（momentum 等事件驱动策略：穿越/突破随时更新入场意图；
+        # Strategy.refresh_signal 默认返回 None 不刷新，维持窗口首信号——向后兼容）
+        st = self.deps.state
+        if (st.signal is not None and st.position is None and not st.window_bet_placed):
+            refresh = self.deps.strategy.refresh_signal({"now_ms": now_sec * 1000})
+            if refresh is not None and refresh.direction is not st.signal.direction:
+                st.signal = refresh
+                logger.info("信号刷新: %s (P(up)=%.3f)", refresh.direction.value, refresh.p_up)
         # 挂单成交检测
         self.deps.refresh_pending(market, now_sec)
         # 决策与执行

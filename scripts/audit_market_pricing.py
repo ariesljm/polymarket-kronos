@@ -66,7 +66,13 @@ def _f(s: str) -> float | None:
 
 
 def load_book(path: str) -> list[dict]:
-    """读录音：(ts_ms, up_ask, up_bid, down_ask, down_bid)，跳过盘口缺失行。"""
+    """读录音：(ts_ms, up_ask, up_bid, down_ask, down_bid)，跳过盘口缺失行。
+
+    关键：record_join_ws 是读 bot 的 book.json 快照录盘——bot 停机时段
+    book.json 不更新，录音时间戳照走但价格冻结在旧值。冻结价格与结算
+    随机配对会伪造「低价低估」假象。返回行带 active 标记（该行价格相对
+    前一行有变化=盘口活着），审计默认只用活跃行。
+    """
     out = []
     with open(path, encoding="utf-8") as f:
         for r in csv.DictReader(f):
@@ -76,18 +82,25 @@ def load_book(path: str) -> list[dict]:
                 "ts": int(r["ts"]) // 1000,
                 "up_ask": _f(r["up_ask"]), "up_bid": _f(r["up_bid"]),
                 "down_ask": _f(r["down_ask"]), "down_bid": _f(r["down_bid"]),
+                "active": False,
             })
+    for i in range(1, len(out)):
+        if (out[i]["up_ask"], out[i]["down_ask"]) != (out[i - 1]["up_ask"], out[i - 1]["down_ask"]):
+            out[i]["active"] = True
     return out
 
 
 def entry_price_for_rows(rows: list[dict], window_start: int, side: str) -> float | None:
-    """窗口开始后 60s 内第一个非空 ask（模拟策略窗口初段入场价）。"""
+    """窗口开始后 60s 内第一个**盘口活着**（价格有变动）的 ask。
+
+    冻结段价格是 bot 停机时 book.json 的陈旧值，与结算随机配对会伪造
+    「低价低估」——只接受 active 行，否则返回 None（该窗口方向不可评估）。
+    """
     lo = window_start
     for r in rows:
         if lo <= r["ts"] < lo + 60:
-            ask = r[f"{side}_ask"]
-            if ask is not None and ask > 0:
-                return ask
+            if r.get("active") and r[f"{side}_ask"] is not None and r[f"{side}_ask"] > 0:
+                return r[f"{side}_ask"]
         if r["ts"] >= lo + 60:
             break
     return None
@@ -157,7 +170,7 @@ def main() -> None:
         if wins_map.get(w) is None:
             continue
         win = wins_map[w]
-        win_rows = [r for r in rows if w <= r["ts"] < w + STEP]
+        win_rows = [r for r in rows if w <= r["ts"] < w + STEP and r.get("active")]
         for side in ("up", "down"):
             if side_filter not in ("all", side):
                 continue
@@ -231,7 +244,16 @@ def main() -> None:
     mean = statistics.fmean(pnls)
     sd = statistics.stdev(pnls) if len(pnls) > 1 else 0.0
     t = mean / (sd / math.sqrt(len(pnls))) if sd else 0.0
-    print(f"全部候选均值 {mean:+.4f}/笔（t={t:.2f}，n={len(pnls)}）")
+    med = statistics.median(pnls)
+    # 极端单会把均值/总显著性拉爆（历史 5.19 大单、0.0-0.1 档同类陷阱）：
+    # 同时给中位数与 win/lose 均值，均值只作参考
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    print(f"全部候选: 均值 {mean:+.4f}/笔（t={t:.2f}，n={len(pnls)}）| 中位数 {med:+.4f} | "
+          f"赢均值 {statistics.fmean(wins) if wins else 0:+.4f} / 输均值 {statistics.fmean(losses) if losses else 0:+.4f} | "
+          f"命中 {len(wins)}/{len(pnls)} ({len(wins)/len(pnls):.0%})")
+    if abs(t) >= 1.96:
+        print("  ⚠️ 均值显著需复核极端单: 看中位数与命中率是否同向；仅均值一侧显著多为单笔驱动")
     for b in sorted(buckets):
         sub = buckets[b]
         if len(sub) >= 5:

@@ -15,6 +15,7 @@ from typing import Callable
 from pmbot.executor_protocols import MarketBook, TradeExecutor, shares_for_amount
 from pmbot.market_discovery import MarketInfo
 from pmbot.state import StateStore, TradeState
+from pmbot.engine import BREAKER_MESSAGES  # 暂停文案单一事实源（_exec_pause 消费）
 from pmbot.types import (
     Action,
     ActionType,
@@ -50,6 +51,7 @@ class ExecutionDispatcher:
         step_sec: int,
         save_status,
         taker_fee_pct: float = 0.0,
+        breaker_cfg=None,
     ):
         # state 可传 TradeState 实例或 () -> TradeState；统一收敛为 getter：
         # 每次 self.state 都取当前对象，reset 重建状态无需手工同步。
@@ -63,6 +65,7 @@ class ExecutionDispatcher:
         self.step_sec = step_sec
         self._save = save_status
         self.taker_fee_pct = taker_fee_pct
+        self.breaker_cfg = breaker_cfg  # EngineConfig：暂停文案消费 engine.BREAKER_MESSAGES（单一事实源）
 
     @property
     def state(self) -> TradeState:
@@ -82,8 +85,24 @@ class ExecutionDispatcher:
         elif action.type is ActionType.PAUSE:
             self._exec_pause(action)
         elif action.type is ActionType.SKIP and action.reason:
-            # 带 reason 的 SKIP（如方向一致性过滤 contradiction）：记录供观测/标定
-            logger.info("跳过：%s", action.reason)
+            if action.reason == "entry_price_cap":
+                # 记录拦截时的真实入场价分布（momentum 入场价观测：穿越后 ask 极化值）
+                try:
+                    from pmbot.types import token_for
+
+                    sig = getattr(st, "signal", None)
+                    tok = token_for(market, sig.direction) if sig is not None else None
+                    ask = self.book.best_ask(tok, size=1.0) if tok is not None else None
+                    logger.info(
+                        "跳过：entry_price_cap（方向 %s ask=%s）",
+                        sig.direction.value if sig is not None else "?",
+                        f"{ask:.3f}" if ask is not None else "无报价",
+                    )
+                except Exception:
+                    logger.info("跳过：entry_price_cap")
+            else:
+                # 带 reason 的 SKIP（如方向一致性过滤 contradiction）：记录供观测/标定
+                logger.info("跳过：%s", action.reason)
 
     def refresh_pending(self, market: MarketInfo, now_sec: int) -> None:
         """挂单成交检测（lifecycle tick 每 tick 调用）。
@@ -175,13 +194,16 @@ class ExecutionDispatcher:
             proceeds = self.trade.sell_proceeds(fill.order_id, token)
         self.close_position(pos, exit_price, action.reason or "sell", proceeds=proceeds)
 
+
     def _exec_pause(self, action: Action) -> None:
         st = self.state
         st.paused = True
-        st.pause_reason = {
-            "consecutive_losses": "连亏熔断",
-            "daily_loss": "日亏熔断",
-        }.get(action.reason or "", "熔断暂停")
+        key = action.reason or ""
+        fn = BREAKER_MESSAGES.get(key, lambda *_: "熔断暂停")
+        try:
+            st.pause_reason = fn(st, self.breaker_cfg)
+        except Exception:
+            st.pause_reason = "熔断暂停"
         logger.warning("收到暂停指令（%s）", st.pause_reason)
 
     # ---- 挂单成交 ----

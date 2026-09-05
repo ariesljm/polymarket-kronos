@@ -21,7 +21,7 @@ from pmbot.types import Direction, Fill, PendingOrder, Signal
 WINDOW_MS = 900_000
 
 CFG = Config(
-    strategy="kronos",
+    strategy="momentum",
     symbols=["BTC"],
     market_interval="15m",
     amount_per_trade=1,
@@ -35,21 +35,24 @@ CFG = Config(
     stop_loss=0.20,
     max_consecutive_losses=10,
     max_daily_loss=10,
-    max_klines=2048,
-    model_variant="kronos-mini",
-    sample_count=20,
 )
 
 
 class FakeStrategy:
-    def __init__(self, signal, fn=None):
+    def __init__(self, signal, fn=None, refresh=None):
         self._signal = signal
         self._fn = fn
+        self._refresh = refresh
+        self.refresh_calls = 0
 
     def generate_signal(self, context=None):
         if self._fn:
             return self._fn(context)
         return self._signal
+
+    def refresh_signal(self, context=None):
+        self.refresh_calls += 1
+        return self._refresh
 
 
 class FakeDiscovery:

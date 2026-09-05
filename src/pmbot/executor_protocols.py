@@ -26,13 +26,11 @@ class SamplerProto(Protocol):
     is_fresh: 快照是否新鲜（陈旧判定单一事实源，消费方不自行实现）——决策价读
     快照前必须先问新鲜度，不无条件信快照；
     update_snapshot: 消费方 REST 现拉结果回填（防重复 REST）；
-    light_price: 轻量事件价（best_bid_ask/last_trade_price，仅心跳与展示）。
     """
 
     def snapshot(self, token_id: str) -> dict | None: ...
     def is_fresh(self, token_id: str) -> bool: ...
     def update_snapshot(self, token_id: str, book: dict) -> None: ...
-    def light_price(self, token_id: str) -> dict | None: ...
 
 
 class MarketBook(Protocol):
