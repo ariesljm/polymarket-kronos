@@ -1,40 +1,42 @@
 @echo off
 REM ============================================================
-REM 多标的 momentum paper test 启动脚本（BTC + ETH + SOL 三个 5m 市场并行）
-REM 每个标的独立进程 + 独立数据目录（status/trades/pid 互不干扰）
-REM 数据统一放 data_multi/ 下（每标的一个子目录: btc eth sol）
-REM 用法: start_multi.bat          启动三个标的
-REM        start_multi.bat stop    优雅停止全部
+REM Multi-symbol momentum paper test launcher (BTC + ETH + SOL)
+REM Each symbol: separate process + separate data dir under data_multi/
+REM Usage: start_multi.bat           start 3 bots + enter TUI
+REM        start_multi.bat stop     gracefully stop all bots
+REM NOTE: keep this file ASCII-only (cmd parses bat as GBK; UTF-8
+REM       Chinese bytes would corrupt commands on double-click).
 REM ============================================================
 setlocal
 cd /d %~dp0
+title PMBOT Multi-TUI
 
 if "%1"=="stop" goto stop
 
 mkdir data_multi logs 2>nul
 
-echo 启动 BTC...
+echo Starting BTC...
 start "pmbot-BTC" /min cmd /c "uv run python -m pmbot.run --dry-run --symbol BTC --data-dir data_multi/btc --poll 2 >> logs\btc.log 2>&1"
-echo 启动 ETH...
+echo Starting ETH...
 start "pmbot-ETH" /min cmd /c "uv run python -m pmbot.run --dry-run --symbol ETH --data-dir data_multi/eth --poll 2 >> logs\eth.log 2>&1"
-echo 启动 SOL...
+echo Starting SOL...
 start "pmbot-SOL" /min cmd /c "uv run python -m pmbot.run --dry-run --symbol SOL --data-dir data_multi/sol --poll 2 >> logs\sol.log 2>&1"
-echo 三个标的已启动, 日志: logs\btc.log logs\eth.log logs\sol.log
+echo 3 bots started, logs: logs\btc.log logs\eth.log logs\sol.log
 echo.
-echo 进入聚合 TUI（每 2 秒刷新）...  Ctrl-C 退出面板（bot 继续运行）
+echo Entering TUI (refresh 2s)... Ctrl-C exits panel, bots keep running
 uv run python scripts\multi_panel.py
 echo.
-echo 面板已退出。bot 仍在后台运行。
-echo 再次观察: uv run python scripts\multi_panel.py
-echo 停止全部: start_multi.bat stop
+echo Panel exited. Bots still running in background.
+echo Re-open panel:  uv run python scripts\multi_panel.py
+echo Stop all bots:  start_multi.bat stop
 pause
 goto end
 
 :stop
-uv run python -c "from pmbot.control import write_control; [write_control('stop', f'data_multi/{s}/control.json') for s in ['btc','eth','sol']]; print('stop 已发送三标的')"
-echo 等待优雅停机...
+uv run python -c "from pmbot.control import write_control; [write_control('stop', f'data_multi/{s}/control.json') for s in ['btc','eth','sol']]; print('stop sent to 3 bots')"
+echo Waiting for graceful shutdown...
 timeout /t 12 /nobreak >nul
-echo 停止完成
+echo Done.
 
 :end
 endlocal
