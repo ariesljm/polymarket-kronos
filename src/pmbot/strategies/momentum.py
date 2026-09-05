@@ -66,7 +66,7 @@ class MomentumStrategy(Strategy):
         log_dir: str | Path = "data",
         fetch_price: Callable[[], float | None] | None = None,
         fetch_window_open: Callable[[], float | None] | None = None,
-    ):
+    ) -> None:
         sc = strategy_config or StrategyConfig()
         self.symbol = symbol
         self.interval = sc.market_interval

@@ -7,6 +7,7 @@ BinanceDataSource 负责网络拉取（Binance 公开接口），只把新数据
 from __future__ import annotations
 
 import logging
+from typing import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def fetch_klines_batch(
 class KlineStore:
     """本地 CSV 滚动存储：每标的一个文件，追加增量、按时间戳去重、超上限裁剪。"""
 
-    def __init__(self, data_dir: Path | str, timeframe: str = "15m"):
+    def __init__(self, data_dir: Path | str, timeframe: str = "15m") -> None:
         self._data_dir = Path(data_dir)
         self._timeframe = timeframe
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -148,18 +149,18 @@ class BinanceDataSource:
     def __init__(
         self,
         store: KlineStore,
-        fetch_fn=None,
+        fetch_fn: Callable[..., list[dict]] | None = None,
         max_klines: int = 2048,
         timeframe: str = "15m",
         backfill_page: int = 1000,
-    ):
+    ) -> None:
         self.store = store
         self.max_klines = max_klines
         self.timeframe = timeframe
         self._page = backfill_page
         self._fetch = fetch_fn or fetch_klines_batch
 
-    def update(self, symbol: str):
+    def update(self, symbol: str) -> pd.DataFrame:
         """拉取最新数据并返回当前全量 K 线（DataFrame）。"""
         latest = self.store.latest_ts(symbol)
         if latest is None:

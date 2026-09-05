@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from types import FrameType
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,8 +56,8 @@ class TradingLoop:
         poll_sec: int = 10,
         high_freq_poll_sec: float = 2.0,
         user_stream: UserStream | None = None,
-        ticker=None,
-    ):
+        ticker: "SpotTickerThread" | None = None,
+    ) -> None:
         """ticker: Binance 实时价线程（SpotTickerThread，可选）——build_view 计算
         live_delta_pct（方向一致性过滤）。None 时不过滤（旧配置兼容）。
 
@@ -145,7 +146,7 @@ class TradingLoop:
 
         self._shutdown = False
 
-        def _on_signal(signum, frame):
+        def _on_signal(signum: int, frame: FrameType | None) -> None:
             logger.info("收到信号 %s，优雅停机中...", signum)
             self._shutdown = True
 

@@ -28,11 +28,11 @@ class ParentWatchdog:
         self,
         *,
         parent_pid: int | None,
-        child_process,
+        child_process: "subprocess.Popen",
         is_alive: Callable[[int], bool],
         on_parent_exit: Callable[[int], None],
         poll_interval: float = 2.0,
-    ):
+    ) -> None:
         self._parent_pid = parent_pid
         self._child = child_process
         self._is_alive = is_alive

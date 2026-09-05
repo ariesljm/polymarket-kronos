@@ -15,8 +15,8 @@ import logging
 import os
 import signal
 import subprocess
+from types import FrameType
 import sys
-from pathlib import Path
 
 
 def _kill_tree(pid: int) -> None:
@@ -61,12 +61,12 @@ def main(argv: list[str] | None = None) -> int:
                           pid_file=f"{data_dir}/bot.pids")
 
 
-def _main_with_guard(args, mode: str, data_dir: str) -> int:
+def _main_with_guard(args: argparse.Namespace, mode: str, data_dir: str) -> int:
     import pmbot.monitor as monitor
 
     # 终端关闭（CTRL_CLOSE/LOGOFF/SHUTDOWN）在 Windows 上触发 SIGTERM：
     # 转为 KeyboardInterrupt 走统一优雅退出路径（finally 整树清理）。
-    def _on_sigterm(signum, frame):
+    def _on_sigterm(signum: int, frame: FrameType | None) -> None:
         raise KeyboardInterrupt
 
     try:

@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+from types import FrameType
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -129,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     # 终端关闭（CTRL_CLOSE）在 Windows 触发 SIGTERM → 优雅停机（同 Ctrl-C）
     import signal as _signal
 
-    def _on_sigterm(signum, frame):
+    def _on_sigterm(signum: int, frame: FrameType | None) -> None:
         raise KeyboardInterrupt
 
     try:

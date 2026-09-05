@@ -1,6 +1,6 @@
 """多标的聚合终端面板：BTC + ETH + SOL 的 momentum 实时状态 + 交易汇总。
 
-用法: uv run python scripts/multi_panel.py [--data-dir data_btc,data_eth,data_sol] [--live]
+用法: uv run python scripts/multi_panel.py [--data-dir data_multi/btc,data_multi/eth,data_multi/sol] [--live]
 循环多个数据目录,每 2 秒刷新。视图构建复用 panel_view.build_multi_view
 （与 monitor 共用同一读面;模式/目录经 RuntimePaths 派生,不再本脚本硬编码）。
 """
@@ -59,7 +59,7 @@ def block_for(v, data_dir: str | Path, data_root: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="多标的聚合面板")
-    parser.add_argument("--data-dir", default="data_btc,data_eth,data_sol",
+    parser.add_argument("--data-dir", default="data_multi/btc,data_multi/eth,data_multi/sol",
                         help="逗号分隔的数据目录列表（每标的一个 bot 进程一个）")
     parser.add_argument("--live", action="store_true", help="实盘模式（默认 dry-run；模式/目录派生与 monitor 一致）")
     args = parser.parse_args(argv)

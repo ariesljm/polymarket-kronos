@@ -49,10 +49,10 @@ class ExecutionDispatcher:
         store: StateStore,
         dry_run: bool,
         step_sec: int,
-        save_status,
+        save_status: Callable[[], None],
         taker_fee_pct: float = 0.0,
-        breaker_cfg=None,
-    ):
+        breaker_cfg: "EngineConfig" | None = None,
+    ) -> None:
         # state 可传 TradeState 实例或 () -> TradeState；统一收敛为 getter：
         # 每次 self.state 都取当前对象，reset 重建状态无需手工同步。
         self._state_getter: Callable[[], TradeState] = (
@@ -268,7 +268,7 @@ class ExecutionDispatcher:
         if sampler is not None:
             sampler.subscribe([])
 
-    def subscribe_sampler(self, market: MarketInfo, user_stream=None) -> None:
+    def subscribe_sampler(self, market: MarketInfo, user_stream: "UserStream" | None = None) -> None:
         """BookSampler 订阅当前窗口 token。"""
         sampler = self.book.sampler
         if sampler is not None:

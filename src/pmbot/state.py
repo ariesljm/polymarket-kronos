@@ -116,7 +116,7 @@ class StateStore:
     快照/日志的序列化细节收敛在此模块。
     """
 
-    def __init__(self, status_path: str | Path = "data/status.json", trades_path: str | Path = "data/trades.csv"):
+    def __init__(self, status_path: str | Path = "data/status.json", trades_path: str | Path = "data/trades.csv") -> None:
         self.status_path = Path(status_path)
         self.trades_path = Path(trades_path)
 

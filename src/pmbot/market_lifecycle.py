@@ -64,7 +64,7 @@ class LifecycleDeps(Protocol):
 class MarketLifecycle:
     """单个市场窗口的生命周期。依赖经 LifecycleDeps 窄接口注入。"""
 
-    def __init__(self, deps: LifecycleDeps, window_start: int, now_sec: int):
+    def __init__(self, deps: LifecycleDeps, window_start: int, now_sec: int) -> None:
         self.deps = deps
         self.window_start = window_start
         self.phase = Phase.INIT

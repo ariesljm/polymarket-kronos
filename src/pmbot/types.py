@@ -36,7 +36,7 @@ class Signal:
     p_up: float
     baseline_close: float | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # 兼容字符串形式（如 "up"），统一为枚举，避免裸串穿透类型判断
         if isinstance(self.direction, str):
             object.__setattr__(self, "direction", Direction(self.direction))
@@ -162,6 +162,6 @@ class MarketView:
     elapsed_sec: int = 0  # 窗口已进行秒数（开仓延迟判断用，0 = 未知）
     live_delta_pct: float | None = None  # 窗口起点至今 Binance 实时移动 %（None=无实时价，不过滤）
 
-def token_for(market, direction: Direction) -> str:
+def token_for(market: "MarketInfo", direction: Direction) -> str:
     """方向 → 市场 token（UP→yes，DOWN→no）。单一事实源（main_loop/lifecycle 共用）。"""
     return market.yes_token_id if direction is Direction.UP else market.no_token_id

@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from typing import Callable
+
 import pandas as pd
 
 DEFAULT_MIN_TRADES = 200
@@ -65,7 +67,7 @@ def significance_stats(pnls: list[float]) -> dict:
     return out
 
 
-def aggregate(records, match=None) -> dict:
+def aggregate(records: list, match: Callable | None = None) -> dict[str, float | int]:
     """交易记录聚合（笔数/胜败/盈亏/最大亏损）。
 
     match(record) 返回 False 的行不计入（如今日过滤）；None 表示全部交易。

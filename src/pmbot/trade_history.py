@@ -19,7 +19,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from pmbot.ledger import RECORD_COLUMNS, TradeRecord
 logger = logging.getLogger(__name__)
@@ -58,10 +58,10 @@ class TradeHistorySyncer:
     def __init__(
         self,
         path: str | Path,
-        fetch_trades,
-        fetch_redeems,
+        fetch_trades: Callable[..., list[dict]],
+        fetch_redeems: Callable[..., list[dict]],
         poll_sec: int = 300,
-    ):
+    ) -> None:
         self.path = Path(path)
         self._fetch_trades = fetch_trades
         self._fetch_redeems = fetch_redeems
@@ -124,7 +124,7 @@ class TradeHistorySyncer:
             logger.warning("读取 %s 失败，按空历史处理", self.path)
         return known
 
-    def _fetch_new(self, fetch, known_tx: set[str]) -> list[dict]:
+    def _fetch_new(self, fetch: Callable[..., list[dict]], known_tx: set[str]) -> list[dict]:
         """分页拉取流水直到历史区：本页全部已知（已同步过）或到尾页即停。"""
         rows: list[dict] = []
         offset = 0

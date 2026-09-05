@@ -3,31 +3,15 @@ name = "pmbot"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    "einops>=0.8.2",
-    "huggingface-hub>=1.27.0",
-    "numpy>=2.5.2",
-    "pandas>=3.0.5",
     "py-clob-client-v2>=1.1.0",
     "python-dotenv>=1.2.2",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
     "pyyaml>=6.0",
     "requests>=2.34.2",
     "rich>=15.0.0",
-    "safetensors>=0.8.0",
-    "scipy>=1.18.0",
-    "torch>=2.0",
     "websockets>=17.0.1",
 ]
-
-# GPU 推理（NVIDIA GTX 1060 3GB，Pascal 架构）：使用 CUDA 12.6 源
-[tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true  # 仅显式指定（torch）走此源，其他依赖仍从 PyPI 解析
-
-# 无 NVIDIA 环境回退：删除上方 sources/index 后 uv sync 即回 PyPI CPU 版。
 
 [dependency-groups]
 dev = [

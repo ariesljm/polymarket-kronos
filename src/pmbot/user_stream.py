@@ -28,7 +28,7 @@ class UserStream(ReconnectingWsThread):
     ws_url = WS_URL
 
     def __init__(self, auth: dict | None = None, proxy: str | None = None,
-                 ws_url: str = WS_URL):
+                 ws_url: str = WS_URL) -> None:
         """auth: {"apiKey", "secret", "passphrase"}；无 auth 时仅空转（不连接）。"""
         super().__init__(name="user-stream", proxy=proxy)
         self.ws_url = ws_url

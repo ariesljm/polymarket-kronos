@@ -11,10 +11,13 @@ config.py 本身无需改动。
 
 from __future__ import annotations
 
+import typing
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+T = typing.TypeVar("T", float, int)
 
 KNOWN_STRATEGIES = ("momentum",)
 
@@ -180,51 +183,27 @@ def load_config(path: str | Path) -> Config:
     if not (0 < tpm < 1):
         raise ConfigError("take_profit_max 必须在 (0,1) 之间")
 
-    cbe = _as_int(s["cancel_before_end_sec"], "cancel_before_end_sec")
-    elbe = _as_int(s.get("exit_loss_before_end_sec", DEFAULTS["exit_loss_before_end_sec"]), "exit_loss_before_end_sec")
-    hte = _as_int(s.get("hold_until_end_sec", DEFAULTS["hold_until_end_sec"]), "hold_until_end_sec")
-    nebs = _as_int(s.get("no_entry_before_end_sec", DEFAULTS["no_entry_before_end_sec"]), "no_entry_before_end_sec")
-    ods = _as_int(s.get("open_delay_sec", DEFAULTS["open_delay_sec"]), "open_delay_sec")
-    if cbe <= 0 or elbe < 0 or hte < 0 or nebs < 0:
-        raise ConfigError(
-            "cancel_before_end_sec 必须 > 0；"
-            "exit_loss_before_end_sec / hold_until_end_sec / "
-            "no_entry_before_end_sec 必须 ≥ 0（0 表示关闭）"
-        )
-    if not 0 <= ods <= 300:
-        raise ConfigError("open_delay_sec 必须在 0-300 秒之间（0 表示关闭开仓延迟）")
+    cbe = _field(s, "cancel_before_end_sec", _as_int, lo=1)
+    elbe = _field(s, "exit_loss_before_end_sec", _as_int, lo=0, hint="0 表示关闭")
+    hte = _field(s, "hold_until_end_sec", _as_int, lo=0, hint="0 表示关闭")
+    nebs = _field(s, "no_entry_before_end_sec", _as_int, lo=0, hint="0 表示关闭")
+    ods = _field(s, "open_delay_sec", _as_int, lo=0, hi=300, hint="0 表示关闭开仓延迟")
 
-    csp = _as_float(s.get("contradiction_skip_pct", DEFAULTS["contradiction_skip_pct"]),
-                    "contradiction_skip_pct")
-    if csp < 0:
-        raise ConfigError("contradiction_skip_pct 必须 ≥ 0（0 表示关闭方向一致性过滤）")
+    csp = _field(s, "contradiction_skip_pct", _as_float, lo=0, hint="0 表示关闭方向一致性过滤")
 
-    mep = _as_float(s.get("max_entry_price", DEFAULTS["max_entry_price"]),
-                    "max_entry_price")
-    if mep < 0:
-        raise ConfigError("max_entry_price 必须 ≥ 0（0 表示关闭入场价上限）")
+    mep = _field(s, "max_entry_price", _as_float, lo=0, hint="0 表示关闭入场价上限")
 
-    miep = _as_float(s.get("min_entry_price", DEFAULTS["min_entry_price"]),
-                     "min_entry_price")
-    if miep < 0:
-        raise ConfigError("min_entry_price 必须 ≥ 0（0 表示关闭入场价下限）")
+    miep = _field(s, "min_entry_price", _as_float, lo=0, hint="0 表示关闭入场价下限")
     if 0 < miep and 0 < mep and miep >= mep:
         raise ConfigError("min_entry_price 必须 < max_entry_price")
 
-    tfp = _as_float(s.get("taker_fee_pct", DEFAULTS["taker_fee_pct"]),
-                    "taker_fee_pct")
-    if not (0 <= tfp < 1):
-        raise ConfigError("taker_fee_pct 必须在 [0,1) 之间（0 表示不模拟手续费）")
+    tfp = _field(s, "taker_fee_pct", _as_float, lo=0, hi=1, hi_excl=True, hint="0 表示不模拟手续费")
 
-    thr = _as_float(s.get("threshold_pct", DEFAULTS["threshold_pct"]),
-                    "threshold_pct")
-    if thr <= 0:
-        raise ConfigError("threshold_pct 必须 > 0（momentum 穿越阈值，如 0.08 = 0.08%%）")
+    thr = _field(s, "threshold_pct", _as_float, lo=0, lo_excl=True,
+                 hint="momentum 穿越阈值，如 0.08 = 0.08%")
 
-    mcl = _as_int(s["max_consecutive_losses"], "max_consecutive_losses")
-    mdl = _as_float(s["max_daily_loss"], "max_daily_loss")
-    if mcl <= 0 or mdl <= 0:
-        raise ConfigError("max_consecutive_losses / max_daily_loss 必须 > 0")
+    mcl = _field(s, "max_consecutive_losses", _as_int, lo=1)
+    mdl = _field(s, "max_daily_loss", _as_float, lo=0, lo_excl=True)
 
     return Config(
         strategy=strategy,
@@ -260,15 +239,44 @@ def _known_strategies() -> tuple[str, ...]:
     return strategies()
 
 
-def _as_float(value, name: str) -> float:
+def _as_float(value: object, name: str) -> float:
     try:
-        return float(value)
+        return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError) as e:
         raise ConfigError(f"{name} 必须是数字，实际: {value!r}") from e
 
 
-def _as_int(value, name: str) -> int:
+def _as_int(value: object, name: str) -> int:
     try:
-        return int(value)
+        return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError) as e:
         raise ConfigError(f"{name} 必须是整数，实际: {value!r}") from e
+
+
+def _interval_desc(lo: float | None, hi: float | None,
+                   lo_excl: bool, hi_excl: bool) -> str:
+    """范围描述（错误消息用）：纯 Python 无需多态，直接字符串化边界。"""
+    if lo is not None and hi is not None:
+        l, r = ("(" if lo_excl else "["), (")" if hi_excl else "]")
+        return f"在 {l}{lo}, {hi}{r} 之间"
+    if lo is not None:
+        return ("必须 > " if lo_excl else "必须 ≥ ") + str(lo)
+    return "必须 ≤ " + str(hi) if hi is not None else ""
+
+
+def _field(s: dict, key: str,
+           cast: typing.Callable[[object, str], T],
+           *, lo: float | None = None, hi: float | None = None,
+           lo_excl: bool = False, hi_excl: bool = False,
+           hint: str = "") -> T:
+    """合并配置取值：类型转换 + 范围校验，错误消息统一带字段名。
+
+    收敛重复的『_as_X(s.get(key, DEFAULTS[key]), key) + 范围 if + raise』骨架。
+    """
+    v = cast(s.get(key, DEFAULTS[key]), key)  # type: ignore[arg-type]
+    outside = (lo is not None and (v <= lo if lo_excl else v < lo)) or \
+              (hi is not None and (v >= hi if hi_excl else v > hi))
+    if outside:
+        msg = f"{key} {_interval_desc(lo, hi, lo_excl, hi_excl)}"
+        raise ConfigError(msg + (f"（{hint}）" if hint else ""))
+    return v

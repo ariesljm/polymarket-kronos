@@ -59,7 +59,7 @@ class BookSampler(ReconnectingWsThread):
     def __init__(self, fetch_book: Callable[[str], dict] | None = None, interval: float = 2.0,
                  ws_url: str = WS_URL,
                  proxy: str | None = None, book_path: str | None = None,
-                 book_flush_sec: float = 1.0, health_check_sec: float = 2.0):
+                 book_flush_sec: float = 1.0, health_check_sec: float = 2.0) -> None:
         """fetch_book(token_id) -> book dict：WS 断线时的 REST 兜底（可为 None）。
 
         book_path: 落盘文件（data/book.json），供监控面板 1s 级实时盘口。

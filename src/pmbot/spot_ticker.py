@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Callable
 import threading
 import time
 
@@ -44,7 +45,7 @@ class SpotTickerThread(ReconnectingWsThread):
     app_heartbeat_sec = None
 
     def __init__(self, symbol: str = "BTC", *, proxy: str | None = None,
-                 fetch_ticker=None):
+                 fetch_ticker: Callable[[], float | None] | None = None) -> None:
         super().__init__(name="spot-ticker", proxy=proxy)
         self.symbol = normalize_symbol(symbol)
         self.ws_url = WS_URL_TMPL.format(sym=self.symbol.lower())
@@ -71,7 +72,7 @@ class SpotTickerThread(ReconnectingWsThread):
 
     # ---- WS 钩子（ReconnectingWsThread 子类实现） ----
 
-    async def _send_subscribe(self, ws) -> None:
+    async def _send_subscribe(self, ws: "ClientConnection") -> None:
         # Binance 单流 GET 连接（/ws/<stream>）无需发送订阅消息，连上即收
         pass
 

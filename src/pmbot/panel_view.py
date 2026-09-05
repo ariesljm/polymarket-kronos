@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 from pmbot.constants import WINDOW_SECONDS, step_ms_for
@@ -107,7 +108,7 @@ def _fmt_cents(x: float) -> str:
     return f"{c:.2f}" if c < 1 else f"{c:.0f}"
 
 
-def _today_local(tz=None) -> str:
+def _today_local(tz: tzinfo | None = None) -> str:
     """本地时区（默认系统本地）今日日期串（YYYY-MM-DD），自然日切分。"""
     return datetime.now(timezone.utc).astimezone(tz).strftime("%Y-%m-%d")
 
@@ -137,7 +138,9 @@ def _fmt_uptime(sec: int | None) -> str:
 
 # ---- build_view 内部填充 ----
 
-def _view_defaults(model_variant, tp_sl, uptime_sec, now_sec, config_summary) -> PanelView:
+def _view_defaults(model_variant: str | None, tp_sl: dict | None,
+                   uptime_sec: int | None, now_sec: int,
+                   config_summary: dict) -> PanelView:
     """视图默认值（build_view 入口骨架）。"""
     return PanelView(
         model_variant=model_variant,
@@ -166,14 +169,14 @@ def _fill_status_note(v: PanelView, status: TradeState, trades: list) -> None:
         v.status_note = "观望（未达阈值）"
 
 
-def _aggregate_trades(trades, match=None) -> dict:
+def _aggregate_trades(trades: list, match: Callable | None = None) -> dict[str, float | int]:
     """聚合交易统计：委托 stats.aggregate（单一实现，面板/验证报告同口径）。"""
     from pmbot.stats import aggregate
 
     return aggregate(trades, match)
 
 
-def _fill_trades(v: PanelView, trades: list, today: str, tz,
+def _fill_trades(v: PanelView, trades: list, today: str, tz: tzinfo,
                 recent_limit: int | None = RECENT_LIMIT) -> None:
     """今日统计/最近交易/全部交易统计（坏行已在账本读面滤除）。"""
     today_stats = _aggregate_trades(
@@ -203,7 +206,7 @@ def _fill_trades(v: PanelView, trades: list, today: str, tz,
 # ---- 公开入口 ----
 
 def build_view(status: TradeState | None, trades: list,
-               now_sec: int, today: str | None = None, local_tz=None,
+               now_sec: int, today: str | None = None, local_tz: tzinfo | None = None,
                panel: PanelConfig | None = None, recent_limit: int | None = RECENT_LIMIT) -> PanelView:
     """从 TradeState / trades 构建视图数据（纯函数）。"""
     today = today or _today_local()
@@ -305,7 +308,7 @@ def render(v: PanelView) -> str:
     lines.append(f"当前窗口: {v.window_label}")
     prices = v.prices
     if prices:
-        def fmt(x):
+        def fmt(x: object) -> str:
             return _fmt_cents(x) if x is not None else "—"
 
         lines.append(f"盘口 UP: {fmt(prices.get('up_bid'))}/{fmt(prices.get('up_ask'))}  "
@@ -393,7 +396,7 @@ def render(v: PanelView) -> str:
     return "\n".join(lines)
 
 
-def build_live_view(symbol: str | None, config: str, paths,
+def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
                     recent_limit: int | None = RECENT_LIMIT,
                     uptime_sec: int | None = None, spot: dict | None = None) -> PanelView:
     """读取状态/交易/盘口/配置并构建视图（TUI 与 Web 控制台共用）。

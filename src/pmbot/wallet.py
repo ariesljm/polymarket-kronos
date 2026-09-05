@@ -53,7 +53,7 @@ class WalletReconciler:
         dry_run: bool = True,
         refresh_sec: int = BALANCE_REFRESH_SEC,
         step_sec: int = 300,
-    ):
+    ) -> None:
         self._source = source
         self._save = save_status
         self._dry_run = dry_run
@@ -62,12 +62,12 @@ class WalletReconciler:
         self._last_balance_sec = 0
         self._last_positions_sec = 0
 
-    def reconcile(self, now_sec: int, state) -> None:
+    def reconcile(self, now_sec: int, state: TradeState) -> None:
         """按节流周期执行余额刷新与持仓核对（引擎每 tick 调用）。"""
         self._refresh_balance(now_sec, state)
         self._refresh_positions(now_sec, state)
 
-    def startup_reconcile(self, now_sec: int, state) -> None:
+    def startup_reconcile(self, now_sec: int, state: TradeState) -> None:
         """启动立即核对一次 Polymarket 实时持仓（live only，绕过节流）。
 
         引擎 run_forever 启动处调用：意外退出（杀进程/关终端）残留的幽灵持仓
@@ -87,7 +87,7 @@ class WalletReconciler:
 
     # ---- 余额 ----
 
-    def _refresh_balance(self, now_sec: int, state) -> None:
+    def _refresh_balance(self, now_sec: int, state: TradeState) -> None:
         """定时刷新钱包余额快照（面板展示）；查询失败保留旧值。
 
         今日盈亏基准捕获：day_start_balance 为空（首日/跨天后）时，
@@ -117,7 +117,7 @@ class WalletReconciler:
 
     # ---- 实时持仓核对 ----
 
-    def _refresh_positions(self, now_sec: int, state, force: bool = False) -> None:
+    def _refresh_positions(self, now_sec: int, state: TradeState, force: bool = False) -> None:
         """Polymarket 实时持仓核对（官方 /positions）：防幽灵持仓 + UI 实时展示。
 
         force=True（启动核对）绕过节流门：启动场景必须执行一次，不等轮询周期。
@@ -204,7 +204,7 @@ class WalletReconciler:
             return False  # slug 无窗口起点（非 bot 市场格式）：保守不判死仓
         return window_ended_at(ws, now_sec, self._step_sec) and float(p.get("currentValue") or 0) <= 0
 
-    def _adopt_untracked(self, mine: list[dict], state, now_sec: int) -> bool:
+    def _adopt_untracked(self, mine: list[dict], state: TradeState, now_sec: int) -> bool:
         """从未跟踪持仓重建本地 position（接管）。
 
         场景：下单成交但响应丢失（实盘无成交数据放弃建仓）、误清恢复等——

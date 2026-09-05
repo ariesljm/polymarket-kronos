@@ -35,7 +35,7 @@ class ClobExecutor:
         chain_id: int = 137,  # Polygon 主网；Amoy 测试网 80002
         proxy_wallet: str | None = None,
         sampler: SamplerProto | None = None,
-    ):
+    ) -> None:
         """proxy_wallet: Polymarket 代理钱包地址（funder）。
 
         新架构（CTF Exchange V2 + pUSD）下 CLOB 订单使用 POLY_PROXY 签名
@@ -116,7 +116,7 @@ class ClobExecutor:
             "passphrase": creds.api_passphrase,
         }
 
-    def _get_l1(self):
+    def _get_l1(self) -> ClobClient:
         if self._l1_client is None:
             if not self._pk:
                 raise RuntimeError("缺少钱包私钥：请在 .env 中配置 PRIVATE_KEY")
@@ -125,7 +125,7 @@ class ClobExecutor:
             self._l1_client = ClobClient(host=CLOB_HOST, chain_id=self._chain_id, key=self._pk)
         return self._l1_client
 
-    def _get_client(self):
+    def _get_client(self) -> ClobClient:
         if self._client is None:
             from py_clob_client_v2 import ApiCreds, ClobClient
 
@@ -371,7 +371,7 @@ class ClobExecutor:
                                         or detail.get("size_matched") or detail.get("takingAmount"))
             except Exception:
                 pass
-        def _f(x):
+        def _f(x: object) -> float | None:
             try:
                 return float(x) if x is not None else None
             except (TypeError, ValueError):
@@ -490,7 +490,7 @@ class SimExecutor:
         chain_id: int = 137,
         proxy_wallet: str | None = None,
         sampler: SamplerProto | None = None,
-    ):
+    ) -> None:
         self._live = ClobExecutor(
             private_key=private_key,
             creds_cache=creds_cache,

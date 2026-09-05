@@ -34,7 +34,7 @@ class ReconnectingWsThread(threading.Thread):
     # ping，发应用层 PING 文本无益且可能被当作未知消息）。
     app_heartbeat_sec: float | None = 10.0
 
-    def __init__(self, *, name: str | None = None, proxy: str | None = None):
+    def __init__(self, *, name: str | None = None, proxy: str | None = None) -> None:
         super().__init__(daemon=True, name=name or self.__class__.__name__)
         self._proxy = proxy
         self._stop = threading.Event()
@@ -125,7 +125,7 @@ class ReconnectingWsThread(threading.Thread):
         except asyncio.CancelledError:
             return
 
-    async def _answer_heartbeat(self, ws: ClientConnection, msg) -> bool:
+    async def _answer_heartbeat(self, ws: ClientConnection, msg: object) -> bool:
         """应用层心跳应答（兼容）：服务端发 PING 文本 → 回 PONG。
 
         现行 Polymarket 规则以客户端主动发 PING 为心跳主路径（见 _ping_loop），
@@ -160,7 +160,7 @@ class ReconnectingWsThread(threading.Thread):
     # ---- 订阅集合动态推送 ----
 
     def _push_subscriptions(self, wanted: set[str], payload_key: str,
-                            on_error=None) -> None:
+                            on_error: Callable[[], None] | None = None) -> None:
         """订阅集合变化且 WS 连接中：推送 operation 消息动态增删，避免等重连。
 
         wanted: 当前想要的完整订阅集合；payload_key: 服务端键名（如 assets_ids/markets）。

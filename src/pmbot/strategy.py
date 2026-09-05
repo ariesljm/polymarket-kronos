@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable
 
+from pmbot.config import StrategyConfig
 from pmbot.types import Direction, Signal, SignalContext
 
 _REGISTRY: dict[str, type["Strategy"]] = {}
@@ -75,7 +76,8 @@ def strategy_class(name: str) -> type[Strategy]:
     return _REGISTRY[name]
 
 
-def create_strategy(name: str, *, config=None, **kwargs) -> Strategy:
+def create_strategy(name: str, *, config: StrategyConfig | None = None,
+                      **kwargs: object) -> Strategy:
     """按注册名创建策略；config 为 StrategyConfig 窄视图时打包传给策略构造。"""
     if config is not None:
         kwargs.setdefault("strategy_config", config)

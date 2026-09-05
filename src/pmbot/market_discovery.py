@@ -40,11 +40,11 @@ class MarketInfo:
 class MarketDiscovery:
     def __init__(
         self,
-        fetch_markets: Callable | None = None,
-        proxies: dict | None = None,
+        fetch_markets: Callable[[str], list[dict]] | None = None,
+        proxies: dict[str, str] | None = None,
         timeout: int = 30,
         interval: str = "15m",
-    ):
+    ) -> None:
         # 注入 fake 便于测试；默认走 gamma-api
         self._fetch = fetch_markets or self._gamma_fetch
         self._proxies = proxies
@@ -75,7 +75,7 @@ class MarketDiscovery:
         return data if isinstance(data, list) else []
 
     @staticmethod
-    def _parse_json_field(value) -> list:
+    def _parse_json_field(value: object) -> list:
         if isinstance(value, list):
             return value
         if isinstance(value, str):
@@ -87,7 +87,7 @@ class MarketDiscovery:
         return []
 
     @staticmethod
-    def _as_bool(value) -> bool:
+    def _as_bool(value: object) -> bool:
         """gamma 的布尔字段可能是真布尔或字符串 \"True\"/\"False\"。"""
         if isinstance(value, bool):
             return value
@@ -123,7 +123,7 @@ class MarketDiscovery:
         """
         self._cache.pop((symbol, window_start, require_tradable), None)
 
-    def _fetch_window(self, symbol: str, window_start: int, require_tradable: bool):
+    def _fetch_window(self, symbol: str, window_start: int, require_tradable: bool) -> list[dict]:
         """实际查询 gamma（被 find_window 缓存包裹，同窗口只查一次）。"""
         slug = self._slug_for(symbol, window_start)
         markets = self._fetch(slug)

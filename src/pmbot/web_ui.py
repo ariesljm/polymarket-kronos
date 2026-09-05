@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -63,7 +62,7 @@ def make_handler(
     """
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             pass  # 面板已有日志，HTTP 访问不刷屏
 
         def _send_json(self, code: int, data: dict) -> None:

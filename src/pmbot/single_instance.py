@@ -31,7 +31,7 @@ _OPEN_PROCESS_QUERY_LIMITED = 0x1000
 class InstanceGuard:
     """按角色注册/清理的单实例锁（不跨进程加锁，靠"新杀旧"保证唯一）。"""
 
-    def __init__(self, pid_file: str | Path = PID_FILE):
+    def __init__(self, pid_file: str | Path = PID_FILE) -> None:
         self.path = Path(pid_file)
 
     # ---- 内部 ----
@@ -109,7 +109,7 @@ class InstanceGuard:
             self._write(data)
 
 
-def run_with_guard(role: str, fn, pid_file: str | Path = PID_FILE):
+def run_with_guard(role: str, fn: Callable[[], int], pid_file: str | Path = PID_FILE) -> int:
     """按角色执行受单实例守护包裹的业务函数。
 
     新实例先杀旧实例（同角色）再注册自己；fn 结束（含异常）自动注销。

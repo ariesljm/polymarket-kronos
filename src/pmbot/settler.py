@@ -43,7 +43,7 @@ class SettlementSource(Protocol):
     """结算所需市场查询的窄接口（TradingLoop/MarketDiscovery 满足）。"""
 
     def find_window(self, symbol: str, window_start: int,
-                    require_tradable: bool = True): ...
+                    require_tradable: bool = True) -> MarketInfo | None: ...
     def invalidate(self, symbol: str, window_start: int,
                    require_tradable: bool = True) -> None: ...
 
@@ -63,7 +63,7 @@ class Settler:
         settle_timeout_sec: int | None = None,
         dry_run: bool = True,
         simulated_settle: Callable[[Position], float | None] | None = None,
-    ):
+    ) -> None:
         self.symbol = symbol
         self.source = source
         self._settle_proceeds = settle_proceeds
