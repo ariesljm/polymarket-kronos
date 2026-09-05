@@ -23,8 +23,8 @@ uv run python -m pmbot.start_bot --live
 | `uv run python -m pmbot.start_bot [--dry-run\|--live]` | 一键启动：主循环（后台）+ 监控面板（前台） |
 | `uv run python -m pmbot.run [--dry-run\|--live] --symbol BTC --data-dir data_multi/btc` | 单标的专用主循环（多标的并行各跑一个进程） |
 | `uv run python -m pmbot.monitor [--web-port 8765]` | 监控面板 + Web 控制台（http://127.0.0.1:8765，仅本机） |
-| `uv run python scripts/multi_panel.py [--data-dir data_multi/btc,data_multi/eth,data_multi/sol]` | 多标的聚合终端面板（视图复用 build_multi_view） |
-| `start_multi.bat` / `start_momentum.bat` | 多标的 / 单标的批量启动脚本 |
+| `uv run python scripts/multi_panel.py [--data-dir data_multi/btc,data_multi/eth,data_multi/sol]` | 多标的聚合 TUI（corridor-watch 风格：标题栏/标的行情块/LEGS 表/状态栏） |
+| `start_multi.bat` | 多标的批量启动：起 bot 后**自动进入聚合 TUI**（Ctrl-C 退面板不影响 bot） |
 | `uv run python -m pmbot.report` | 验证报告（trades.csv + 策略统计；实盘用 `--data-dir data_live`） |
 | `uv run pytest` | 跑全部测试（423 个） |
 

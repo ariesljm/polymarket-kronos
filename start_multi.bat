@@ -20,7 +20,14 @@ start "pmbot-ETH" /min cmd /c "uv run python -m pmbot.run --dry-run --symbol ETH
 echo 启动 SOL...
 start "pmbot-SOL" /min cmd /c "uv run python -m pmbot.run --dry-run --symbol SOL --data-dir data_multi/sol --poll 2 >> logs\sol.log 2>&1"
 echo 三个标的已启动, 日志: logs\btc.log logs\eth.log logs\sol.log
-echo TUI 聚合面板: uv run python scripts\multi_panel.py
+echo.
+echo 进入聚合 TUI（每 2 秒刷新）...  Ctrl-C 退出面板（bot 继续运行）
+uv run python scripts\multi_panel.py
+echo.
+echo 面板已退出。bot 仍在后台运行。
+echo 再次观察: uv run python scripts\multi_panel.py
+echo 停止全部: start_multi.bat stop
+pause
 goto end
 
 :stop
