@@ -52,6 +52,7 @@ class ExecutionDispatcher:
         save_status: Callable[[], None],
         taker_fee_pct: float = 0.0,
         breaker_cfg: "EngineConfig" | None = None,
+        max_entry_price: float = 0.0,  # 入场价上限（执行层二次校验，防决策后 book 竞态极化追高）
     ) -> None:
         # state 可传 TradeState 实例或 () -> TradeState；统一收敛为 getter：
         # 每次 self.state 都取当前对象，reset 重建状态无需手工同步。
@@ -65,6 +66,7 @@ class ExecutionDispatcher:
         self.step_sec = step_sec
         self._save = save_status
         self.taker_fee_pct = taker_fee_pct
+        self.max_entry_price = max_entry_price  # 可变：main_loop 每轮同步 auto_tune 覆盖
         self.breaker_cfg = breaker_cfg  # EngineConfig：暂停文案消费 engine.BREAKER_MESSAGES（单一事实源）
 
     @property
@@ -143,6 +145,18 @@ class ExecutionDispatcher:
             logger.warning("市价买入跳过：盘口无报价 %s", token[:16])
             # 无报价冷却：本窗口 N 秒内不再重试（信号不变时每 tick 都会再触发
             # PLACE_MARKET，无冷却则缺失盘口时每秒重试；冷却后短暂恢复仍能入场）
+            st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
+            self._save()
+            return
+        # 执行层二次校验：引擎 decide 的 max_entry 初判基于决策时刻 book 快照，
+        # 决策与下单之间 book 被 WS 线程异步更新（穿越后盘口秒级极化）——
+        # 若当前 ask 已 > cap，放弃追价（宁错过不高买：高追仓位历史净亏）。
+        cap = self.max_entry_price
+        if cap > 0 and ask > cap:
+            logger.info(
+                "执行层拦截：决策后盘口极化 ask=%.3f > cap=%.2f（不追价，%ds 后重试）",
+                ask, cap, BUY_RETRY_COOLDOWN_SEC,
+            )
             st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
             self._save()
             return

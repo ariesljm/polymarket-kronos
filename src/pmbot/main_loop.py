@@ -102,6 +102,7 @@ class TradingLoop:
             save_status=self.save_status,
             taker_fee_pct=self.config.taker_fee_pct,
             breaker_cfg=self.config.to_engine_config(),
+            max_entry_price=self.config.max_entry_price,
         )
         # 结算状态机（持仓窗口结束后的结算等待/兑付）：深模块，规则独立可测。
         # 窄接口注入：市场查询（find_window/invalidate）+ 兑付查询 + 平仓/丢弃回调。
@@ -582,7 +583,14 @@ class TradingLoop:
             logger.exception("auto_tune 重算失败（维持当前参数）")
 
     def execute(self, action: Action, market: MarketInfo, now_sec: int) -> None:
-        """动作分派（lifecycle 使用，委托 ExecutionDispatcher）。"""
+        """动作分派（lifecycle 使用，委托 ExecutionDispatcher）。
+
+        每次同步 auto_tune 的入场价上限到执行层（决策初判 + 执行二次校验同一 cap）。
+        """
+        if action.type is ActionType.PLACE_MARKET:
+            eff = (self._auto.max_entry_price if self._auto and self._auto.max_entry_price
+                   else self.config.max_entry_price)
+            self._exec_dispatcher.max_entry_price = eff
         self._exec_dispatcher.execute(action, market, now_sec)
 
     def save_status(self) -> None:
