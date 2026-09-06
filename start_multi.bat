@@ -7,7 +7,7 @@ if "%1"=="stop" goto stop
 mkdir data_multi logs 2>nul
 
 echo Starting multi-symbol bot (BTC+ETH+SOL, single process, log: logs\multi.log)...
-start /b cmd /c "uv run python -m pmbot.run_multi --symbols BTC,ETH,SOL --data-dirs data_multi/btc,data_multi/eth,data_multi/sol --dry-run --poll 2 >nul 2>&1"
+start /b cmd /c "uv run python -m pmbot.run_multi --symbols BTC,ETH,SOL --data-dirs data_multi/btc,data_multi/eth,data_multi/sol --dry-run --poll 1 >nul 2>&1"
 echo.
 echo Entering panel (refresh 2s)... Ctrl-C exits panel only
 uv run python scripts\multi_panel.py

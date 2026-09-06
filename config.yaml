@@ -35,7 +35,7 @@ momentum:
   exit_loss_before_end_sec: 0   # 关闭浮亏离场（持有到结算，窗口末不卖）
   hold_until_end_sec: 60     # 窗口结束前浮盈 → 持有到结算（默认开启）
   no_entry_before_end_sec: 60   # 窗口结束前 60s 禁入（穿越太晚来不及结算）
-  open_delay_sec: 10         # 窗口开始 10s 后开始检测（避开开盘噪声）
+  open_delay_sec: 0         # 开仓延迟：momentum 穿越常发生在窗口早期，延迟 = 盘口被 MM 极化后只能拒单（0=关闭）
   max_entry_price: 0.65      # 入场价上限（首日实证：穿越后盘口秒级极化 ask 直接 0.9+，
                              # taker 追单 EV 负——0.65 拦截高追，待真实入场价分布重估）
   taker_fee_pct: 0.03        # dry-run 模拟 taker 手续费率（按成交金额；比真实费 1.7-2.5%% 保守）

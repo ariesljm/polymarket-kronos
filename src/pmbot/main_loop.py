@@ -54,7 +54,7 @@ class TradingLoop:
         dry_run: bool = True,
         settle_timeout_sec: int | None = None,
         poll_sec: int = 10,
-        high_freq_poll_sec: float = 2.0,
+        high_freq_poll_sec: float = 1.0,
         user_stream: UserStream | None = None,
         ticker: "SpotTickerThread" | None = None,
     ) -> None:

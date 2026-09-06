@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="模拟运行（默认）")
     parser.add_argument("--live", dest="dry_run", action="store_false", help="实盘运行（真钱）")
     parser.set_defaults(dry_run=True)
-    parser.add_argument("--poll", type=int, default=2, help="轮询间隔秒数")
+    parser.add_argument("--poll", type=int, default=1, help="轮询间隔秒数（1s：穿越后尽早决策，抓 MM 未调价窗口）")
     args = parser.parse_args(argv)
 
     from pmbot.config import load_config
