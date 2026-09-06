@@ -570,7 +570,7 @@ class TradingLoop:
             from pmbot.auto_tune import band_stats, tune, tune_reason
             from pmbot.ledger import load_records
 
-            trades = load_records(self.trades_path)
+            trades = load_records(self.trades_path.parent)  # load_records 契约是 data_dir（内部拼 api/trades 文件名）
             stats = band_stats(trades)
             override = tune(
                 trades,

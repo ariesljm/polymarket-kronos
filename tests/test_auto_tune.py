@@ -80,3 +80,22 @@ def test_tune_reason_text():
     stats = band_stats(_trades([(0.1, 0.2)]))
     reason = tune_reason(AutoTuneOverride(), stats)
     assert "无调整" in reason
+
+def test_load_records_requires_data_dir_not_file():
+    """回归: load_records 契约是 data_dir——传文件路径会静默返回空列表
+    （曾致 auto_tune 在 main_loop 里整条链路空跑: 调用方传 trades_path 文件）。"""
+    import csv
+    import tempfile
+    from pathlib import Path
+    from pmbot.ledger import load_records
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        tfile = td / "trades.csv"
+        with open(tfile, "w", newline="", encoding="utf-8") as fh:
+            from pmbot.ledger import RECORD_COLUMNS
+            w = csv.DictWriter(fh, fieldnames=RECORD_COLUMNS)
+            w.writeheader()
+            w.writerow(dict.fromkeys(RECORD_COLUMNS, ""))  # 仅表头（半写场景），仍应有记录？无数据行 → []
+        assert load_records(td) == []       # 目录语义: 无数据行 → 空
+        assert load_records(tfile) == []    # 文件语义现在与目录一致(容错归一),不再静默崩
