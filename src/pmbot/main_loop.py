@@ -136,6 +136,7 @@ class TradingLoop:
             )
         self._lifecycle: MarketLifecycle | None = None
         self._skip_window_until = 0  # 启动跳过窗口终点（秒；0=不跳过，run_forever 启动时设置）
+        self._last_hb = 0.0  # 心跳日志：每 60s 一行运行摘要（复盘时间线）
 
     # ---- 对外入口 ----
 
@@ -204,6 +205,22 @@ class TradingLoop:
             return  # stop 指令：本 tick 不再交易，循环随即优雅停机
         st = self.state
         now_sec = now_ms // 1000
+        # 心跳：每 60s 记录运行状态（窗口/持仓/盘口/策略），保证无事件时段也有时间线
+        if now_sec - self._last_hb >= 60:
+            self._last_hb = float(now_sec)
+            pos = st.position
+            wstart = (datetime.fromtimestamp(st.window_start, tz=timezone.utc).strftime("%H:%M")
+                      if st.window_start else "—")
+            hb = (
+                f"心跳 窗口@{wstart} 剩余={max(0, (st.window_start + self.step_sec - now_sec) if st.window_start else 0)}s "
+                f"持仓={'%s %.2f股@%.3f' % (pos.direction.value.upper(), pos.size, pos.entry_price) if pos else '无'} "
+            )
+            prices = st.market_prices or {}
+            if prices:
+                hb += f"盘口UP={prices.get('up_ask')} DOWN={prices.get('down_ask')} "
+            if getattr(st, "strategy_state", None):
+                hb += f"策略={st.strategy_state}"
+            logger.info(hb)
         day = datetime.fromtimestamp(now_sec, tz=timezone.utc).strftime("%Y-%m-%d")
         st.roll_day(day)  # 先处理跨天（重置今日基准），再刷新余额捕获新基准
         self.wallet_sync.reconcile(now_sec, st)

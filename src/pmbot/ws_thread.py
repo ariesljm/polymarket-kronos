@@ -12,14 +12,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import threading
 
 from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_BASE = 2.0
-RECONNECT_MAX = 30.0
+RECONNECT_BASE = 30.0  # 重连退避起步（秒）：多 bot 并发时避免握手风暴触发服务端限流
+RECONNECT_MAX = 300.0  # 重连退避上限（秒）
 
 
 class ReconnectingWsThread(threading.Thread):
@@ -97,11 +98,14 @@ class ReconnectingWsThread(threading.Thread):
             except Exception as e:
                 logger.warning("%s 断开（%s），%.0fs 后重连", self.__class__.__name__, e, backoff)
                 self._on_disconnect()
-                # 等待重连期间周期调用兜底钩子（如 REST 轮询），保持数据新鲜
+                # 等待重连期间周期调用兜底钩子（如 REST 轮询），保持数据新鲜。
+                # 重连等待加 ±50% 抖动：多 bot 并发断开时错开同步握手，
+                # 避免同时重连触发服务端连接限流（曾见 3 bot 同步重连风暴）。
+                wait_total = backoff * random.uniform(0.5, 1.5)
                 waited = 0.0
-                while not self._stop.is_set() and waited < backoff:
+                while not self._stop.is_set() and waited < wait_total:
                     self._while_disconnected()
-                    wait = min(self.disconnect_poll_sec, backoff - waited)
+                    wait = min(self.disconnect_poll_sec, wait_total - waited)
                     self._stop.wait(wait)
                     waited += wait
                 backoff = min(backoff * 2, self.reconnect_max)

@@ -9,10 +9,37 @@ from __future__ import annotations
 
 import argparse
 import logging
+import logging.handlers
 import os
 import sys
 import time
+from pathlib import Path
 from types import FrameType
+
+
+def _setup_logging(log_dir: Path, symbol: str) -> None:
+    """日志：按天滚动文件 logs/{symbol}.log（保留 14 天，UTF-8）
+    + 交互终端（stderr 为 TTY）时附加控制台输出。
+    后台启动（nohup/start /b 重定向到 nul）只写文件——日志唯一来源。
+    """
+    root = logging.getLogger()
+    if root.handlers:  # 重复启动防御（同一进程多次调用 main）
+        return
+    log_dir.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    fh = logging.handlers.TimedRotatingFileHandler(
+        log_dir / f"{symbol}.log", when="midnight", backupCount=14, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    handlers: list[logging.Handler] = [fh]
+    if sys.stderr.isatty():
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        handlers.append(sh)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    # 降噪：httpx/py_clob 每 tick 刷屏的请求日志提升到 WARNING（曾占满日志 90%+）
+    for noisy in ("httpx", "py_clob_client_v2.http_helpers.helpers", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,13 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="只跑一个 tick 后退出（调试）")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    # 降噪：httpx/py_clob 每 tick 刷屏的请求日志提升到 WARNING（曾占满日志 90%+）
-    for noisy in ("httpx", "py_clob_client_v2.http_helpers.helpers", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    _setup_logging(Path(__file__).resolve().parent.parent / "logs",
+                   (args.symbol or "pmbot"))
 
     # 依赖集中导入（函数内：入口模块冷启动不加载重型依赖链）
     from pmbot.book_sampler import BookSampler
@@ -55,9 +77,13 @@ def main(argv: list[str] | None = None) -> int:
     paths = paths_for(not args.dry_run, args.data_dir)
     data_dir = paths.data_dir
 
+    # 代理从环境读取（墙内访问 Polymarket/Binance 需代理；BookSampler/SpotTicker/UserStream 统一注入）
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+
     # Binance 实时价线程提前创建：momentum 策略用它做穿越检测（WS ~1s 推送，
     # 比每 tick REST 快；更早发现穿越 → 更可能抓做市商未调价的便宜档）。
-    ticker = SpotTickerThread(symbol=symbol)
+    # 直连墙内不稳（实测超时），与 BookSampler 一致走代理。
+    ticker = SpotTickerThread(symbol=symbol, proxy=proxy)
     strat_kwargs = {}
     # 依赖注入按策略声明（needs_fetch_price）：新策略声明即可，run.py 不再
     # 按策略名硬编码 if（策略名单单一事实源在 registry + 策略类自身）。
@@ -74,9 +100,9 @@ def main(argv: list[str] | None = None) -> int:
     discovery = MarketDiscovery(interval=cfg.market_interval)
     executor = SimExecutor() if args.dry_run else ClobExecutor()  # 两个适配器：模拟 / 实盘
 
-    # Polymarket WS 市场频道（REST book 兜底）；代理从环境读取（polymarket 需代理）
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    sampler = BookSampler(executor.fetch_book, interval=1.0, proxy=proxy,
+    # Polymarket WS 市场频道（REST book 兜底）
+    # interval=3.0：降频 REST 兜底请求（WS 断开时避免 1s 级高频触发 API 限流）
+    sampler = BookSampler(executor.fetch_book, interval=3.0, proxy=proxy,
                                  book_path=f"{data_dir}/book.json")
     executor.attach_sampler(sampler)
     sampler.start()
@@ -87,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
     user_stream.start()
 
     # Binance 实时价线程（方向一致性过滤数据源 + momentum 穿越检测）：WS miniTicker + REST 兜底。
-    # 镜像端点直连可达（data_source 同款实证），不传 proxy 优先直连。
     # ticker 已提前创建（momentum 注入用），此处启动。
     ticker.start()
 
@@ -118,6 +143,16 @@ def main(argv: list[str] | None = None) -> int:
         control_path=f"{data_dir}/control.json",
     )
 
+    # 启动横幅：一键复盘需要的全部上下文（时间/模式/标的/数据目录/策略/网络）
+    logging.info("=" * 56)
+    logging.info("pmbot 启动")
+    logging.info("模式=%s 标的=%s 数据目录=%s", mode, symbol, data_dir)
+    logging.info("策略=%s 窗口=%s 轮询=%ds 每注=%s USDC",
+                 cfg.strategy, cfg.market_interval, args.poll, cfg.amount_per_trade)
+    logging.info("代理=%s（None=直连）", proxy)
+    logging.info("WS: BookSampler=Polymarket盘口 SpotTicker=Binance实时价 断线自动重连（退避30-300s）")
+    logging.info("=" * 56)
+
     def _run() -> None:
         from pmbot.control import read_control
 
@@ -139,7 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     # 单实例守护：杀旧 run 实例防多开互踩状态文件；退出自动注销
-    run_with_guard("run", _run, pid_file=paths.pid_file)
+    try:
+        run_with_guard("run", _run, pid_file=paths.pid_file)
+    except Exception:
+        logging.exception("主循环异常退出（崩溃兜底，完整 traceback 已记录）")
+        return 2
     return 0
 
 
