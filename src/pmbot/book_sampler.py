@@ -302,7 +302,41 @@ class BookSampler(ReconnectingWsThread):
                 if snap is None:
                     continue
                 _apply_price_change(snap, c)
+                # price_change 每条自带服务端权威 top-of-book（官方文档字段）；
+                # 存快照供 best_ask/best_bid 优先读——比本地档位排序更及时权威，零额外流量。
+                if c.get("best_bid") is not None:
+                    snap["best_bid"] = str(c["best_bid"])
+                if c.get("best_ask") is not None:
+                    snap["best_ask"] = str(c["best_ask"])
                 self._snapshot_ts[asset_id] = time.monotonic()
+
+    def best_ask(self, token_id: str) -> float | None:
+        """最优卖价：优先 WS 权威 best_ask（price_change 携带），缺失则档位加权。"""
+        snap = self.snapshot(token_id)
+        if snap is None:
+            return None
+        if snap.get("best_ask") is not None:
+            try:
+                return float(snap["best_ask"])
+            except (TypeError, ValueError):
+                pass
+        from pmbot.book_price import weighted_price
+
+        return weighted_price(snap, "asks", size=1.0)
+
+    def best_bid(self, token_id: str) -> float | None:
+        """最优买价：优先 WS 权威 best_bid（price_change 携带），缺失则档位加权。"""
+        snap = self.snapshot(token_id)
+        if snap is None:
+            return None
+        if snap.get("best_bid") is not None:
+            try:
+                return float(snap["best_bid"])
+            except (TypeError, ValueError):
+                pass
+        from pmbot.book_price import weighted_price
+
+        return weighted_price(snap, "bids", size=1.0)
 
     def _apply_light_event(self, data: dict) -> None:
         """轻量行情事件（best_bid_ask / last_trade_price）：仅作事件流心跳（_touch 刷新新鲜度）。"""

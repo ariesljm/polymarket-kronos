@@ -120,6 +120,58 @@ def test_price_change_updates_snapshot(fake_connect):
         s.join(timeout=2)
 
 
+def test_price_change_best_ask_authoritative(fake_connect):
+    """price_change 自带服务端权威 best_ask/best_bid → best_ask() 优先读它（零额外流量）。"""
+    import json as _json
+
+    snap = book_event("tok-a", [(0.45, 10)], [(0.46, 8)])
+    changes = {"event_type": "price_change", "price_changes": [
+        {"asset_id": "tok-a", "price": "0.45", "size": "12", "side": "BUY",
+         "best_bid": "0.50", "best_ask": "0.51"},
+    ]}
+    fake_connect([[_json.dumps([snap]), _json.dumps(changes)]])
+    s = BookSampler(interval=0.05)
+    s.subscribe(["tok-a"])
+    s.start()
+    try:
+        deadline = time.time() + 2
+        ask = bid = None
+        while time.time() < deadline:
+            ask = s.best_ask("tok-a")
+            bid = s.best_bid("tok-a")
+            if ask == 0.51:
+                break
+            time.sleep(0.02)
+        assert ask == 0.51  # 权威值优先于档位 0.46
+        assert bid == 0.50
+    finally:
+        s.stop()
+        s.join(timeout=2)
+
+
+def test_best_ask_fallback_to_levels(fake_connect):
+    """price_change 无 best_ask 字段 → 档位加权兜底（老数据兼容）。"""
+    import json as _json
+
+    snap = book_event("tok-a", [(0.45, 10)], [(0.46, 8)])
+    fake_connect([[_json.dumps([snap])]])
+    s = BookSampler(interval=0.05)
+    s.subscribe(["tok-a"])
+    s.start()
+    try:
+        deadline = time.time() + 2
+        ask = None
+        while time.time() < deadline:
+            ask = s.best_ask("tok-a")
+            if ask is not None:
+                break
+            time.sleep(0.02)
+        assert ask == 0.46  # 档位第一档
+    finally:
+        s.stop()
+        s.join(timeout=2)
+
+
 def test_unsubscribe_clears_snapshot(fake_connect):
     """退订清空快照；再次订阅触发新连接。"""
     import json as _json
