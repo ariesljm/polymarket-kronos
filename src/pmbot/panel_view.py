@@ -227,6 +227,7 @@ def _fill_trades(v: PanelView, trades: list, today: str, tz: tzinfo,
             {
                 "ts": _fmt_ts(r.ts),
                 "direction": r.direction,
+                "size": r.size,
                 "entry": r.entry_price,
                 "exit": r.exit_price,
                 "pnl": round(r.pnl, 4),

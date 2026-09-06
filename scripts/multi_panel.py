@@ -266,7 +266,7 @@ def _legs_table(views: list[PanelView]) -> Table:
         if v.position:
             p = v.position
             table.add_row(
-                "> " + (v.symbol or "?"), v.symbol or "?", dir_name(p["direction"]),
+                Text("▶ 持仓", style="bold yellow"), v.symbol or "?", dir_name(p["direction"]),
                 f"{p['size']:.2f}", _fmt_cents(p["entry_price"]), "持仓中",
                 Text("—", style="yellow"),
             )
@@ -274,7 +274,7 @@ def _legs_table(views: list[PanelView]) -> Table:
         if v.pending:
             p = v.pending
             table.add_row(
-                "  " + (v.symbol or "?"), v.symbol or "?", dir_name(p["direction"]),
+                Text("▶ 挂单", style="bold magenta"), v.symbol or "?", dir_name(p["direction"]),
                 f"{p['size'] or '?'}", _fmt_cents(p["price"]), "挂单中",
                 Text("—", style="magenta"),
             )
@@ -283,8 +283,8 @@ def _legs_table(views: list[PanelView]) -> Table:
         if v.recent_trades:
             t = v.recent_trades[0]
             table.add_row(
-                "  " + (v.symbol or "?"), v.symbol or "?", dir_name(t["direction"]),
-                "—", _fmt_cents(t["entry"]), _fmt_cents(t["exit"]),
+                Text("▸ 最近", style="dim"), v.symbol or "?", dir_name(t["direction"]),
+                f"{t.get('size', 0):.2f}", _fmt_cents(t["entry"]), _fmt_cents(t["exit"]),
                 _pnl_text(t["pnl"]),
             )
             has_row = True
