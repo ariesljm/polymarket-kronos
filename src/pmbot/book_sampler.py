@@ -83,7 +83,6 @@ class BookSampler(ReconnectingWsThread):
         self._retry_after: dict[str, float] = {}
         self._retry_backoff: dict[str, float] = {}
         self._direction_map: dict[str, str] = {}  # token_id -> up/down
-        self._last_subscribed: set[str] = set()  # 已发送给服务端的订阅集合（WS 线程读写）
         self._book_path = Path(book_path) if book_path else None
         self._book_flush_sec = book_flush_sec
         self._health_check_sec = health_check_sec
@@ -257,8 +256,8 @@ class BookSampler(ReconnectingWsThread):
             await ws.send(json.dumps({
                 "type": "market", "assets_ids": tokens,
             }))
-            # 连接时全量订阅 → 更新已发送集合基线（后续增量 diff 的基础）
-            self._last_subscribed = set(tokens)
+            # 连接时全量订阅 → 基类 _mark_subscribed 记录基线（后续增量 diff 基础）
+            self._mark_subscribed(tokens)
 
     def _handle_message(self, raw: str) -> None:
         if raw == "PONG":

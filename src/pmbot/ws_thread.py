@@ -47,6 +47,9 @@ class ReconnectingWsThread(threading.Thread):
         self._loop: asyncio.AbstractEventLoop | None = None
         # 最后收到数据时刻（僵尸连接检测：服务端不推数据但连接不关 → 主动重连）
         self._last_data_ts = 0.0
+        # 已发送给服务端的订阅集合（基类持有，_push_subscriptions 增量 diff 基线；
+        # 子类 _send_subscribe 经 _mark_subscribed 更新——不再各自手写初始化）
+        self._last_subscribed: set[str] = set()
 
     # ---- 对外接口 ----
 
@@ -176,6 +179,11 @@ class ReconnectingWsThread(threading.Thread):
 
     def _handle_message(self, raw: str) -> None:
         """处理收到的消息。"""
+
+    def _mark_subscribed(self, tokens) -> None:
+        """记录已发送给服务端的订阅集合（_send_subscribe 连接时全量订阅后调用，
+        供 _push_subscriptions 做增量 diff 基线）。"""
+        self._last_subscribed = set(tokens)
 
     # ---- 订阅集合动态推送 ----
 

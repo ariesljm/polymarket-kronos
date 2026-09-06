@@ -13,14 +13,11 @@ from pmbot.config import EngineConfig
 
 @dataclass(frozen=True)
 class AutoTuneOverride:
-    """自适应调参覆盖（auto_tune 生成）:None 字段 = 退化为 config 值。
+    """自适应调参覆盖（auto_tune 生成）:完整覆盖值——字段恒有值（无调整时为
+    对应 config 默认），消费者直读，不做 None→config 回落（回落收口在 tune()）。"""
 
-    max_entry_price: 收窄后的入场价上限(禁止高于此价入场)。
-    take_profit: 调整后的止盈比例(接近 1 = 持有到结算)。
-    """
-
-    max_entry_price: float | None = None
-    take_profit: float | None = None
+    max_entry_price: float = 0.0
+    take_profit: float = 0.0
 from pmbot.exit_rules import position_exit_levels
 from pmbot.types import Action, ActionType, Direction, MarketView, Position, Signal, StateView
 
@@ -123,8 +120,9 @@ def _manage_position(config: EngineConfig, position: Position, best_bid: float |
     if best_bid is None:
         return Action(ActionType.SKIP)
     # 百分比止盈止损（相对入场价）：共享 exit_rules 单一事实源（回测/面板同公式）
+    # auto_tune 完整覆盖值：override 恒有值（无调整 = config 默认），直读不回落
     tp, sl = position_exit_levels(
-        position.entry_price, override.take_profit if override and override.take_profit else config.take_profit,
+        position.entry_price, override.take_profit if override else config.take_profit,
         config.stop_loss,
         tp_max=config.take_profit_max,
     )
@@ -160,9 +158,8 @@ def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
         return Action(ActionType.SKIP, reason="contradiction")
     # 入场价上限：盘口 ask 高于此价不入场（追高仓位历史净亏；0 = 关闭）。
     # 无报价（None）不拦——执行层缺报价本就放弃建仓。
-    # auto_tune 覆盖：数据证明高价格带亏损时收窄上限。
-    cap = (override.max_entry_price if override and override.max_entry_price
-           else config.max_entry_price)
+    # auto_tune 完整覆盖值：override 恒有值（无调整 = config 默认），直读不回落
+    cap = override.max_entry_price if override else config.max_entry_price
     if cap > 0 and best_ask is not None and best_ask > cap:
         return Action(ActionType.SKIP, reason="entry_price_cap")
     # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 五五开档历史净亏 -2.52/31 笔，

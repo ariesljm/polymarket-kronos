@@ -12,7 +12,6 @@ start_multi.bat 启动 bot 后自动进入本面板；Ctrl-C 退出面板不影�
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import time
 from datetime import datetime
@@ -21,7 +20,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from pmbot.ledger import load_records  # noqa: E402
-from pmbot.panel_view import PanelView, build_multi_view  # noqa: E402
+from pmbot.panel_view import (  # noqa: E402
+    PanelView,
+    build_multi_view,
+    parse_strategy_spot,
+    status_tail,
+    _fmt_cents,
+)
 from pmbot.paths import RuntimePaths  # noqa: E402
 
 from rich.console import Console, Group  # noqa: E402
@@ -37,7 +42,6 @@ GATE_TRADES = 200  # 统计门限：样本量
 GATE_T = 1.96  # 统计门限：|t|
 
 console = Console()
-_SPOT_RE = re.compile(r"基准\s+([\d,.]+)\s+偏离\s+([+-][\d.]+)%")
 _checks = 0  # 刷新计数（底部状态栏 checks）
 
 
@@ -67,9 +71,17 @@ def _fmt_ts(ts: str) -> str:
         return (ts or "")[:5]
 
 
-def _fmt_cents(x: float) -> str:
-    c = x * 100
-    return f"{c:.2f}" if c < 1 else f"{c:.0f}"
+def _t_stat(trades: list) -> float | None:
+    """全量 PnL 的 t 统计量（纯 python，不依赖 numpy）。"""
+    pnls = [t.pnl for t in trades]
+    n = len(pnls)
+    if n < 2:
+        return None
+    mean = sum(pnls) / n
+    var = sum((x - mean) ** 2 for x in pnls) / (n - 1)
+    if var == 0:
+        return None
+    return mean / (var / n) ** 0.5
 
 
 def _win_pct(stats: dict | None) -> str:
@@ -80,29 +92,6 @@ def _win_pct(stats: dict | None) -> str:
 
 def _pnl_text(pnl: float) -> Text:
     return Text(f"{pnl:+.2f}", style="green" if pnl > 0 else ("red" if pnl < 0 else "white"))
-
-
-def _parse_spot(strategy_state: str | None) -> tuple[float, float] | None:
-    """从 momentum 策略状态文案解析（基准价, 偏离%）→ 反推当前现货价。"""
-    if not strategy_state:
-        return None
-    m = _SPOT_RE.search(strategy_state)
-    if not m:
-        return None
-    base = float(m.group(1).replace(",", ""))
-    dev = float(m.group(2))
-    return base * (1 + dev / 100), dev
-
-
-def _status_tail(strategy_state: str | None) -> str:
-    """取 strategy_state 尾部的状态词（如 '⏳ 等待穿越' / '已穿越'）。"""
-    if not strategy_state:
-        return ""
-    for marker in ("⏳", "🔥", "已穿越", "等待穿越", "已触发"):
-        i = strategy_state.find(marker)
-        if i >= 0:
-            return strategy_state[i:].strip()
-    return ""
 
 
 def _is_online(data_dir: str | Path) -> bool:
@@ -162,7 +151,7 @@ def _symbol_block(v: PanelView, online: bool) -> Group:
     head = Text("● " if online else "○ ", style="green" if online else "red")
     head.append(Text(f"{v.symbol or '?'}  ", style="bold white"))
 
-    spot = _parse_spot(v.strategy_state)
+    spot = parse_strategy_spot(v.strategy_state)
     if spot:
         price, dev = spot
         arrow = "▲" if dev >= 0 else "▼"
@@ -188,7 +177,7 @@ def _symbol_block(v: PanelView, online: bool) -> Group:
     probs.append(Text(_fmt_cents(up) + "¢", style="bold green") if up is not None else Text("—", style="dim"))
     probs.append(Text("  跌 ", style="dim"))
     probs.append(Text(_fmt_cents(down) + "¢", style="bold red") if down is not None else Text("—", style="dim"))
-    st = _status_tail(v.strategy_state)
+    st = status_tail(v.strategy_state)
     if st:
         probs.append(Text(f"  状态: {st}", style="dim"))
     lines.append(probs)
@@ -316,7 +305,7 @@ def _status_bar(views: list[PanelView], online_flags: list[bool]) -> Text:
     for v, on in zip(views, online_flags):
         prices = v.prices or {}
         up = prices.get("up_ask")
-        spot = _parse_spot(v.strategy_state)
+        spot = parse_strategy_spot(v.strategy_state)
         if not on:
             t.append(Text(f"  {v.symbol or '?'} 离线", style="red"))
             continue
@@ -348,15 +337,16 @@ def main(argv: list[str] | None = None) -> int:
     amount = 1.0
     threshold_pct = 0.08
     max_entry = 0.65
-    try:
-        from pmbot.config import load_config
+    from pmbot.config import load_config
 
-        cfg = load_config(str(ROOT / "config.yaml"))
-        symbols = len(cfg.symbols)
-        interval = cfg.market_interval
-        amount = cfg.amount_per_trade
-        threshold_pct = getattr(cfg, "threshold_pct", 0.08)
-        max_entry = getattr(cfg, "max_entry_price", 0.65)
+    cfg_loaded = None
+    try:
+        cfg_loaded = load_config(str(ROOT / "config.yaml"))
+        symbols = len(cfg_loaded.symbols)
+        interval = cfg_loaded.market_interval
+        amount = cfg_loaded.amount_per_trade
+        threshold_pct = getattr(cfg_loaded, "threshold_pct", 0.08)
+        max_entry = getattr(cfg_loaded, "max_entry_price", 0.65)
     except Exception:
         pass
 
@@ -364,7 +354,8 @@ def main(argv: list[str] | None = None) -> int:
     with Live(refresh_per_second=1 / REFRESH_SEC, screen=False, console=console) as live:
         while True:
             _checks += 1
-            views = build_multi_view(paths_list, str(ROOT / "config.yaml"))
+            # cfg 一次加载复用（build_live_view 不再每标的每 2s 重复解析 config.yaml）
+            views = build_multi_view(paths_list, str(ROOT / "config.yaml"), cfg=cfg_loaded)
             per_dir_trades = {d: load_records(ROOT / d) for d in dirs}
             online_flags = [_is_online(ROOT / d) for d in dirs]
 

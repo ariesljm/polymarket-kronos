@@ -29,11 +29,11 @@ def _trades(rows: list[tuple]) -> list:
 
 
 def test_insufficient_samples_no_change():
-    """全局样本不足 → 空 override（不基于噪声调参）。"""
-    out = tune(_trades([(0.30, 0.2), (0.50, -1.0), (0.31, 0.1)]), min_band_n=10)
-    assert out == AutoTuneOverride()
-    assert out.max_entry_price is None
-    assert out.take_profit is None
+    """全局样本不足 → 完整覆盖值 = config 默认（调参未触发）。"""
+    out = tune(_trades([(0.30, 0.2), (0.50, -1.0), (0.31, 0.1)]), min_band_n=10,
+               config_max_entry=0.65, config_take_profit=0.95)
+    assert out.max_entry_price == 0.65  # 回落到 config
+    assert out.take_profit == 0.95
 
 
 def test_high_band_negative_narrows_max_entry():
@@ -49,14 +49,14 @@ def test_high_band_negative_narrows_max_entry():
 
 
 def test_narrow_never_above_config():
-    """收窄结果不高于 config（只收窄不放宽）。"""
+    """收窄结果不高于 config（只收窄不放宽）→ 完整值 = config。"""
     rows = [(0.83, -0.9) for _ in range(10)]
     out = tune(_trades(rows), min_band_n=10, config_max_entry=0.65)
     assert out.max_entry_price == 0.65  # 0.8 收缴但 config 更严 → 维持 config
-    """所有带正 EV → override 不出现（纯 config 运行）。"""
+    # 所有带正 EV → 完整覆盖值 = config（纯 config 运行）
     rows = [(p, 0.2) for p in (0.1, 0.3, 0.5, 0.7) for _ in range(12)]
     out = tune(_trades(rows), min_band_n=10, config_max_entry=0.65)
-    assert out.max_entry_price is None
+    assert out.max_entry_price == 0.65
 
 
 def test_low_band_winrate_raises_take_profit():
@@ -78,7 +78,7 @@ def test_band_stats_aggregation():
 
 def test_tune_reason_text():
     stats = band_stats(_trades([(0.1, 0.2)]))
-    reason = tune_reason(AutoTuneOverride(), stats)
+    reason = tune_reason(AutoTuneOverride(max_entry_price=0.65, take_profit=0.95), stats)
     assert "无调整" in reason
 
 def test_load_records_requires_data_dir_not_file():

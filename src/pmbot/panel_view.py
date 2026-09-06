@@ -8,6 +8,7 @@ monitor.py 退化为 CLI 入口与 TUI 渲染循环。
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Callable
 from dataclasses import dataclass, field
@@ -106,6 +107,38 @@ def _fmt_cents(x: float) -> str:
     """价格（0-1 概率）→ 美分显示；不足 1 美分保留 2 位小数（防 0.1 美分显示成 0）。"""
     c = x * 100
     return f"{c:.2f}" if c < 1 else f"{c:.0f}"
+
+
+# ---- 策略状态文案解析（单一事实源:multi_panel 与 build_live_view 共用,禁止消费端自建 regex）----
+
+_SPOT_RE = re.compile(r"基准\s+([\d,.]+)\s+偏离\s+([+-][\d.]+)%")
+
+
+def parse_strategy_spot(strategy_state: str | None) -> tuple[float, float] | None:
+    """从策略状态文案解析（基准价, 偏离%）→ 反推当前现货价。
+
+    策略状态文案即展示串（策略自报），本函数是唯一逆解析入口——
+    渲染文案格式变更时只需改此处与策略,面板/汇总不再各自猜。
+    """
+    if not strategy_state:
+        return None
+    m = _SPOT_RE.search(strategy_state)
+    if not m:
+        return None
+    base = float(m.group(1).replace(",", ""))
+    dev = float(m.group(2))
+    return base * (1 + dev / 100), dev
+
+
+def status_tail(strategy_state: str | None) -> str:
+    """取策略状态文案尾部的状态词（如 '⏳ 等待穿越' / '已穿越'）。"""
+    if not strategy_state:
+        return ""
+    for marker in ("⏳", "🔥", "已穿越", "等待穿越", "已触发"):
+        i = strategy_state.find(marker)
+        if i >= 0:
+            return strategy_state[i:].strip()
+    return ""
 
 
 def _today_local(tz: tzinfo | None = None) -> str:
@@ -398,7 +431,8 @@ def render(v: PanelView) -> str:
 
 def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
                     recent_limit: int | None = RECENT_LIMIT,
-                    uptime_sec: int | None = None, spot: dict | None = None) -> PanelView:
+                    uptime_sec: int | None = None, spot: dict | None = None,
+                    cfg: "Config" | None = None) -> PanelView:
     """读取状态/交易/盘口/配置并构建视图（TUI 与 Web 控制台共用）。
 
     symbol: 交易品种（None 时从 status.json 回退）；config: 配置文件路径。
@@ -423,7 +457,8 @@ def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
     config_summary = ""
     tp_sl = None
     try:
-        cfg = load_config(config)
+        if cfg is None:
+            cfg = load_config(config)
         thresholds = {"p_up_buy": cfg.p_up_buy, "p_down_buy": cfg.p_down_buy}
         window_seconds = step_ms_for(cfg.market_interval) // 1000
         tp_sl = {"pct": cfg.take_profit, "max": cfg.take_profit_max, "sl": cfg.stop_loss}
@@ -459,13 +494,15 @@ def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
 
 
 def build_multi_view(path_configs: list["RuntimePaths"], config: str,
-                     recent_limit: int | None = RECENT_LIMIT) -> list[PanelView]:
+                     recent_limit: int | None = RECENT_LIMIT,
+                     cfg: "Config" | None = None) -> list[PanelView]:
     """多标的聚合视图：每 data_dir 一个 build_live_view（monitor 与 multi_panel 共用）。
 
     path_configs: 各标的的 RuntimePaths（模式感知由调用方统一定——路径派生单一
     事实源在 RuntimePaths，聚合面板不再自行硬编码 mode/目录）。
     """
     return [
-        build_live_view(symbol=None, config=config, paths=p, recent_limit=recent_limit)
+        build_live_view(symbol=None, config=config, paths=p, recent_limit=recent_limit,
+                        cfg=cfg)
         for p in path_configs
     ]

@@ -34,7 +34,6 @@ class UserStream(ReconnectingWsThread):
         self.ws_url = ws_url
         self._auth = auth
         self._markets: list[str] = []
-        self._last_subscribed: set[str] = set()  # 已发送给服务端的 markets 集合（WS 线程读写）
         self._lock = threading.Lock()
         self._events: queue.Queue = queue.Queue()
         self.connected = False  # 线程安全读（bool 赋值原子）
@@ -80,7 +79,7 @@ class UserStream(ReconnectingWsThread):
     async def _send_subscribe(self, ws: ClientConnection) -> None:
         with self._lock:
             markets = list(self._markets)
-            self._last_subscribed = set(markets)
+            self._mark_subscribed(markets)
         await ws.send(json.dumps({
             "auth": self._auth, "type": "user", "markets": markets,
         }))

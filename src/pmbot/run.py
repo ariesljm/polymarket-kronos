@@ -48,19 +48,38 @@ def _setup_logging(log_dir: Path, symbol: str) -> None:
 
 @dataclass
 class LoopBundle:
-    """单标的主循环全套件（run.py 单标的 与 run_multi.py 多标的多线程共用）。"""
+    """单标的主循环全套件（run.py 单标的 与 run_multi.py 多标的多线程共用）。
+
+    持有三条 WS 线程引用并负责 shutdown（stop 谁启动谁）：启动分散在
+    build_loop，停机集中在此——消除『谁都能 start、没人 stop』的生命周期分裂。
+    """
 
     loop: TradingLoop
     state: TradeState
     paths: RuntimePaths
     symbol: str
+    ticker: "SpotTickerThread" = None  # type: ignore[assignment]
+    sampler: "BookSampler" = None  # type: ignore[assignment]
+    user_stream: "UserStream" = None  # type: ignore[assignment]
+
+    def shutdown_all(self) -> None:
+        """停掉本标的全部 WS 线程（幂等；异常只记日志不阻断其它标的）。"""
+        import logging as _lg
+
+        for c in (self.user_stream, self.sampler, self.ticker):
+            try:
+                if c is not None:
+                    c.stop()
+            except Exception:
+                _lg.exception("stop %s 失败", type(c).__name__)
 
 
-def build_loop(cfg, args, symbol: str, paths: RuntimePaths) -> LoopBundle:
+def build_loop(cfg, *, symbol: str, paths: RuntimePaths, dry_run: bool, poll_sec: int) -> LoopBundle:
     """构造单标的主循环全栈（共享 Config/代理; 独立状态/数据目录/WS 线程）。
 
     多标的并行时每标的调一次：各自的 BookSampler/SpotTicker/StateStore，
-    数据目录独立（status/trades/book 互不干扰）。
+    数据目录独立。显式参数（不接 argparse Namespace）：run.py 与 run_multi.py
+    共享构造，入口契约静态可见，两入口 parser 无需同步 flag。
     """
     from pmbot.book_sampler import BookSampler
     from pmbot.clob_executor import ClobExecutor, SimExecutor
@@ -91,7 +110,7 @@ def build_loop(cfg, args, symbol: str, paths: RuntimePaths) -> LoopBundle:
         **strat_kwargs,
     )
     discovery = MarketDiscovery(interval=cfg.market_interval)
-    executor = SimExecutor() if args.dry_run else ClobExecutor()
+    executor = SimExecutor() if dry_run else ClobExecutor()
 
     # Polymarket WS 市场频道（REST book 兜底，常态 2s 轮询——WS 数据流在代理下
     # 不稳定（活跃连接 RST，实测 30s 诊断），REST 兜底是数据新鲜度主保障：
@@ -102,7 +121,7 @@ def build_loop(cfg, args, symbol: str, paths: RuntimePaths) -> LoopBundle:
     sampler.start()
 
     # 认证 WS（订单/成交推送）：仅实盘使用——dry-run 不触碰真实凭证
-    user_stream = UserStream(executor.api_auth() if not args.dry_run else None, proxy=proxy)
+    user_stream = UserStream(executor.api_auth() if not dry_run else None, proxy=proxy)
     user_stream.start()
 
     # Binance 实时价线程
@@ -126,15 +145,16 @@ def build_loop(cfg, args, symbol: str, paths: RuntimePaths) -> LoopBundle:
         discovery=discovery,
         executor=executor,
         state=state,
-        dry_run=args.dry_run,
-        poll_sec=args.poll,
+        dry_run=dry_run,
+        poll_sec=poll_sec,
         user_stream=user_stream,
         ticker=ticker,
         trades_path=paths.trades,
         status_path=paths.status,
         control_path=f"{data_dir}/control.json",
     )
-    return LoopBundle(loop=loop, state=state, paths=paths, symbol=symbol)
+    return LoopBundle(loop=loop, state=state, paths=paths, symbol=symbol,
+                      ticker=ticker, sampler=sampler, user_stream=user_stream)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -167,7 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     # 代理从环境读取（墙内访问 Polymarket/Binance 需代理；记录在启动横幅）
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
 
-    bundle = build_loop(cfg, args, symbol, paths)
+    bundle = build_loop(cfg, symbol=symbol, paths=paths,
+                        dry_run=args.dry_run, poll_sec=args.poll)
     loop = bundle.loop
     mode = paths.mode
 
@@ -185,10 +206,13 @@ def main(argv: list[str] | None = None) -> int:
         from pmbot.control import read_control
 
         read_control(f"{data_dir}/control.json")  # 丢弃面板残留指令（如旧实例停机前的 stop），避免启动即停机
-        if args.once:
-            loop.tick(now_ms=int(time.time() * 1000))
-        else:
-            loop.run_forever()
+        try:
+            if args.once:
+                loop.tick(now_ms=int(time.time() * 1000))
+            else:
+                loop.run_forever()
+        finally:
+            bundle.shutdown_all()  # 停本标的全部 WS 线程（生命周期收口于 LoopBundle）
 
     # 终端关闭（CTRL_CLOSE）在 Windows 触发 SIGTERM → 优雅停机（同 Ctrl-C）
     import signal as _signal

@@ -77,10 +77,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     mode = "dry-run" if args.dry_run else "live"
 
+    bundles: list = []
     loops: list = []
     for sym, dd in zip(symbols, data_dirs):
         paths = RuntimePaths(data_dir=dd, mode=mode)
-        bundle = build_loop(cfg, args, sym, paths)
+        bundle = build_loop(cfg, symbol=sym, paths=paths,
+                            dry_run=args.dry_run, poll_sec=args.poll)
+        bundles.append(bundle)
         loops.append(bundle.loop)
         logging.info("标的 %s 已构建（数据目录 %s, 策略 %s）", sym, dd, cfg.strategy)
 
@@ -120,6 +123,10 @@ def main(argv: list[str] | None = None) -> int:
                 loop.request_stop()
             for t in threads:
                 t.join(timeout=15)
+        finally:
+            # WS 线程生命周期收口：全部标的 sampler/ticker/user_stream 统一停止
+            for b in bundles:
+                b.shutdown_all()
         return 0
 
     return run_with_guard("run-multi", _run, pid_file="data_multi/bot.pids")

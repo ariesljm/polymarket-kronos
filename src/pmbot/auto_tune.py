@@ -84,7 +84,9 @@ def tune(
     stats = band_stats(trades, bands)
     total_n = sum(s.n for s in stats.values())
     if total_n < min_band_n:
-        return AutoTuneOverride()  # 全局样本不足,不动参数
+        return AutoTuneOverride(
+            max_entry_price=config_max_entry, take_profit=config_take_profit,
+        )  # 全局样本不足：有效值 = config 默认（完整覆盖值，调参未触发）
 
     # ---- max_entry: 累计 EV 扫描 ----
     new_max: float | None = None
@@ -107,18 +109,20 @@ def tune(
     if low.n >= min_band_n and low.win_rate > 0.55:
         new_tp = 0.99  # 低带胜率显著 → 更接近持有（止盈 0.99 近似持有到结算）
 
+    # 完整覆盖值：未调整字段填充 config（消费者只读，无需再次回落）
     return AutoTuneOverride(
-        max_entry_price=new_max,
-        take_profit=new_tp if new_tp is not None and new_tp > config_take_profit else None,
+        max_entry_price=new_max if new_max is not None else config_max_entry,
+        take_profit=new_tp if new_tp is not None and new_tp > config_take_profit else config_take_profit,
     )
 
 
-def tune_reason(override: AutoTuneOverride, stats: dict[tuple[float, float], BandStat]) -> str:
-    """人类可读的调参原因（日志/复盘用）。"""
+def tune_reason(override: AutoTuneOverride, stats: dict[tuple[float, float], BandStat],
+                config_max_entry: float = 0.65, config_take_profit: float = 0.95) -> str:
+    """人类可读的调参原因（日志/复盘用）。override 为完整覆盖值，与 config 默认对比判调整。"""
     parts = []
-    if override.max_entry_price is not None:
+    if override.max_entry_price != config_max_entry:
         parts.append(f"max_entry {override.max_entry_price:.2f}(带 EV≤0)")
-    if override.take_profit is not None:
+    if override.take_profit != config_take_profit:
         parts.append(f"take_profit {override.take_profit:.2f}(低带胜率高)")
     if not parts:
         parts.append("无调整(样本不足或带 EV 均正)")
