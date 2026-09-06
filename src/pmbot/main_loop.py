@@ -606,8 +606,8 @@ class TradingLoop:
         samp = getattr(self.book, "sampler", None)
         if samp is not None:
             ws["book"] = samp.connection_status()
-        if getattr(self, "ticker", None) is not None:
-            ws["ticker"] = self.ticker.connection_status()
+        if getattr(self, "_ticker", None) is not None:
+            ws["ticker"] = self._ticker.connection_status()
         if ws:
             extra["ws"] = ws
         self._store.save(self.state, extra=extra)

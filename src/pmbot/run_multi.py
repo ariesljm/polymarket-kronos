@@ -28,13 +28,14 @@ from pmbot.run import build_loop
 LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
 
-def _setup_multi_logging() -> Path:
-    """单文件日志 logs/multi.log（保留 14 天）+ 交互终端控制台。"""
+def _setup_multi_logging(mode: str) -> Path:
+    """单文件日志:dry-run=logs/multi.log, live=logs/multi_live.log(按天滚动 14 天,不混)。"""
     log_dir = Path(__file__).resolve().parents[2] / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    fname = "multi_live.log" if mode == "live" else "multi.log"
     fmt = logging.Formatter(LOG_FMT)
     fh = logging.handlers.TimedRotatingFileHandler(
-        log_dir / "multi.log", when="midnight", backupCount=14, encoding="utf-8"
+        log_dir / fname, when="midnight", backupCount=14, encoding="utf-8"
     )
     fh.setFormatter(fmt)
     handlers: list[logging.Handler] = [fh]
@@ -49,7 +50,6 @@ def _setup_multi_logging() -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    log_dir = _setup_multi_logging()
     parser = argparse.ArgumentParser(description="多标的单进程主循环（每标的一个线程）")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument(
@@ -72,11 +72,14 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     data_dirs = [d.strip() for d in args.data_dirs.split(",") if d.strip()]
+    for dd in data_dirs:  # 数据目录自建（live 新目录 data_live/* 不存在时会挂）
+        Path(dd).mkdir(parents=True, exist_ok=True)
     if len(symbols) != len(data_dirs):
         logging.error("--symbols 与 --data-dirs 数量不一致（%d vs %d）", len(symbols), len(data_dirs))
         return 2
     mode = "dry-run" if args.dry_run else "live"
 
+    log_dir = _setup_multi_logging(mode)
     bundles: list = []
     loops: list = []
     for sym, dd in zip(symbols, data_dirs):
@@ -90,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("=" * 56)
     logging.info("pmbot multi 启动: %d 标的", len(loops))
     logging.info("模式=%s 轮询=%ds 策略=%s 窗口=%s", mode, args.poll, cfg.strategy, cfg.market_interval)
-    logging.info("日志: %s", log_dir / "multi.log")
+    logging.info("日志: %s", log_dir / ("multi_live.log" if mode == "live" else "multi.log"))
     logging.info("=" * 56)
 
     def _on_sigterm(signum: int, frame: FrameType | None) -> None:
@@ -103,10 +106,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def _run() -> int:
         stop_event = threading.Event()
+        errors: list = []
         threads = [
             threading.Thread(
                 target=_run_loop,
-                args=(loop, stop_event),
+                args=(loop, stop_event, errors),
                 name=f"loop-{loop.symbol}",
                 daemon=True,
             )
@@ -127,13 +131,18 @@ def main(argv: list[str] | None = None) -> int:
             # WS 线程生命周期收口：全部标的 sampler/ticker/user_stream 统一停止
             for b in bundles:
                 b.shutdown_all()
-        return 0
+        # 任一标的线程异常 → 非 0 退出（日志已有 traceback;退出码不再掩盖崩溃）
+        return 1 if errors else 0
 
-    return run_with_guard("run-multi", _run, pid_file="data_multi/bot.pids")
+    pid_dir = "data_multi" if args.dry_run else "data_live"
+    return run_with_guard("run-multi", _run, pid_file=f"{pid_dir}/bot.pids")
 
 
-def _run_loop(loop, stop_event: threading.Event) -> None:
-    """单标的主循环线程体：run_forever 内部已处理 KeyboardInterrupt/异常隔离。"""
+def _run_loop(loop, stop_event: threading.Event, errors: list) -> None:
+    """单标的主循环线程体：run_forever 内部已处理 KeyboardInterrupt/异常隔离。
+
+    errors: 共享列表，线程异常时记录（主线程据此返回非 0 退出码）。
+    """
     try:
         from pmbot.control import read_control
 
@@ -141,6 +150,7 @@ def _run_loop(loop, stop_event: threading.Event) -> None:
         loop.run_forever()
     except Exception:
         logging.exception("标的 %s 主循环异常退出", getattr(loop, "symbol", "?"))
+        errors.append(getattr(loop, "symbol", "?"))
     finally:
         logging.info("标的 %s 线程结束", getattr(loop, "symbol", "?"))
 
