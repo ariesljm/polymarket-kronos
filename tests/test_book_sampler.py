@@ -559,6 +559,7 @@ def test_ping_loop_sends_app_ping():
 
     s = BookSampler()
     s.app_heartbeat_sec = 0.02
+    s._last_data_ts = __import__("time").monotonic()  # 模拟有数据,绕过僵尸重连检测
 
     async def run():
         task = asyncio.create_task(s._ping_loop(FakeWs()))

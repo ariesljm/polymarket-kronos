@@ -93,9 +93,10 @@ def build_loop(cfg, args, symbol: str, paths: RuntimePaths) -> LoopBundle:
     discovery = MarketDiscovery(interval=cfg.market_interval)
     executor = SimExecutor() if args.dry_run else ClobExecutor()
 
-    # Polymarket WS 市场频道（REST book 兜底）
-    # interval=3.0：降频 REST 兜底请求（WS 断开时避免 1s 级高频触发 API 限流）
-    sampler = BookSampler(executor.fetch_book, interval=3.0, proxy=proxy,
+    # Polymarket WS 市场频道（REST book 兜底，常态 2s 轮询——WS 数据流在代理下
+    # 不稳定（活跃连接 RST，实测 30s 诊断），REST 兜底是数据新鲜度主保障：
+    # book_age ≤2s；WS 能连上时盘口近实时，断时兜底即时接管。
+    sampler = BookSampler(executor.fetch_book, interval=2.0, proxy=proxy,
                           book_path=f"{data_dir}/book.json")
     executor.attach_sampler(sampler)
     sampler.start()

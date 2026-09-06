@@ -225,6 +225,12 @@ class TradingLoop:
             prices = st.market_prices or {}
             if prices:
                 hb += f"盘口UP={prices.get('up_ask')} DOWN={prices.get('down_ask')} "
+            # 盘口新鲜度：book.json 距上次写入的秒数（WS 断/兜底失效时变大，数据延迟可观测）
+            try:
+                age = now_sec - int(self.status_path.parent.joinpath("book.json").stat().st_mtime)
+                hb += f"book_age={age}s "
+            except OSError:
+                hb += "book_age=? "
             if getattr(st, "strategy_state", None):
                 hb += f"策略={st.strategy_state}"
             logger.info(hb)

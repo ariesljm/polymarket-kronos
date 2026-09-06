@@ -14,13 +14,15 @@ import json
 import logging
 import random
 import threading
+import time
 
 from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_BASE = 30.0  # 重连退避起步（秒）：多 bot 并发时避免握手风暴触发服务端限流
-RECONNECT_MAX = 300.0  # 重连退避上限（秒）
+RECONNECT_BASE = 5.0  # 重连退避起步（秒）：行情数据新鲜度优先——断线 5s 内重试
+RECONNECT_MAX = 60.0  # 重连退避上限（秒）
+STALE_IDLE_SEC = 25.0  # 无数据僵尸连接检测：超过该时长无任何消息 → 主动重连
 
 
 class ReconnectingWsThread(threading.Thread):
@@ -43,6 +45,8 @@ class ReconnectingWsThread(threading.Thread):
         # WS 线程写、主线程只读：当前连接与事件循环（动态订阅更新用）
         self._connected_ws: ClientConnection | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # 最后收到数据时刻（僵尸连接检测：服务端不推数据但连接不关 → 主动重连）
+        self._last_data_ts = 0.0
 
     # ---- 对外接口 ----
 
@@ -84,6 +88,7 @@ class ReconnectingWsThread(threading.Thread):
                         )
                         try:
                             async for msg in ws:
+                                self._last_data_ts = time.monotonic()
                                 if await self._answer_heartbeat(ws, msg):
                                     continue  # 心跳应答不交给子类
                                 self._handle_message(msg)
@@ -122,6 +127,17 @@ class ReconnectingWsThread(threading.Thread):
         try:
             while not self._stop.is_set():
                 await asyncio.sleep(interval)
+                # 僵尸连接检测：长时间无数据（服务端静默但连接未关）→ 主动断开触发重连
+                if time.monotonic() - self._last_data_ts > STALE_IDLE_SEC:
+                    logger.warning(
+                        "%s 僵尸连接（%.0fs 无数据），主动重连",
+                        self.__class__.__name__, time.monotonic() - self._last_data_ts,
+                    )
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    return
                 try:
                     await ws.send("PING")
                 except Exception:
