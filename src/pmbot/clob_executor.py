@@ -95,12 +95,21 @@ class ClobExecutor:
         self._sampler = sampler
 
     def fetch_book(self, token_id: str) -> dict:
-        """公开盘口查询（无需认证；BookSampler REST 兜底用）。"""
-        from py_clob_client_v2 import ClobClient
+        """公开盘口查询（无需认证；BookSampler REST 兜底用）。
 
-        if self._book_client is None:
-            self._book_client = ClobClient(host=CLOB_HOST, chain_id=self._chain_id)
-        return self._book_client.get_order_book(token_id)
+        走代理：clob.polymarket.com 直连被墙（py_clob_client 无 proxy 参数,
+        其 get_order_book 直连必超时——REST 兜底曾 5884 次失败与此同源）。
+        """
+        import requests
+
+        r = requests.get(
+            f"{CLOB_HOST}/book?token_id={token_id}",
+            timeout=6,
+            proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
+            headers={"User-Agent": "pmbot/1.0"},
+        )
+        r.raise_for_status()
+        return r.json()
 
     def api_auth(self) -> dict | None:
         """CLOB API 凭证（UserStream 认证用）：缓存完整则返回 auth dict，否则 None。
