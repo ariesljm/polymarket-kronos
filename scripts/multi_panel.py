@@ -106,21 +106,22 @@ def _is_online(data_dir: str | Path) -> bool:
 # ---- 渲染 ----
 
 def _title_bar(views: list[PanelView], mode: str, interval: str) -> Table:
-    """标题栏：程序名 | 市场描述 | 右侧结算时间（窗口结束）。"""
-    resolve = "—"
+    """标题栏：程序名 | 市场描述 | 右侧统一窗口信息（三个标的同时刻,只显示一次）。"""
+    win = "窗口 — 剩 —"
     if views:
         label = views[0].window_label  # "09-05 16:40-16:45"
-        if label and "-" in label:
-            resolve = label.rsplit("-", 1)[-1].strip()  # "16:45"
+        rem = views[0].window_remaining_sec
+        rem_txt = f"{rem // 60}分{rem % 60:02d}秒" if rem is not None else "—"
+        win = f"窗口 {label} 剩 {rem_txt}"
     t = Text("PMBOT", style="bold white")
     t.append("  ", style="dim")
     t.append(f"Polymarket {interval} 涨跌 momentum", style="cyan")
     t.append(f"  {'实盘' if mode == 'live' else 'dry-run 模拟'}",
              style="bold red" if mode == "live" else "bold yellow")
-    right = Text(f"结算 {resolve}", style="dim")
+    right = Text(win, style="dim")
     bar = Table(expand=True, box=None, pad_edge=False, show_edge=False, padding=0, show_header=False)
     bar.add_column(justify="left", no_wrap=True)
-    bar.add_column(justify="right", no_wrap=True, min_width=10)
+    bar.add_column(justify="right", no_wrap=True, min_width=24)
     bar.add_row(t, right)
     return bar
 
@@ -158,10 +159,10 @@ def _cfg_line(symbols: int, interval: str, amount: float, threshold_pct: float,
 
 
 def _symbol_block(v: PanelView, online: bool) -> Group:
-    """单标的块：现货价 / 涨跌概率 / 状态 / 持仓 / 统计 / 最近交易（只显示标特定的内容）。"""
+    """单标的块：现货价 / 涨跌概率 / 策略状态 / WS 状态 / 持仓 / 统计（只显示标特定的内容，窗口信息统一在顶部栏）。"""
     lines: list = []
 
-    # 首行：在线灯 + 标的 + 现货价 + 涨跌 | 窗口 + 剩余
+    # 首行：在线灯 + 标的 + 现货价 + 涨跌（窗口信息统一在顶部栏显示）
     head = Text("● " if online else "○ ", style="green" if online else "red")
     head.append(Text(f"{v.symbol or '?'}  ", style="bold white"))
 
@@ -173,15 +174,7 @@ def _symbol_block(v: PanelView, online: bool) -> Group:
         head.append(Text(f"{arrow}{abs(dev):.2f}%", style="green" if dev >= 0 else "red"))
     else:
         head.append(Text("$—", style="dim"))
-
-    rem = v.window_remaining_sec
-    rem_txt = f"{rem // 60}分{rem % 60:02d}秒" if rem is not None else "—"
-    win = Text(f"窗口 {v.window_label}  剩 {rem_txt}", style="dim")
-    row1 = Table(expand=True, box=None, pad_edge=False, show_edge=False, padding=0, show_header=False)
-    row1.add_column(justify="left", no_wrap=True)
-    row1.add_column(justify="right", no_wrap=True)
-    row1.add_row(head, win)
-    lines.append(row1)
+    lines.append(head)
 
     # 第二行：涨/跌概率 + 策略状态
     prices = v.prices or {}
