@@ -126,16 +126,30 @@ def _title_bar(views: list[PanelView], mode: str, interval: str) -> Table:
 
 
 def _cfg_line(symbols: int, interval: str, amount: float, threshold_pct: float,
-              max_entry: float) -> Table:
-    """配置行（全局参数，只显示一次，标的块不再重复）：策略参数 + 连接状态。"""
+              max_entry: float, views: list) -> Table:
+    """配置行（全局参数，只显示一次，标的块不再重复）+ 真实聚合 WS 连接状态（替代早期硬编码死文案）。"""
     left = Text(
         f"配置 标的 {symbols} · 每注 {amount:.0f} · 持有至结算 · {interval} · "
         f"穿越±{threshold_pct:.2f}% · 入场上限 {max_entry:.2f}",
         style="dim",
     )
+
+    def ws_agg(key: str, label: str) -> Text:
+        """聚合全部标的的 WS 状态:全连=●已连 / 部分=○N/M重连 / 全停=✖已停。"""
+        sts = [v.ws_status.get(key) for v in views if v.ws_status and v.ws_status.get(key)]
+        if not sts:
+            return Text(f"{label}?", style="dim")
+        if all(s == "connected" for s in sts):
+            return Text(f"{label}●已连", style="bold green")
+        if all(s == "stopped" for s in sts):
+            return Text(f"{label}✖已停", style="dim")
+        n = sts.count("connected")
+        return Text(f"{label}○{n}/{len(sts)}重连", style="bold yellow")
+
     right = Text("config.yaml  ", style="dim")
-    right.append("盘口API正常  ", style="dim green")
-    right.append("币安WS已连", style="dim green")
+    right.append(ws_agg("book", "盘口"))
+    right.append(Text("  ", style="dim"))
+    right.append(ws_agg("ticker", "币安WS"))
     bar = Table(expand=True, box=None, pad_edge=False, show_edge=False, padding=0, show_header=False)
     bar.add_column(justify="left", no_wrap=True)
     bar.add_column(justify="right", no_wrap=True, min_width=22)
@@ -231,65 +245,46 @@ def _symbol_block(v: PanelView, online: bool) -> Group:
     stat.append(Text(f"  连亏 {v.consecutive_losses}", style="dim"))
     lines.append(stat)
 
-    # 最近交易（最多 2 笔）
-    for t in (v.recent_trades or [])[:2]:
-        pnl = t["pnl"]
-        style = "green" if pnl > 0 else ("red" if pnl < 0 else "yellow")
-        label = t.get("label") or t.get("reason") or ""
-        lines.append(Text(
-            f"最近 {t['ts']} {'涨' if t['direction'].upper() == 'UP' else '跌'} "
-            f"{_fmt_cents(t['entry'])}→{_fmt_cents(t['exit'])} {pnl:+.2f} {label}",
-            style=style,
-        ))
-
     border = "green" if online else "red"
     return Panel(Group(*lines), title=f"{v.symbol or '?'}", border_style=border, padding=(0, 1))
 
 
-def _legs_table(views: list[PanelView]) -> Table:
-    """持仓表：各标的当前持仓 + 最近一笔结算（方向用 涨/跌）。"""
+def _history_table(views: list[PanelView], per_symbol: int = 3) -> Table:
+    """交易历史表：各标的最细交易明细，按时间倒序（最新在上）。
+
+    每标的取最近 per_symbol 笔（panel_view.recent_trades 已带 size/label），
+    跨标的合并排序——市场/时间/方向/数量/价格/盈亏一目了然。
+    """
     table = Table(expand=True, box=None, pad_edge=False, show_edge=False,
                   header_style="bold white", padding=0)
-    table.add_column("持仓", justify="left", style="dim", no_wrap=True, min_width=6)
+    table.add_column("时间", justify="left", style="dim", no_wrap=True, min_width=5)
     table.add_column("标的", justify="left", no_wrap=True, min_width=4)
-    table.add_column("方向", justify="left", no_wrap=True, min_width=4)
-    table.add_column("数量", justify="right", no_wrap=True, min_width=5)
+    table.add_column("方向", justify="left", no_wrap=True, min_width=2)
+    table.add_column("数量(股)", justify="right", no_wrap=True, min_width=7)
     table.add_column("入场", justify="right", no_wrap=True, min_width=5)
     table.add_column("出场", justify="right", no_wrap=True, min_width=5)
     table.add_column("盈亏", justify="right", no_wrap=True, min_width=6)
+    table.add_column("原因", justify="left", no_wrap=True, min_width=8)
 
     def dir_name(d: str) -> str:
         return "涨" if d.upper() == "UP" else ("跌" if d.upper() == "DOWN" else d)
 
-    has_row = False
+    rows = []
     for v in views:
-        if v.position:
-            p = v.position
-            table.add_row(
-                Text("▶ 持仓", style="bold yellow"), v.symbol or "?", dir_name(p["direction"]),
-                f"{p['size']:.2f}", _fmt_cents(p["entry_price"]), "持仓中",
-                Text("—", style="yellow"),
-            )
-            has_row = True
-        if v.pending:
-            p = v.pending
-            table.add_row(
-                Text("▶ 挂单", style="bold magenta"), v.symbol or "?", dir_name(p["direction"]),
-                f"{p['size'] or '?'}", _fmt_cents(p["price"]), "挂单中",
-                Text("—", style="magenta"),
-            )
-            has_row = True
-    for v in views:
-        if v.recent_trades:
-            t = v.recent_trades[0]
-            table.add_row(
-                Text("▸ 最近", style="dim"), v.symbol or "?", dir_name(t["direction"]),
-                f"{t.get('size', 0):.2f}", _fmt_cents(t["entry"]), _fmt_cents(t["exit"]),
-                _pnl_text(t["pnl"]),
-            )
-            has_row = True
-    if not has_row:
-        table.add_row("", "暂无持仓", "", "", "", "", "")
+        for t in (v.recent_trades or [])[:per_symbol]:
+            rows.append((t["ts"], v.symbol or "?", t))
+    rows.sort(key=lambda r: r[0], reverse=True)  # 时间倒序：最新在上
+
+    if not rows:
+        table.add_row("", "暂无交易", "", "", "", "", "", "")
+        return table
+    for ts, sym, t in rows:
+        label = t.get("label") or t.get("reason") or ""
+        table.add_row(
+            ts, sym, dir_name(t["direction"]),
+            f"{t.get('size', 0):.2f}", _fmt_cents(t["entry"]), _fmt_cents(t["exit"]),
+            _pnl_text(t["pnl"]), label,
+        )
     return table
 
 
@@ -377,14 +372,14 @@ def main(argv: list[str] | None = None) -> int:
 
             body = Group(
                 _title_bar(views, mode, interval),
-                _cfg_line(symbols, interval, amount, threshold_pct, max_entry),
+                _cfg_line(symbols, interval, amount, threshold_pct, max_entry, views),
                 Text("─" * max(10, console.width - 4), style="dim"),
             )
             for v, on in zip(views, online_flags):
                 body.renderables.append(_symbol_block(v, on))
                 body.renderables.append(Text("─" * max(10, console.width - 4), style="dim"))
 
-            body.renderables.append(_legs_table(views))
+            body.renderables.append(_history_table(views))
             body.renderables.append(_deploy_line(amount, symbols, per_dir_trades))
             body.renderables.append(Text("─" * max(10, console.width - 4), style="dim"))
             body.renderables.append(_status_bar(views, online_flags))
