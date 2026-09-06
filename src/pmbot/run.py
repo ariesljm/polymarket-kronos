@@ -13,8 +13,12 @@ import logging.handlers
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
+
+from pmbot.paths import RuntimePaths
+from pmbot.state import TradeState
 
 
 def _setup_logging(log_dir: Path, symbol: str) -> None:
@@ -42,42 +46,32 @@ def _setup_logging(log_dir: Path, symbol: str) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Polymarket 策略交易主循环")
-    parser.add_argument("--config", default="config.yaml", help="配置文件路径")
-    parser.add_argument("--data-dir", default=None, help="数据目录（默认按模式派生：dry-run=data/，live=data_live/）")
-    parser.add_argument(
-        "--dry-run", dest="dry_run", action="store_true", help="模拟运行（默认，不真下单）"
-    )
-    parser.add_argument("--live", dest="dry_run", action="store_false", help="实盘运行（真钱）")
-    parser.set_defaults(dry_run=True)  # 安全默认：忘记传参也不碰真钱
-    parser.add_argument("--poll", type=int, default=1, help="轮询间隔秒数（tick 频率，1s = 止盈止损秒级响应）")
-    parser.add_argument("--symbol", default=None, help="覆盖 config symbols[0]（多标的并行：各进程 --symbol BTC/ETH/SOL --data-dir data_X）")
-    parser.add_argument("--once", action="store_true", help="只跑一个 tick 后退出（调试）")
-    args = parser.parse_args(argv)
+@dataclass
+class LoopBundle:
+    """单标的主循环全套件（run.py 单标的 与 run_multi.py 多标的多线程共用）。"""
 
-    _setup_logging(Path(__file__).resolve().parent.parent / "logs",
-                   (args.symbol or "pmbot"))
+    loop: TradingLoop
+    state: TradeState
+    paths: RuntimePaths
+    symbol: str
 
-    # 依赖集中导入（函数内：入口模块冷启动不加载重型依赖链）
+
+def build_loop(cfg, args, symbol: str, paths: RuntimePaths) -> LoopBundle:
+    """构造单标的主循环全栈（共享 Config/代理; 独立状态/数据目录/WS 线程）。
+
+    多标的并行时每标的调一次：各自的 BookSampler/SpotTicker/StateStore，
+    数据目录独立（status/trades/book 互不干扰）。
+    """
     from pmbot.book_sampler import BookSampler
     from pmbot.clob_executor import ClobExecutor, SimExecutor
-    from pmbot.config import load_config
     from pmbot.main_loop import TradingLoop
     from pmbot.market_discovery import MarketDiscovery
-    from pmbot.paths import paths_for
-    from pmbot.single_instance import run_with_guard
     from pmbot.spot_ticker import SpotTickerThread
     from pmbot.state import StateStore, TradeState
     from pmbot.strategy import create_strategy, strategy_class
     from pmbot.user_stream import UserStream
 
-    cfg = load_config(args.config)
-    symbol = args.symbol or cfg.symbols[0]
-    paths = paths_for(not args.dry_run, args.data_dir)
     data_dir = paths.data_dir
-
-    # 代理从环境读取（墙内访问 Polymarket/Binance 需代理；BookSampler/SpotTicker/UserStream 统一注入）
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
 
     # Binance 实时价线程提前创建：momentum 策略用它做穿越检测（WS ~1s 推送，
@@ -85,8 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     # 直连墙内不稳（实测超时），与 BookSampler 一致走代理。
     ticker = SpotTickerThread(symbol=symbol, proxy=proxy)
     strat_kwargs = {}
-    # 依赖注入按策略声明（needs_fetch_price）：新策略声明即可，run.py 不再
-    # 按策略名硬编码 if（策略名单单一事实源在 registry + 策略类自身）。
+    # 依赖注入按策略声明（needs_fetch_price）：新策略声明即可，run 不按策略名硬编码
     strat_cls = strategy_class(cfg.strategy)
     if getattr(strat_cls, "needs_fetch_price", False):
         strat_kwargs["fetch_price"] = ticker.latest_price
@@ -94,26 +87,24 @@ def main(argv: list[str] | None = None) -> int:
         cfg.strategy,
         symbol=symbol,
         log_dir=data_dir,
-        config=cfg.to_strategy_config(),  # 策略参数窄视图（间隔/阈值）
+        config=cfg.to_strategy_config(),
         **strat_kwargs,
     )
     discovery = MarketDiscovery(interval=cfg.market_interval)
-    executor = SimExecutor() if args.dry_run else ClobExecutor()  # 两个适配器：模拟 / 实盘
+    executor = SimExecutor() if args.dry_run else ClobExecutor()
 
     # Polymarket WS 市场频道（REST book 兜底）
     # interval=3.0：降频 REST 兜底请求（WS 断开时避免 1s 级高频触发 API 限流）
     sampler = BookSampler(executor.fetch_book, interval=3.0, proxy=proxy,
-                                 book_path=f"{data_dir}/book.json")
+                          book_path=f"{data_dir}/book.json")
     executor.attach_sampler(sampler)
     sampler.start()
 
-    # 认证 WS（订单/成交推送）：仅实盘使用——dry-run 不触碰真实凭证（clob_creds.json
-    # 存在时也不连接认证 WS），模拟持仓与真实钱包无关，事件空转。
+    # 认证 WS（订单/成交推送）：仅实盘使用——dry-run 不触碰真实凭证
     user_stream = UserStream(executor.api_auth() if not args.dry_run else None, proxy=proxy)
     user_stream.start()
 
-    # Binance 实时价线程（方向一致性过滤数据源 + momentum 穿越检测）：WS miniTicker + REST 兜底。
-    # ticker 已提前创建（momentum 注入用），此处启动。
+    # Binance 实时价线程
     ticker.start()
 
     state = StateStore(paths.status).load()
@@ -142,6 +133,42 @@ def main(argv: list[str] | None = None) -> int:
         status_path=paths.status,
         control_path=f"{data_dir}/control.json",
     )
+    return LoopBundle(loop=loop, state=state, paths=paths, symbol=symbol)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Polymarket 策略交易主循环")
+    parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    parser.add_argument("--data-dir", default=None, help="数据目录（默认按模式派生：dry-run=data/，live=data_live/）")
+    parser.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", help="模拟运行（默认，不真下单）"
+    )
+    parser.add_argument("--live", dest="dry_run", action="store_false", help="实盘运行（真钱）")
+    parser.set_defaults(dry_run=True)  # 安全默认：忘记传参也不碰真钱
+    parser.add_argument("--poll", type=int, default=1, help="轮询间隔秒数（tick 频率，1s = 止盈止损秒级响应）")
+    parser.add_argument("--symbol", default=None, help="覆盖 config symbols[0]（多标的并行：各进程 --symbol BTC/ETH/SOL --data-dir data_X）")
+    parser.add_argument("--once", action="store_true", help="只跑一个 tick 后退出（调试）")
+    args = parser.parse_args(argv)
+
+    _setup_logging(Path(__file__).resolve().parents[2] / "logs",
+                   (args.symbol or "pmbot"))
+
+    # 依赖集中导入（函数内：入口模块冷启动不加载重型依赖链）
+    from pmbot.config import load_config
+    from pmbot.paths import paths_for
+    from pmbot.single_instance import run_with_guard
+
+    cfg = load_config(args.config)
+    symbol = args.symbol or cfg.symbols[0]
+    paths = paths_for(not args.dry_run, args.data_dir)
+    data_dir = paths.data_dir
+
+    # 代理从环境读取（墙内访问 Polymarket/Binance 需代理；记录在启动横幅）
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+
+    bundle = build_loop(cfg, args, symbol, paths)
+    loop = bundle.loop
+    mode = paths.mode
 
     # 启动横幅：一键复盘需要的全部上下文（时间/模式/标的/数据目录/策略/网络）
     logging.info("=" * 56)

@@ -140,6 +140,10 @@ class TradingLoop:
 
     # ---- 对外入口 ----
 
+    def request_stop(self) -> None:
+        """多标的并发模式：主线程 Ctrl-C 时置停机标志（run_forever 下轮 tick 退出）。"""
+        self._shutdown = True
+
     def run_forever(self) -> None:
         """阻塞运行：对齐窗口边界轮询；SIGINT/SIGTERM 优雅停机。"""
         import signal
