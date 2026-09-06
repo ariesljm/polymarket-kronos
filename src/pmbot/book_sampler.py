@@ -275,6 +275,11 @@ class BookSampler(ReconnectingWsThread):
             self._apply_book_event(data)
         elif etype == "price_change":
             self._apply_price_changes(data.get("price_changes") or [])
+        elif etype == "tick_size_change":
+            # 官方文档标注 critical：tick 变化后旧 tick 下单会被拒。
+            # 当前入场价 ≤0.50 在 0.04-0.96 区间（tick 固定 0.01，py_clob 已对齐），
+            # 影响有限——记录事件供诊断，若未来入场区间外扩需消费此值。
+            self._apply_tick_change(data)
         elif etype in ("last_trade_price", "best_bid_ask"):
             # 轻量事件（D）：不重建整本快照，只做事件流心跳（刷新快照新鲜度）
             # + 记录轻量价。字段名服务端格式容错，解析失败只损失心跳。
@@ -337,6 +342,15 @@ class BookSampler(ReconnectingWsThread):
         from pmbot.book_price import weighted_price
 
         return weighted_price(snap, "bids", size=1.0)
+
+    def _apply_tick_change(self, data: dict) -> None:
+        """记录 tick size 变化（诊断用；当前 0.01 固定区间不消费）。"""
+        old_tick = data.get("old_tick_size")
+        new_tick = data.get("new_tick_size")
+        asset_id = data.get("asset_id") or data.get("asset") or "?"
+        logger.info(
+            "盘口 tick 变化: %s %s → %s", asset_id[:16], old_tick, new_tick,
+        )
 
     def _apply_light_event(self, data: dict) -> None:
         """轻量行情事件（best_bid_ask / last_trade_price）：仅作事件流心跳（_touch 刷新新鲜度）。"""

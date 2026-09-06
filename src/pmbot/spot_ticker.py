@@ -45,7 +45,8 @@ class SpotTickerThread(ReconnectingWsThread):
     app_heartbeat_sec = None
 
     def __init__(self, symbol: str = "BTC", *, proxy: str | None = None,
-                 fetch_ticker: Callable[[], float | None] | None = None) -> None:
+                 fetch_ticker: Callable[[], float | None] | None = None,
+                 on_update: Callable[[], None] | None = None) -> None:
         super().__init__(name="spot-ticker", proxy=proxy)
         self.symbol = normalize_symbol(symbol)
         self.ws_url = WS_URL_TMPL.format(sym=self.symbol.lower())
@@ -55,6 +56,14 @@ class SpotTickerThread(ReconnectingWsThread):
         self._price: float | None = None
         self._delta: float = 0.0  # 面板展示：最近一次价格差（与 SpotPrice 语义一致）
         self._ts: float = 0.0
+        # 价格更新事件通知（事件驱动入场：WS 推送到达即触发主循环 tick，
+        # 减少轮询相位延迟——MM 秒级极化，0-1s 的发现延迟 = 入场价系统性变差）
+        self._on_update: Callable[[], None] | None = on_update
+        self._last_notify = 0.0
+
+    def set_on_update(self, cb: Callable[[], None]) -> None:
+        """设置价格更新回调（线程安全：仅写引用；主循环创建后注入）。"""
+        self._on_update = cb
 
     # ---- 消费方接口（线程安全） ----
 
@@ -97,6 +106,17 @@ class SpotTickerThread(ReconnectingWsThread):
                 self._delta = price - self._price
             self._price = price
             self._ts = time.monotonic()
+        # 通知回调（锁外调用：回调可能重入 latest_price 取价，避免自锁死锁）；
+        # 0.15s 最小间隔节流——WS 1s 推送 + REST 兜底 1s 常态 ≤2 次/s，防突发风暴
+        cb = self._on_update
+        if cb is not None:
+            now = time.monotonic()
+            if now - self._last_notify >= 0.15:
+                self._last_notify = now
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("%s 更新回调异常", self.__class__.__name__)
 
     def _while_disconnected(self) -> None:
         """等待重连期间 REST 兜底（1s 轮询，保持价格新鲜）。"""

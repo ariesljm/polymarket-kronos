@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from types import FrameType
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,6 +90,11 @@ class TradingLoop:
         self.high_freq_poll_sec = high_freq_poll_sec
         self.user_stream = user_stream
         self._ticker = ticker  # Binance 实时价线程（None = 不启用方向过滤）
+        # 事件驱动入口：ticker 价格更新 set 本 Event → run_forever 的 wait 立即返回
+        # （WS 推送到达即 tick，消除轮询相位延迟；无更新时按原轮询间隔超时）
+        self._tick_event = threading.Event()
+        if self._ticker is not None and hasattr(self._ticker, "set_on_update"):
+            self._ticker.set_on_update(self._tick_event.set)
         # 执行分派器：动作执行与挂单成交检测（深模块提取）。
         # state 经 getter 注入：reset 重建 TradeState 后自动跟随，无需手工回写。
         self._exec_dispatcher = ExecutionDispatcher(
@@ -193,7 +199,9 @@ class TradingLoop:
                 self._shutdown = True
             except Exception:
                 logger.exception("tick 异常，跳过")
-            time.sleep(self._dynamic_sleep_sec())
+            # 事件驱动等待：ticker 价格更新（WS 推送）即时唤醒；否则按轮询间隔超时
+            self._tick_event.wait(timeout=self._dynamic_sleep_sec())
+            self._tick_event.clear()
         self.shutdown(now_sec=int(time.time()))
         logger.info("优雅停机完成")
 
