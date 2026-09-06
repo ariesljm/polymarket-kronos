@@ -6,7 +6,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from pmbot.config import EngineConfig
+
+
+@dataclass(frozen=True)
+class AutoTuneOverride:
+    """自适应调参覆盖（auto_tune 生成）:None 字段 = 退化为 config 值。
+
+    max_entry_price: 收窄后的入场价上限(禁止高于此价入场)。
+    take_profit: 调整后的止盈比例(接近 1 = 持有到结算)。
+    """
+
+    max_entry_price: float | None = None
+    take_profit: float | None = None
 from pmbot.exit_rules import position_exit_levels
 from pmbot.types import Action, ActionType, Direction, MarketView, Position, Signal, StateView
 
@@ -62,12 +76,14 @@ def circuit_breaker(state: StateView, config: EngineConfig) -> tuple[str, str] |
 
 
 def decide(config: EngineConfig, state: StateView, market: MarketView, signal: Signal,
-            now_sec: int | None = None) -> Action:
+            now_sec: int | None = None,
+            override: AutoTuneOverride | None = None) -> Action:
     """根据当前状态与信号决定下一个动作。
 
     state: 连续亏损、当日亏损、本窗口是否已下注、是否暂停、建仓冷却截止。
     market: 距窗口结束秒数、目标方向 best ask/bid、当前持仓、挂单。
     now_sec: 墙钟秒（冷却判定注入，纯函数不自行取时）；None = 不做冷却判断。
+    override: 自适应调参结果（auto_tune），字段 None 时退化为 config 值。
     """
     # 熔断优先于一切交易动作；人工暂停时不产生任何交易动作
     # （判定与文案与 tick 共用 circuit_breaker 单一事实源——tick 先跑故此处
@@ -84,7 +100,8 @@ def decide(config: EngineConfig, state: StateView, market: MarketView, signal: S
 
     position = market.position
     if position is not None:
-        return _manage_position(config, position, market.best_bid, market.remaining_sec)
+        return _manage_position(config, position, market.best_bid, market.remaining_sec,
+                                override=override)
 
     pending = market.pending_order
     if pending is not None:
@@ -98,15 +115,17 @@ def decide(config: EngineConfig, state: StateView, market: MarketView, signal: S
         return Action(ActionType.SKIP)
 
     return _maybe_enter(config, signal, market.best_ask, market.remaining_sec,
-                        market.elapsed_sec, market.live_delta_pct)
+                        market.elapsed_sec, market.live_delta_pct, override=override)
 
 
-def _manage_position(config: EngineConfig, position: Position, best_bid: float | None, remaining_sec: int) -> Action:
+def _manage_position(config: EngineConfig, position: Position, best_bid: float | None, remaining_sec: int,
+                     override: AutoTuneOverride | None = None) -> Action:
     if best_bid is None:
         return Action(ActionType.SKIP)
     # 百分比止盈止损（相对入场价）：共享 exit_rules 单一事实源（回测/面板同公式）
     tp, sl = position_exit_levels(
-        position.entry_price, config.take_profit, config.stop_loss,
+        position.entry_price, override.take_profit if override and override.take_profit else config.take_profit,
+        config.stop_loss,
         tp_max=config.take_profit_max,
     )
     if best_bid >= tp:
@@ -125,7 +144,8 @@ def _manage_position(config: EngineConfig, position: Position, best_bid: float |
 
 def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
                  remaining_sec: int, elapsed_sec: int = 0,
-                 live_delta_pct: float | None = None) -> Action:
+                 live_delta_pct: float | None = None,
+                 override: AutoTuneOverride | None = None) -> Action:
     if signal.direction is Direction.SKIP:
         return Action(ActionType.SKIP)
     # 开仓延迟：市场开始后 N 秒内不开仓（观察早期波动，避免开盘瞬间噪声信号；0 = 关闭）
@@ -140,7 +160,10 @@ def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
         return Action(ActionType.SKIP, reason="contradiction")
     # 入场价上限：盘口 ask 高于此价不入场（追高仓位历史净亏；0 = 关闭）。
     # 无报价（None）不拦——执行层缺报价本就放弃建仓。
-    if config.max_entry_price > 0 and best_ask is not None and best_ask > config.max_entry_price:
+    # auto_tune 覆盖：数据证明高价格带亏损时收窄上限。
+    cap = (override.max_entry_price if override and override.max_entry_price
+           else config.max_entry_price)
+    if cap > 0 and best_ask is not None and best_ask > cap:
         return Action(ActionType.SKIP, reason="entry_price_cap")
     # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 五五开档历史净亏 -2.52/31 笔，
     # 该档位无信息优势且买卖价差双向吞噬；0 = 关闭）。

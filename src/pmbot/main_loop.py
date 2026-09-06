@@ -16,7 +16,7 @@ from pmbot.executor_protocols import MarketBook, OrderPlacer, TradeExecutor, Wal
 from pmbot.config import Config
 from pmbot.constants import window_end_sec, window_start_sec, window_ended_at
 from pmbot.control import read_control
-from pmbot.engine import circuit_breaker, decide, live_delta_pct
+from pmbot.engine import AutoTuneOverride, circuit_breaker, decide, live_delta_pct
 from pmbot.execution_dispatcher import ExecutionDispatcher
 from pmbot.market_discovery import MarketDiscovery, MarketInfo
 from pmbot.market_lifecycle import MarketLifecycle, Phase
@@ -137,6 +137,8 @@ class TradingLoop:
         self._lifecycle: MarketLifecycle | None = None
         self._skip_window_until = 0  # 启动跳过窗口终点（秒；0=不跳过，run_forever 启动时设置）
         self._last_hb = 0.0  # 心跳日志：每 60s 一行运行摘要（复盘时间线）
+        self._auto: AutoTuneOverride | None = None  # 自适应调参覆盖（auto_tune 每 60s 重算）
+        self._last_tune_sec = 0.0
 
     # ---- 对外入口 ----
 
@@ -225,6 +227,10 @@ class TradingLoop:
             if getattr(st, "strategy_state", None):
                 hb += f"策略={st.strategy_state}"
             logger.info(hb)
+        # 自适应调参：每 60s 重算（样本门槛保护，无证据不动参数）
+        if now_sec - self._last_tune_sec >= 60:
+            self._last_tune_sec = float(now_sec)
+            self._auto_tune()
         day = datetime.fromtimestamp(now_sec, tz=timezone.utc).strftime("%Y-%m-%d")
         st.roll_day(day)  # 先处理跨天（重置今日基准），再刷新余额捕获新基准
         self.wallet_sync.reconcile(now_sec, st)
@@ -546,10 +552,34 @@ class TradingLoop:
         self._exec_dispatcher.refresh_pending(market, now_sec)
 
     def decide(self, view: MarketView) -> Action:
-        """决策引擎调用（lifecycle 使用）。"""
+        """决策引擎调用（lifecycle 使用）。override=auto_tune 自适应参数。"""
         st = self.state
         return decide(self.config.to_engine_config(), self.state_view(), view, self.state.signal,
-                      now_sec=self._now_sec())
+                      now_sec=self._now_sec(), override=self._auto)
+
+    def _auto_tune(self) -> None:
+        """自适应调参：读真实交易 → 分价格带 EV → 引擎参数覆盖（无证据不动）。"""
+        try:
+            from pmbot.auto_tune import band_stats, tune, tune_reason
+            from pmbot.ledger import load_records
+
+            trades = load_records(self.trades_path)
+            stats = band_stats(trades)
+            override = tune(
+                trades,
+                min_band_n=10,
+                config_max_entry=self.config.max_entry_price,
+                config_take_profit=self.config.take_profit,
+            )
+            if override != self._auto:
+                changed = bool(override.max_entry_price or override.take_profit)
+                self._auto = override
+                if changed:
+                    logger.info("auto_tune 调整参数: %s", tune_reason(override, stats))
+                else:
+                    logger.info("auto_tune 评估(维持配置): %s", tune_reason(override, stats))
+        except Exception:
+            logger.exception("auto_tune 重算失败（维持当前参数）")
 
     def execute(self, action: Action, market: MarketInfo, now_sec: int) -> None:
         """动作分派（lifecycle 使用，委托 ExecutionDispatcher）。"""
