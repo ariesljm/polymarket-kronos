@@ -56,6 +56,15 @@ class ReconnectingWsThread(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
+    def connection_status(self) -> str:
+        """当前连接状态（供面板/心跳展示；只读 Event 与引用，线程安全）。
+
+        connected=WS 已建立 / reconnecting=断线退避重连中 / stopped=已停。
+        """
+        if self._stop.is_set():
+            return "stopped"
+        return "connected" if self._connected_ws is not None else "reconnecting"
+
     def run(self) -> None:
         try:
             asyncio.run(self._ws_loop())

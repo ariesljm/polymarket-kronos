@@ -1694,6 +1694,9 @@ class FakeSampler:
     def subscribe(self, tokens, direction_map=None):
         self.subscribed.append(list(tokens))
 
+    def connection_status(self) -> str:
+        return "connected"
+
 
 def test_circuit_breaker_unsubscribes_sampler(tmp_path):
     """熔断触发时退订盘口采样器（停旧 token 空转轮询，防 404 刷屏）。"""

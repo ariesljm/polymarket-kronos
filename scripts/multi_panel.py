@@ -182,6 +182,22 @@ def _symbol_block(v: PanelView, online: bool) -> Group:
         probs.append(Text(f"  状态: {st}", style="dim"))
     lines.append(probs)
 
+    # WS 连接状态（数据链路健康：盘口 book_sampler + 币安 ticker;●=已连 ○=重连中 ✖=已停）
+    ws = v.ws_status or {}
+    if ws:
+        ws_line = Text("WS ", style="dim")
+        for key, label in (("book", "盘口"), ("ticker", "币安")):
+            s = ws.get(key)
+            if s == "connected":
+                lit = Text(f"{label}●", style="bold green")
+            elif s == "reconnecting":
+                lit = Text(f"{label}○", style="bold yellow")
+            else:
+                lit = Text(f"{label}✖", style="dim")
+            ws_line.append(lit)
+            ws_line.append(Text("  ", style="dim"))
+        lines.append(ws_line)
+
     # 持仓 / 挂单
     if v.position:
         p = v.position

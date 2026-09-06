@@ -595,10 +595,19 @@ class TradingLoop:
         self._exec_dispatcher.execute(action, market, now_sec)
 
     def save_status(self) -> None:
-        extra = None
+        extra: dict = {}
         st_fn = getattr(self.strategy, "status_text", None)
         if st_fn is not None:
             text = st_fn()
             if text:
-                extra = {"strategy_state": text}
+                extra["strategy_state"] = text
+        # WS 连接状态（面板展示:盘口 book_sampler + 币安 ticker;断线重连可观测）
+        ws: dict[str, str] = {}
+        samp = getattr(self.book, "sampler", None)
+        if samp is not None:
+            ws["book"] = samp.connection_status()
+        if getattr(self, "ticker", None) is not None:
+            ws["ticker"] = self.ticker.connection_status()
+        if ws:
+            extra["ws"] = ws
         self._store.save(self.state, extra=extra)

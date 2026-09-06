@@ -78,6 +78,7 @@ class PanelView:
     predicting: bool = False
     predict_start_sec: int | None = None
     prices: dict | None = None
+    ws_status: dict | None = None  # WS 连接状态 {"book": str, "ticker": str}（断线重连可观测）
     live_positions: list = field(default_factory=list)
     config_summary: str = ""
     tp_sl: dict | None = None
@@ -299,6 +300,7 @@ def build_view(status: TradeState | None, trades: list,
         v.predict_start_sec = status.predict_start_sec
         v.prices = status.market_prices
         v.strategy_state = getattr(status, "strategy_state", None)
+        v.ws_status = getattr(status, "ws", None)
         if status.skip_until_sec and status.skip_until_sec > now_sec:
             v.startup_wait_sec = status.skip_until_sec - now_sec
         v.live_positions = status.live_positions or []
