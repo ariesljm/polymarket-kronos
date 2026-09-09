@@ -3,10 +3,11 @@
 相比多进程并行（每标的 1 进程 ×6 层 uv shim/base）：
 - 1 个进程、1 份日志（logs/multi.log，按天滚动）、1 个 pid 文件
 - 无重复启动/互杀/日志分散问题（多进程时代：分进程反复 kill_old、日志句柄竞争）
-- 每标的独立状态/数据目录（data_multi/btc 等）与独立 WS 线程，行为与单标的完全一致
+- 每标的独立状态/数据目录（data_multi/eth 等）与独立 WS 线程，行为与单标的完全一致
 
 用法:
-  uv run python -m pmbot.run_multi --symbols BTC,ETH,SOL --data-dirs data_multi/btc,data_multi/eth,data_multi/sol --dry-run
+  uv run python -m pmbot.run_multi --symbols ETH,SOL --data-dirs data_multi/eth,data_multi/sol --dry-run
+  （如需跑其它标的，例：--symbols BTC,ETH,SOL --data-dirs data_multi/btc,data_multi/eth,data_multi/sol）
   Ctrl-C / SIGTERM → 各标的优雅停机（撤单→结算→落盘）后退出
 """
 
@@ -53,10 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="多标的单进程主循环（每标的一个线程）")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument(
-        "--symbols", default="BTC,ETH,SOL", help="逗号分隔标的列表，与 --data-dirs 一一对应"
+        "--symbols", default="ETH,SOL", help="逗号分隔标的列表，与 --data-dirs 一一对应"
     )
     parser.add_argument(
-        "--data-dirs", default="data_multi/btc,data_multi/eth,data_multi/sol",
+        "--data-dirs", default="data_multi/eth,data_multi/sol",
         help="逗号分隔数据目录列表（每标的一个，顺序对应 --symbols）",
     )
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="模拟运行（默认）")

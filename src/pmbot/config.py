@@ -12,7 +12,7 @@ config.py 本身无需改动。
 from __future__ import annotations
 
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -26,7 +26,7 @@ KNOWN_STRATEGIES = ("momentum",)
 _ENGINE_FIELDS = (
     "amount_per_trade", "p_up_buy", "p_down_buy", "cancel_before_end_sec",
     "exit_loss_before_end_sec", "hold_until_end_sec", "take_profit",
-    "take_profit_max", "stop_loss", "max_consecutive_losses", "max_daily_loss",
+    "stop_loss", "max_consecutive_losses", "max_daily_loss",
     "no_entry_before_end_sec", "open_delay_sec", "contradiction_skip_pct",
     "max_entry_price", "min_entry_price", "taker_fee_pct",
 )
@@ -45,8 +45,9 @@ DEFAULTS: dict = {
     "min_entry_price": 0.0,      # 入场价下限：盘口 ask 低于此价不入场（0 = 关闭）
     "taker_fee_pct": 0.0,        # dry-run 模拟 taker 手续费率（按成交金额；实盘 pnl=余额差已含费）
     "threshold_pct": 0.08,     # momentum 策略：Binance 相对窗口开盘穿越阈值 %%——穿越后同向入场
-    "take_profit": 0.30,
-    "take_profit_max": 0.95,
+    "threshold_by_symbol": {},  # 分标的穿越阈值覆盖（如 {ETH: 0.10, SOL: 0.12}）
+    "btc_contradiction_pct": 0.0,  # BTC 反向矛盾过滤阈值（0 = 关闭）
+    "take_profit": 0.95,
     "stop_loss": 0.20,
     "max_consecutive_losses": 10,
     "max_daily_loss": 10,
@@ -68,7 +69,6 @@ class EngineConfig:
     exit_loss_before_end_sec: int
     hold_until_end_sec: int
     take_profit: float
-    take_profit_max: float
     stop_loss: float
     max_consecutive_losses: int
     max_daily_loss: float
@@ -86,6 +86,8 @@ class StrategyConfig:
 
     market_interval: str = "5m"
     threshold_pct: float = 0.08  # momentum：穿越阈值 %%（相对窗口开盘）
+    threshold_by_symbol: dict = field(default_factory=dict)  # 分标的覆盖 {ETH: 0.10, SOL: 0.12}
+    btc_contradiction_pct: float = 0.0  # BTC 反向矛盾过滤阈值（0 = 关闭）
 
 
 @dataclass(frozen=True)
@@ -100,7 +102,6 @@ class Config:
     exit_loss_before_end_sec: int  # 窗口结束前 N 秒内浮亏 → 市价离场（0 = 关闭）
     hold_until_end_sec: int        # 窗口结束前 N 秒内浮盈 → 持有到结算（0 = 关闭）
     take_profit: float
-    take_profit_max: float
     stop_loss: float
     max_consecutive_losses: int
     max_daily_loss: float
@@ -118,6 +119,10 @@ class Config:
     taker_fee_pct: float = 0.0
     # momentum 策略：Binance 相对窗口开盘穿越阈值 %%（穿越后同向入场）
     threshold_pct: float = 0.08
+    # 分标的穿越阈值覆盖（{ETH: 0.10, SOL: 0.12}；未列标的用 threshold_pct）
+    threshold_by_symbol: dict = field(default_factory=dict)
+    # BTC 反向矛盾过滤阈值 %%（0 = 关闭；标的穿越方向与 BTC 反向时跳过入场）
+    btc_contradiction_pct: float = 0.0
 
     def to_engine_config(self) -> EngineConfig:
         """引擎窄视图派生：字段与 EngineConfig 一一对应（白名单自动映射，
@@ -131,6 +136,8 @@ class Config:
         return StrategyConfig(
             market_interval=self.market_interval,
             threshold_pct=self.threshold_pct,
+            threshold_by_symbol=self.threshold_by_symbol,
+            btc_contradiction_pct=self.btc_contradiction_pct,
         )
 
 
@@ -173,15 +180,12 @@ def load_config(path: str | Path) -> Config:
         )
 
     tp = _as_float(s["take_profit"], "take_profit")
-    tpm = _as_float(s.get("take_profit_max", DEFAULTS["take_profit_max"]), "take_profit_max")
     sl = _as_float(s["stop_loss"], "stop_loss")
-    # 百分比语义下两个参数独立：止盈 +tp、止损 -sl（如 tp=0.30 / sl=0.70 均合法）
+    # 止盈为绝对价（0.95 = 价格到 0.95 止盈，接近持有到结算）；止损为相对百分比
     if not (0 < tp < 1):
-        raise ConfigError("take_profit（百分比）必须在 (0,1) 之间")
+        raise ConfigError("take_profit（绝对止盈价）必须在 (0,1) 之间")
     if not (0 <= sl < 1):
         raise ConfigError("stop_loss（百分比）必须在 [0,1) 之间（0 表示关闭止损）")
-    if not (0 < tpm < 1):
-        raise ConfigError("take_profit_max 必须在 (0,1) 之间")
 
     cbe = _field(s, "cancel_before_end_sec", _as_int, lo=1)
     elbe = _field(s, "exit_loss_before_end_sec", _as_int, lo=0, hint="0 表示关闭")
@@ -202,6 +206,15 @@ def load_config(path: str | Path) -> Config:
     thr = _field(s, "threshold_pct", _as_float, lo=0, lo_excl=True,
                  hint="momentum 穿越阈值，如 0.08 = 0.08%")
 
+    tbs = s.get("threshold_by_symbol", {}) or {}
+    if not isinstance(tbs, dict):
+        raise ConfigError("threshold_by_symbol 必须是 dict（如 {ETH: 0.10, SOL: 0.12}）")
+    for _k, _v in tbs.items():
+        _as_float(_v, f"threshold_by_symbol.{_k}")
+
+    btc_cp = _field(s, "btc_contradiction_pct", _as_float, lo=0,
+                    hint="0 表示关闭 BTC 反向矛盾过滤")
+
     mcl = _field(s, "max_consecutive_losses", _as_int, lo=1)
     mdl = _field(s, "max_daily_loss", _as_float, lo=0, lo_excl=True)
 
@@ -218,7 +231,6 @@ def load_config(path: str | Path) -> Config:
         no_entry_before_end_sec=nebs,
         open_delay_sec=ods,
         take_profit=tp,
-        take_profit_max=tpm,
         stop_loss=sl,
         max_consecutive_losses=mcl,
         max_daily_loss=mdl,
@@ -227,6 +239,8 @@ def load_config(path: str | Path) -> Config:
         min_entry_price=miep,
         taker_fee_pct=tfp,
         threshold_pct=thr,
+        threshold_by_symbol=tbs,
+        btc_contradiction_pct=btc_cp,
     )
 
 

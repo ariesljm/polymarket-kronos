@@ -33,8 +33,7 @@ def test_missing_fields_get_defaults(tmp_path):
     assert cfg.p_up_buy == 0.60
     assert cfg.p_down_buy == 0.40
     assert cfg.cancel_before_end_sec == 180
-    assert cfg.take_profit == 0.30
-    assert cfg.take_profit_max == 0.95
+    assert cfg.take_profit == 0.95
     assert cfg.stop_loss == 0.20
     assert cfg.max_consecutive_losses == 10
     assert cfg.max_daily_loss == 10
@@ -145,14 +144,14 @@ momentum:
         load_config(write_config(tmp_path, text))
 
 
-def test_percent_params_validated_independently(tmp_path):
-    """百分比语义：止盈/止损独立校验（stop_loss 可大于 take_profit，如 -70% 止损 +30% 止盈）。"""
-    # 合法：sl=0.70 > tp=0.30（-70% 止损与 +30% 止盈并存）
+def test_take_profit_stop_loss_validated_independently(tmp_path):
+    """止盈为绝对价、止损为百分比，独立校验。"""
+    # 合法：止盈价 0.95 + 止损 -70%
     ok = """
 strategy: momentum
 momentum:
   symbols: [BTC]
-  take_profit: 0.30
+  take_profit: 0.95
   stop_loss: 0.70
 """
     assert load_config(write_config(tmp_path, ok)).stop_loss == 0.70

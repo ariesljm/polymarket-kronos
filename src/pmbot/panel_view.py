@@ -280,7 +280,6 @@ def build_view(status: TradeState | None, trades: list,
 
                 tp, sl = position_exit_levels(
                     p.entry_price, panel.tp_sl["pct"], panel.tp_sl["sl"],
-                    tp_max=panel.tp_sl["max"],
                 )
                 v.position["take_profit_price"] = tp
                 v.position["stop_loss_price"] = sl
@@ -464,12 +463,12 @@ def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
             cfg = load_config(config)
         thresholds = {"p_up_buy": cfg.p_up_buy, "p_down_buy": cfg.p_down_buy}
         window_seconds = step_ms_for(cfg.market_interval) // 1000
-        tp_sl = {"pct": cfg.take_profit, "max": cfg.take_profit_max, "sl": cfg.stop_loss}
+        tp_sl = {"pct": cfg.take_profit, "sl": cfg.stop_loss}
         if cfg.strategy == "momentum":
             config_summary = (
                 f"{cfg.strategy} | {','.join(cfg.symbols)} | {cfg.market_interval} | "
                 f"注{cfg.amount_per_trade} | 穿越±{cfg.threshold_pct}% | "
-                f"止盈+{cfg.take_profit * 100:.0f}%（封顶{cfg.take_profit_max:.2f}） | "
+                f"止盈价{cfg.take_profit:.2f} | "
                 f"止损-{cfg.stop_loss * 100:.0f}% | 盈利持有{cfg.hold_until_end_sec}s | "
                 f"禁入{cfg.no_entry_before_end_sec}s | 开仓延迟{cfg.open_delay_sec}s | "
                 f"连亏熔断{cfg.max_consecutive_losses} | 日亏熔断{cfg.max_daily_loss}"
@@ -478,7 +477,7 @@ def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
             config_summary = (
                 f"{cfg.strategy} | {','.join(cfg.symbols)} | {cfg.market_interval} | "
                 f"注{cfg.amount_per_trade} | P(up)≥{cfg.p_up_buy} | "
-                f"止盈+{cfg.take_profit * 100:.0f}%（封顶{cfg.take_profit_max:.2f}） | "
+                f"止盈价{cfg.take_profit:.2f} | "
                 f"止损-{cfg.stop_loss * 100:.0f}% | 亏损离场{cfg.exit_loss_before_end_sec}s | "
                 f"盈利持有{cfg.hold_until_end_sec}s | 禁入{cfg.no_entry_before_end_sec}s | "
                 f"开仓延迟{cfg.open_delay_sec}s | "

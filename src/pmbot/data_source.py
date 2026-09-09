@@ -54,29 +54,46 @@ def fetch_klines_batch(
     足够 K 线需求；直接请求公开接口。proxies=None 时强制直连（不跟随
     环境代理）——实证：Binance 公共镜像大陆直连可达，经本地代理反而
     握手/读超时；确需代理的环境显式传 proxies 覆盖。
+
+    网络备路：proxies=None（直连）失败时自动回退环境代理重试一次——
+    镜像直连在大陆网络间歇性不可达（Errno 22 / 超时，曾致 momentum 策略
+    整窗口基准 "—" 停摆），代理与直连互为备路；显式传 proxies 的调用
+    （离线回测等）尊重其网络路径选择，不叠加回退。
     """
+    import os
     import requests
 
+    direct = {"http": None, "https": None} if proxies is None else proxies
+    attempts: list[tuple[str, dict]] = [("直连", direct)]
     if proxies is None:
-        # Binance 公共镜像直连：不跟随 HTTPS_PROXY 环境变量
-        proxies = {"http": None, "https": None}
+        env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        if env_proxy:
+            attempts.append(("环境代理", {"http": env_proxy, "https": env_proxy}))
     sym = normalize_symbol(symbol)
     params = {"symbol": sym, "interval": timeframe}
     if limit is not None:
         params["limit"] = limit
     if since is not None:
         params["startTime"] = since
-    r = requests.get(
-        "https://data-api.binance.vision/api/v3/klines",
-        params=params,
-        timeout=45,
-        proxies=proxies,
-    )
-    r.raise_for_status()
-    return [
-        Kline(int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]))
-        for row in r.json()
-    ]
+    last_err: Exception | None = None
+    for path, px in attempts:
+        try:
+            r = requests.get(
+                "https://data-api.binance.vision/api/v3/klines",
+                params=params,
+                timeout=45,
+                proxies=px,
+            )
+            r.raise_for_status()
+            return [
+                Kline(int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]))
+                for row in r.json()
+            ]
+        except Exception as e:
+            last_err = e
+            logger.warning("K线拉取失败（%s）: %s", path, e)
+    assert last_err is not None
+    raise last_err
 
 
 class KlineStore:

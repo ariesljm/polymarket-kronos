@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 RECONNECT_BASE = 5.0  # 重连退避起步（秒）：行情数据新鲜度优先——断线 5s 内重试
 RECONNECT_MAX = 60.0  # 重连退避上限（秒）
 STALE_IDLE_SEC = 25.0  # 无数据僵尸连接检测：超过该时长无任何消息 → 主动重连
+MAX_QUEUE = 256  # 接收队列上限：websockets 默认 16 太紧，盘口高流量时稍慢即满
+# → pause_reading → TCP 背压 → 服务端 1013 slow consumer（实证 2 次）。
+# 调到 256 给足缓冲；处理是纯内存 dict 操作，不会真实积压到爆。
 
 
 class ReconnectingWsThread(threading.Thread):
@@ -80,7 +83,10 @@ class ReconnectingWsThread(threading.Thread):
         while not self._stop.is_set():
             try:
                 async with websockets.connect(
-                    self.ws_url, open_timeout=15, proxy=self._proxy,
+                    self.ws_url,
+                    open_timeout=15,
+                    proxy=self._proxy,
+                    max_queue=MAX_QUEUE,
                 ) as ws:
                     backoff = self.reconnect_base
                     self._on_connect()

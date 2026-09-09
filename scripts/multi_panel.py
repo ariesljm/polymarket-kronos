@@ -1,9 +1,9 @@
-"""多标的聚合终端面板（TUI）：BTC + ETH + SOL 实时状态 + 项目汇总。
+"""多标的聚合终端面板（TUI）：ETH + SOL 实时状态 + 项目汇总。
 
 视觉参考 corridor-watch（Polymarket 监控终端）：蓝色边框 + 标题栏 +
 配置行 + 分隔线标的块 + 持仓表 + 底部状态栏。内容全部中文化。
 
-用法: uv run python scripts/multi_panel.py [--data-dir data_multi/btc,data_multi/eth,data_multi/sol] [--live]
+用法: uv run python scripts/multi_panel.py [--data-dir data_multi/eth,data_multi/sol] [--live]
 循环读取各标的数据目录,每 2 秒刷新。视图构建复用 panel_view.build_multi_view
 （与 monitor 共用同一读面;模式/目录经 RuntimePaths 派生）。
 start_multi.bat 启动 bot 后自动进入本面板；Ctrl-C 退出面板不影响 bot。
@@ -325,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="多标的聚合面板")
     parser.add_argument(
         "--data-dir",
-        default="data_multi/btc,data_multi/eth,data_multi/sol",
+        default="data_multi/eth,data_multi/sol",
         help="逗号分隔的数据目录列表（每标的一个 bot 进程一个）",
     )
     parser.add_argument("--live", action="store_true", help="实盘模式（默认 dry-run；模式/目录派生与 monitor 一致）")

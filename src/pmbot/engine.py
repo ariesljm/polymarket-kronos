@@ -119,12 +119,11 @@ def _manage_position(config: EngineConfig, position: Position, best_bid: float |
                      override: AutoTuneOverride | None = None) -> Action:
     if best_bid is None:
         return Action(ActionType.SKIP)
-    # 百分比止盈止损（相对入场价）：共享 exit_rules 单一事实源（回测/面板同公式）
+    # 止盈止损：共享 exit_rules 单一事实源（回测/面板同公式）
     # auto_tune 完整覆盖值：override 恒有值（无调整 = config 默认），直读不回落
     tp, sl = position_exit_levels(
         position.entry_price, override.take_profit if override else config.take_profit,
         config.stop_loss,
-        tp_max=config.take_profit_max,
     )
     if best_bid >= tp:
         return Action(ActionType.SELL, reason="take_profit")

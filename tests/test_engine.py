@@ -18,8 +18,7 @@ CFG = EngineConfig(
     cancel_before_end_sec=180,
     exit_loss_before_end_sec=30,
     hold_until_end_sec=60,
-    take_profit=0.30,
-    take_profit_max=0.95,
+    take_profit=0.95,
     stop_loss=0.20,
     max_consecutive_losses=10,
     max_daily_loss=10,
@@ -251,7 +250,7 @@ def test_pending_order_not_cancelled_with_time_left():
 
 def test_take_profit_when_bid_reaches_target():
     market = make_market(
-        best_bid=0.80,
+        best_bid=0.95,
         position=make_position(),
     )
     action = decide(CFG, make_state(), market, make_signal("skip", 0.5))
@@ -260,7 +259,7 @@ def test_take_profit_when_bid_reaches_target():
 
 
 def test_no_sell_below_take_profit():
-    # 0.50 < 止盈 0.585（0.45×1.3）→ 不卖
+    # 0.50 < 绝对止盈价 0.95 → 不卖
     market = make_market(
         best_bid=0.50,
         position=make_position(),
@@ -296,7 +295,7 @@ def test_window_end_forces_exit_when_lossing():
 
 
 def test_window_end_holds_profitable_to_settlement():
-    # 剩余 30s，盈利（0.50 > 入场 0.45）但未达止盈 0.585 → 持有到结算（不主动平仓）
+    # 剩余 30s，盈利（0.50 > 入场 0.45）但未达止盈 0.95 → 持有到结算（不主动平仓）
     market = make_market(
         remaining_sec=30,
         best_bid=0.50,
@@ -306,47 +305,34 @@ def test_window_end_holds_profitable_to_settlement():
     assert action.type is ActionType.SKIP
 
 
-def test_percent_tp_sl_scales_with_entry():
-    # 入场 0.20：止盈 = 0.20×1.3 = 0.26，止损 = 0.20×0.8 = 0.16
-    action = decide(CFG, make_state(), make_market(best_bid=0.26, position=make_position(entry_price=0.20)),
+def test_take_profit_is_absolute():
+    """止盈为绝对价 0.95，与入场价无关：低带持仓也持有到 0.95 才止盈。"""
+    action = decide(CFG, make_state(), make_market(best_bid=0.95, position=make_position(entry_price=0.20)),
                     make_signal("skip", 0.5))
     assert action.type is ActionType.SELL
     assert action.reason == "take_profit"
-    action = decide(CFG, make_state(), make_market(best_bid=0.25, position=make_position(entry_price=0.20)),
+    # 0.94 < 0.95 未达止盈 → 继续持有
+    action = decide(CFG, make_state(), make_market(best_bid=0.94, position=make_position(entry_price=0.20)),
                     make_signal("skip", 0.5))
     assert action.type is ActionType.SKIP
+
+
+def test_stop_loss_scales_with_entry():
+    """止损仍为相对百分比：入场 0.20 → 止损 0.20×0.8 = 0.16。"""
     action = decide(CFG, make_state(), make_market(best_bid=0.16, position=make_position(entry_price=0.20)),
                     make_signal("skip", 0.5))
     assert action.type is ActionType.SELL
     assert action.reason == "stop_loss"
-
-
-def test_take_profit_capped_by_max_price():
-    """入场价高时百分比止盈价 >1 → 按 take_profit_max 封顶止盈。"""
-    # 入场 0.80：0.80×1.3 = 1.04 > 1 → 封顶 0.95
-    action = decide(CFG, make_state(),
-                    make_market(best_bid=0.95, position=make_position(entry_price=0.80)),
-                    make_signal("skip", 0.5))
-    assert action.type is ActionType.SELL
-    assert action.reason == "take_profit"
-    # 0.94 < 0.95 未达封顶止盈线 → 继续持有
-    action = decide(CFG, make_state(),
-                    make_market(best_bid=0.94, position=make_position(entry_price=0.80)),
+    action = decide(CFG, make_state(), make_market(best_bid=0.17, position=make_position(entry_price=0.20)),
                     make_signal("skip", 0.5))
     assert action.type is ActionType.SKIP
-    # 正常范围入场不受封顶影响：0.50×1.3 = 0.65 < 0.95
-    action = decide(CFG, make_state(),
-                    make_market(best_bid=0.65, position=make_position(entry_price=0.50)),
-                    make_signal("skip", 0.5))
-    assert action.type is ActionType.SELL
-    assert action.reason == "take_profit"
 
 
 def test_window_end_take_profit_wins_first():
-    # 剩余 30s 且已达止盈 → 止盈优先
+    # 剩余 30s 且已达止盈 0.95 → 止盈优先
     market = make_market(
         remaining_sec=30,
-        best_bid=0.80,
+        best_bid=0.95,
         position=make_position(),
     )
     action = decide(CFG, make_state(), market, make_signal("skip", 0.5))

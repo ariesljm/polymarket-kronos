@@ -116,22 +116,22 @@ def test_view_extracts_status_fields():
 
 
 def test_view_position_includes_tp_sl_prices():
-    """带 tp_sl 配置时，持仓视图携带止盈/止损价（与引擎同公式：min(入×1.3, 0.90)、入−入×0.9）。"""
+    """带 tp_sl 配置时，持仓视图携带止盈/止损价（绝对止盈价 + 相对止损）。"""
     v = build_view(status_dict(), trades_rows(),
                    now_sec=WINDOW_START + 60, today=TODAY, local_tz=timezone.utc,
-                   panel=PanelConfig(tp_sl={"pct": 0.30, "max": 0.90, "sl": 0.90}))
+                   panel=PanelConfig(tp_sl={"pct": 0.95, "sl": 0.20}))
     assert v.position["direction"] == "up"
     assert v.position["size"] == 5.0
-    assert v.position["take_profit_price"] == pytest.approx(0.585)  # min(0.45×1.3, 0.90)
-    assert v.position["stop_loss_price"] == pytest.approx(0.045)   # max(0.45×0.1, 0.001)
+    assert v.position["take_profit_price"] == pytest.approx(0.95)  # 绝对止盈价
+    assert v.position["stop_loss_price"] == pytest.approx(0.36)   # 0.45×0.8
 
 
 def test_view_position_stop_loss_disabled():
     """止损关闭（sl=0）→ 止损价 0.0（UI 显示“关闭”）。"""
     v = build_view(status_dict(), trades_rows(),
                    now_sec=WINDOW_START + 60, today=TODAY, local_tz=timezone.utc,
-                   panel=PanelConfig(tp_sl={"pct": 0.50, "max": 0.90, "sl": 0.0}))
-    assert v.position["take_profit_price"] == 0.675  # min(0.45×1.5, 0.90)
+                   panel=PanelConfig(tp_sl={"pct": 0.95, "sl": 0.0}))
+    assert v.position["take_profit_price"] == 0.95   # 绝对止盈价
     assert v.position["stop_loss_price"] == 0.0      # 关闭
 
 
@@ -338,7 +338,7 @@ def test_position_line_shows_direction_size_price_only():
                   "entered_remaining_sec": 300, "window_start": WINDOW_START},
         market_prices={"up_ask": 0.48, "up_bid": 0.47, "down_ask": 0.54, "down_bid": 0.53},
     )
-    tp_sl = {"pct": 0.30, "max": 0.95, "sl": 0.20}
+    tp_sl = {"pct": 0.95, "sl": 0.20}
     v = build_view(st, trades_rows(), now_sec=WINDOW_START, today=TODAY,
                    panel=PanelConfig(tp_sl=tp_sl))
     text = render(v)

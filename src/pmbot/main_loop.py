@@ -609,6 +609,9 @@ class TradingLoop:
             text = st_fn()
             if text:
                 extra["strategy_state"] = text
+                # 同步内存字段（心跳日志/内存读面用）：曾只进 JSON extra 不回写
+                # state.strategy_state → status.json 新鲜而心跳策略文本长期冻结陈旧
+                self.state.strategy_state = text
         # WS 连接状态（面板展示:盘口 book_sampler + 币安 ticker;断线重连可观测）
         ws: dict[str, str] = {}
         samp = getattr(self.book, "sampler", None)

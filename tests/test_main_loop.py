@@ -30,8 +30,7 @@ CFG = Config(
     cancel_before_end_sec=180,
     exit_loss_before_end_sec=30,
     hold_until_end_sec=60,
-    take_profit=0.30,
-    take_profit_max=0.95,
+    take_profit=0.95,
     stop_loss=0.20,
     max_consecutive_losses=10,
     max_daily_loss=10,
@@ -358,7 +357,7 @@ def test_take_profit_sells_position(tmp_path):
         ),
         executor=ex,
     )
-    ex.best_bid_value = 0.80  # 触发止盈
+    ex.best_bid_value = 0.95  # 触发止盈
     loop.tick(now_ms=1_000_100_000)
     assert ("sell", "YES", 2.0) in ex.calls
     assert loop.state.position is None
@@ -580,7 +579,7 @@ def test_win_resets_consecutive_loss_streak(tmp_path):
         ),
         executor=ex,
     )
-    ex.best_bid_value = 0.80  # 止盈
+    ex.best_bid_value = 0.95  # 止盈
     loop.tick(now_ms=1_000_100_000)
     assert loop.state.consecutive_losses == 0
 
@@ -675,7 +674,7 @@ def test_old_position_take_profit_still_managed(tmp_path):
         ),
         executor=ex,
     )
-    ex.best_bid_value = 0.80  # ≥ take_profit → 止盈
+    ex.best_bid_value = 0.95  # ≥ take_profit → 止盈
     loop.tick(now_ms=1_000_000_000)
     assert ("sell", "YES", 2.0) in ex.calls
     assert loop.state.position is None
@@ -1312,7 +1311,7 @@ def test_sell_pnl_uses_real_fills(tmp_path):
     loop.tick(now_ms=1_000_000_000)  # 入场
     pos = loop.state.position
     # 真实到账（sell_proceeds 聚合）：卖出 0.84，与 best_bid 展示无关
-    ex.best_bid_value = 0.9
+    ex.best_bid_value = 0.95
     ex.sell_proceeds_value = pos.size * 0.84
     loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
     assert loop.state.position is None
@@ -1331,10 +1330,10 @@ def test_sell_pnl_falls_back_to_theoretical_when_no_fills(tmp_path):
     loop = make_loop(tmp_path, executor=ex, dry_run=False)
     loop.tick(now_ms=1_000_000_000)  # 入场
     pos = loop.state.position
-    ex.best_bid_value = 0.9  # sell_proceeds_value=None（聚合失败）
+    ex.best_bid_value = 0.95  # sell_proceeds_value=None（聚合失败）
     loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
     rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
-    expect = pos.size * (0.9 - pos.entry_price)  # 理论价差（best_bid）
+    expect = pos.size * (0.95 - pos.entry_price)  # 理论价差（best_bid）
     assert rows and abs(float(rows[-1]["pnl"]) - expect) < 1e-5
 
 
@@ -1349,13 +1348,13 @@ def test_dry_run_pnl_uses_theoretical_not_balance_diff(tmp_path):
     loop.tick(now_ms=1_000_000_000)  # 入场
     pos = loop.state.position
     assert pos.entry_price > 0
-    ex.best_bid_value = 0.9  # 触发止盈
+    ex.best_bid_value = 0.95  # 触发止盈
     loop.tick(now_ms=1_000_000_000 + 60_000)  # 止盈平仓
     assert loop.state.position is None
     import csv
 
     rows = list(csv.DictReader(open(Path(tmp_path) / "trades.csv", encoding="utf-8")))
-    expect = pos.size * (0.9 - pos.entry_price)  # 理论价差（非 0）
+    expect = pos.size * (0.95 - pos.entry_price)  # 理论价差（非 0）
     assert expect > 0
     assert rows and abs(float(rows[-1]["pnl"]) - expect) < 1e-5
 
@@ -1751,3 +1750,15 @@ def test_no_quote_cooldown_expires_and_retries(tmp_path):
     loop.tick(now_ms=1_000_100_000)
     assert ex.calls and ex.calls[0][0] == "market_buy"
     assert loop.state.retry_until_sec is None  # 建仓成功清除冷却
+
+
+def test_save_status_syncs_memory_strategy_state(tmp_path):
+    """save_status 同步内存 strategy_state（心跳日志读它，曾只写 JSON 不回写导致冻结）。"""
+    loop = make_loop(tmp_path)
+    loop.strategy.status_text = lambda: "策略状态: momentum 基准 100.0 偏离 +0.5%"
+    loop.save_status()
+    assert loop.state.strategy_state == "策略状态: momentum 基准 100.0 偏离 +0.5%"
+    # status.json 权威路径同样拿到（extra 覆盖）
+    import json
+    data = json.loads(Path(str(tmp_path / "status.json")).read_text(encoding="utf-8"))
+    assert data.get("strategy_state") == "策略状态: momentum 基准 100.0 偏离 +0.5%"

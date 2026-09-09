@@ -51,7 +51,7 @@ def fake_connect(monkeypatch):
     import json as _json
 
     def make(conns):
-        state = {"i": 0}
+        state = {"i": 0, "kw": {}}
 
         class FakeConn:
             def __init__(self, messages):
@@ -59,6 +59,7 @@ def fake_connect(monkeypatch):
                 self.sent = self.ws.sent
 
         def connect(*a, **kw):  # websockets.connect 是同步返回 async context manager
+            state["kw"].update(kw)
             if state["i"] >= len(conns):
                 raise RuntimeError("no more conns")
             msgs = conns[state["i"]]
@@ -69,6 +70,24 @@ def fake_connect(monkeypatch):
         return state
 
     return make
+
+
+def test_connect_uses_relaxed_max_queue(fake_connect):
+    """connect 须携带 max_queue=MAX_QUEUE(默认 16 太紧会触发服务端 1013 slow consumer)。"""
+    from pmbot.ws_thread import MAX_QUEUE
+
+    state = fake_connect([["PONG"]])
+    s = BookSampler(interval=0.05)
+    s.subscribe(["tok-a"])
+    s.start()
+    try:
+        deadline = time.time() + 2
+        while time.time() < deadline and not state["kw"]:
+            time.sleep(0.02)
+        assert state["kw"].get("max_queue") == MAX_QUEUE
+    finally:
+        s.stop()
+        s.join(timeout=2)
 
 
 def test_initial_dump_builds_snapshot(fake_connect):
@@ -625,3 +644,33 @@ def test_ping_loop_sends_app_ping():
     asyncio.run(run())
     assert sent and all(m == "PING" for m in sent)
     assert len(sent) >= 2  # 0.07s / 0.02s → 至少两次
+
+
+def test_connection_status_data_link_semantics():
+    """connection_status 报告"数据链路健康"而非纯 TCP:WS 断但快照新鲜 = connected。
+
+    本环境代理对高流量 WS 不稳(WS 断连期间 REST 兜底 1s 刷新),纯 TCP 语义
+    会误导面板显示重连——数据链路实际健康。快照陈旧(WS 断 + REST 失败)才报
+    reconnecting;无订阅需求时保持基类纯 TCP 语义;stopped 优先。
+    """
+    s = BookSampler()
+    # 1. stopped 优先
+    s._stop.set()
+    assert s.connection_status() == "stopped"
+    s._stop.clear()
+
+    # 2. 无订阅需求:回退基类纯 TCP 语义(未连接 → reconnecting)
+    assert s.connection_status() == "reconnecting"
+    s._connected_ws = object()  # 模拟 TCP 已连
+    assert s.connection_status() == "connected"
+    s._connected_ws = None
+
+    # 3. 有订阅 + 任一快照新鲜(WS 断但 REST 兜底在保) → connected
+    s.subscribe(["tok-a", "tok-b"])
+    s.update_snapshot("tok-a", fake_book(0.5))
+    assert s.connection_status() == "connected"
+
+    # 4. 全部快照陈旧(WS 断 + REST 兜底失效) → 回退基类 → reconnecting
+    s._snapshot_ts["tok-a"] = time.monotonic() - 60
+    # tok-b 无快照本身即陈旧;tok-a 已置 60s 前 → 全部陈旧
+    assert s.connection_status() == "reconnecting"

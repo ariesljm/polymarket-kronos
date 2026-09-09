@@ -91,7 +91,12 @@ def build_loop(cfg, *, symbol: str, paths: RuntimePaths, dry_run: bool, poll_sec
     from pmbot.user_stream import UserStream
 
     data_dir = paths.data_dir
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    # 无环境变量时兜底本机默认代理：websockets 17 的 proxy=None 是强制直连（不读
+    # 环境变量），cmd/bat 启动时若环境里没有 HTTPS_PROXY，Polymarket WS 会静默
+    # 直连被墙 → 15s 握手超时无限重连。与 clob_executor.fetch_book 的 REST 兜底
+    # 硬编码默认值同源，保证 WS/REST 链路一致。
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
+        or "http://127.0.0.1:10808"
 
     # Binance 实时价线程提前创建：momentum 策略用它做穿越检测（WS ~1s 推送，
     # 比每 tick REST 快；更早发现穿越 → 更可能抓做市商未调价的便宜档）。
@@ -184,8 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     paths = paths_for(not args.dry_run, args.data_dir)
     data_dir = paths.data_dir
 
-    # 代理从环境读取（墙内访问 Polymarket/Binance 需代理；记录在启动横幅）
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    # 代理从环境读取（墙内访问 Polymarket/Binance 需代理；记录在启动横幅）。
+    # 无环境变量时兜底本机默认代理，理由同 build_loop（websockets proxy=None 强制直连）。
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
+        or "http://127.0.0.1:10808"
 
     bundle = build_loop(cfg, symbol=symbol, paths=paths,
                         dry_run=args.dry_run, poll_sec=args.poll)

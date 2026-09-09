@@ -143,3 +143,88 @@ def test_incremental_stops_when_no_new_data(tmp_path):
     # 2 次调用：回填向前探空（-899000000，返回同批 → 无新数据即停）+ 增量一次（2800000，
     # 同批全重复 → 立即停止，不无限循环）
     assert calls == [-899_000_000, 2_800_000]
+
+
+class _FakeResp:
+    def __init__(self, ok=True):
+        self._ok = ok
+
+    @property
+    def ok(self):
+        return self._ok
+
+    def raise_for_status(self):
+        if not self._ok:
+            raise OSError("直连不可达")
+
+    def json(self):
+        # 一根 K 线即可
+        return [[1_000_000, "100.0", "101.0", "99.0", "100.5", "10.0", 1_789_000_000, "0", 10, "0", "0", "0"]]
+
+
+def test_fetch_klines_direct_success_single_call(monkeypatch):
+    """直连成功：只调一次，不触发备路。"""
+    from pmbot.data_source import fetch_klines_batch
+
+    calls = []
+
+    def fake_get(url, **kw):
+        calls.append(kw.get("proxies"))
+        return _FakeResp()
+
+    monkeypatch.setattr("requests.get", fake_get)
+    ks = fetch_klines_batch("BTC", "5m", since=1, limit=3, proxies=None)
+    assert len(ks) == 1
+    assert calls == [{"http": None, "https": None}]
+
+
+def test_fetch_klines_fallback_to_env_proxy(monkeypatch):
+    """直连失败 → 自动回退环境代理重试一次。"""
+    import os
+    from pmbot.data_source import fetch_klines_batch
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:10808")
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    calls = []
+
+    def fake_get(url, **kw):
+        calls.append(kw.get("proxies"))
+        if kw.get("proxies") == {"http": None, "https": None}:
+            raise OSError(22, "直连不可达")
+        return _FakeResp()
+
+    monkeypatch.setattr("requests.get", fake_get)
+    ks = fetch_klines_batch("BTC", "5m", since=1, limit=3, proxies=None)
+    assert len(ks) == 1  # 备路成功
+    assert len(calls) == 2
+    assert calls[1] == {"http": "http://127.0.0.1:10808", "https": "http://127.0.0.1:10808"}
+
+
+def test_fetch_klines_both_fail_raises(monkeypatch):
+    """直连与代理都失败 → 抛出最后一次异常。"""
+    from pmbot.data_source import fetch_klines_batch
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:10808")
+
+    def fake_get(url, **kw):
+        raise OSError(22, "不可达")
+
+    monkeypatch.setattr("requests.get", fake_get)
+    with pytest.raises(OSError):
+        fetch_klines_batch("BTC", "5m", since=1, limit=3, proxies=None)
+
+
+def test_fetch_klines_explicit_proxy_no_fallback(monkeypatch):
+    """显式传 proxies（离线回测等）：尊重指定路径，失败不叠加回退。"""
+    from pmbot.data_source import fetch_klines_batch
+
+    calls = []
+
+    def fake_get(url, **kw):
+        calls.append(kw.get("proxies"))
+        raise OSError(22, "指定路径失败")
+
+    monkeypatch.setattr("requests.get", fake_get)
+    with pytest.raises(OSError):
+        fetch_klines_batch("BTC", "5m", since=1, limit=3, proxies={"https": "http://127.0.0.1:10808"})
+    assert len(calls) == 1  # 只尝试指定路径一次

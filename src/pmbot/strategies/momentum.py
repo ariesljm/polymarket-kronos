@@ -66,21 +66,44 @@ class MomentumStrategy(Strategy):
         log_dir: str | Path = "data",
         fetch_price: Callable[[], float | None] | None = None,
         fetch_window_open: Callable[[], float | None] | None = None,
+        fetch_btc_price: Callable[[], float | None] | None = None,
     ) -> None:
         sc = strategy_config or StrategyConfig()
         self.symbol = symbol
         self.interval = sc.market_interval
         self.step_ms = step_ms_for(self.interval)
-        self.threshold_pct = getattr(sc, "threshold_pct", 0.08)
+        # 分标的穿越阈值：threshold_by_symbol 覆盖默认 threshold_pct
+        # （SOL 波动 > ETH > BTC，同样 % 下 SOL 假穿越多，需更高阈值）
+        tb = getattr(sc, "threshold_by_symbol", None) or {}
+        self.threshold_pct = tb.get(symbol, getattr(sc, "threshold_pct", 0.08))
+        # BTC 反向矛盾过滤阈值（0 = 关闭）：标的穿越方向与 BTC 反向时跳过
+        self.btc_contradiction_pct = getattr(sc, "btc_contradiction_pct", 0.0)
         # 依赖注入（测试用 fake；运行态默认走 Binance REST）
         self._fetch_price = fetch_price or (lambda: _fetch_price_rest(symbol))
         self._fetch_window_open = fetch_window_open or self._default_window_open
+        self._fetch_btc_price = fetch_btc_price or (lambda: _fetch_price_rest("BTC"))
         # 窗口基准价（收盘/穿越判断的锚）：None = 当前窗口尚未建立基准
         self._base: float | None = None
+        # BTC 窗口基准价（反向过滤的锚）：None = 尚未建立
+        self._btc_base: float | None = None
         # 最近一次实时价（面板状态展示）
         self._last_price: float | None = None
 
     # ---- 依赖注入默认实现 ----
+
+    def _fetch_symbol_window_open(self, symbol: str) -> float | None:
+        """当前窗口 K 线的 open（窗口起点价，与 Polymarket 结算基准同源）。"""
+        try:
+            now_ms = int(time.time() * 1000)
+            ks = fetch_klines_batch(
+                symbol, self.interval, since=now_ms - 2 * self.step_ms,
+                limit=4, proxies=None,
+            )
+            if not ks:
+                return None
+            return float(ks[-1].open)
+        except Exception:
+            return None
 
     def _default_window_open(self) -> float | None:
         """当前窗口 K 线的 open（窗口起点价，与 Polymarket 结算基准同源）。
@@ -89,17 +112,7 @@ class MomentumStrategy(Strategy):
         的 open 在窗口开始即确定——即使窗口已进行几分钟，open 仍是窗口
         起点价，延迟重建基准不引入偏差。
         """
-        try:
-            now_ms = int(time.time() * 1000)
-            ks = fetch_klines_batch(
-                self.symbol, self.interval, since=now_ms - 2 * self.step_ms,
-                limit=4, proxies=None,
-            )
-            if not ks:
-                return None
-            return float(ks[-1].open)
-        except Exception:
-            return None
+        return self._fetch_symbol_window_open(self.symbol)
 
     # ---- 信号 ----
 
@@ -117,6 +130,38 @@ class MomentumStrategy(Strategy):
             return Signal(direction=Direction.DOWN, p_up=0.10)
         return Signal(direction=Direction.SKIP, p_up=0.5)
 
+    def _btc_contradicts(self, direction: Direction) -> bool:
+        """BTC 反向穿越：标的 UP 但 BTC 已跌穿 -pct%，或标的 DOWN 但 BTC 已涨穿 +pct%。
+
+        依据 docs/reports/btc_cross_asset_signal.md：标的穿越方向与 BTC 相反时
+        命中率暴跌（30 天 41% vs 80%；昨晚实盘 5 笔 -3.09），是假穿越（标的
+        独立噪音，非市场动量）。BTC 价默认 REST 拉取（~1s，反向状态非瞬时
+        事件，延迟可接受）；每窗口懒加载 BTC 基准。
+        """
+        if self.btc_contradiction_pct <= 0:
+            return False
+        if self._btc_base is None:
+            self._btc_base = self._fetch_symbol_window_open("BTC")
+            if self._btc_base is None:
+                return False
+        price = self._fetch_btc_price()
+        if price is None or self._btc_base <= 0:
+            return False
+        dev = (price - self._btc_base) / self._btc_base * 100.0
+        if direction is Direction.UP and dev <= -self.btc_contradiction_pct:
+            return True
+        if direction is Direction.DOWN and dev >= self.btc_contradiction_pct:
+            return True
+        return False
+
+    def _apply_btc_filter(self, signal: Signal) -> Signal:
+        """BTC 反向矛盾过滤：穿越方向与 BTC 相反 → 降级 SKIP（不入场）。"""
+        if signal.direction is Direction.SKIP:
+            return signal
+        if self._btc_contradicts(signal.direction):
+            return Signal(direction=Direction.SKIP, p_up=0.5)
+        return signal
+
     def generate_signal(self, context: SignalContext | None = None) -> Signal:
         """窗口开始：建基准价 + 立即检测一次穿越。
 
@@ -131,7 +176,7 @@ class MomentumStrategy(Strategy):
         dev = self._deviation_pct(price)
         if dev is None:
             return Signal(direction=Direction.SKIP, p_up=0.5)
-        return self._signal_for(dev)
+        return self._apply_btc_filter(self._signal_for(dev))
 
     def refresh_signal(self, context: SignalContext | None = None) -> Signal | None:
         """窗口内每 tick：实时监控穿越。穿越返回同向信号，未穿越返回 None。
@@ -147,7 +192,7 @@ class MomentumStrategy(Strategy):
         dev = self._deviation_pct(price) if self._base is not None else None
         if dev is None:
             return None
-        return self._signal_for(dev)
+        return self._apply_btc_filter(self._signal_for(dev))
 
     def status_text(self) -> str | None:
         """面板状态：窗口基准价 / 实时偏离 / 穿越阈值 / 穿越状态。"""
@@ -194,3 +239,4 @@ class MomentumStrategy(Strategy):
     def reset_runtime_data(self) -> None:
         """清空窗口基准（策略无持久化状态，仅内存锚点）。"""
         self._base = None
+        self._btc_base = None

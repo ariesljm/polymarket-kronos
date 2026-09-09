@@ -88,6 +88,24 @@ class BookSampler(ReconnectingWsThread):
         self._health_check_sec = health_check_sec
         self._lock = threading.Lock()
 
+    def connection_status(self) -> str:
+        """盘口数据链路健康状态:WS 或 REST 兜底任一有新鲜快照 = connected。
+
+        覆写基类"纯 TCP 字节流"语义——本环境代理隧道对 WS 高流量下行不稳
+        (实测订阅后 ~3-5s 必断,代码初版实证),WS 断但 REST 兜底 1s 刷新
+        保持快照新鲜时,若按 TCP 状态上报 reconnecting 会误导面板
+        (盘口价实际新鲜可见,数据链路健康)。快照陈旧(WS 断 + REST 兜底
+        也失败)才上报 reconnecting——即数据链路真的断了。
+        """
+        if self._stop.is_set():
+            return "stopped"
+        with self._lock:
+            if not self._tokens:
+                return super().connection_status()  # 无订阅需求:纯 TCP 语义
+            if any(not self._is_stale_locked(t) for t in self._tokens):
+                return "connected"
+        return super().connection_status()
+
     # ---- 主循环接口（线程安全） ----
 
     def subscribe(self, tokens: list[str], direction_map: dict[str, str] | None = None) -> None:
