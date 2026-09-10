@@ -1,4 +1,7 @@
-"""多标的聚合终端面板（TUI）：ETH + SOL 实时状态 + 项目汇总。
+"""多标的聚合终端面板（TUI）：各标的实时状态 + 项目汇总。
+
+标的目录默认从 config.yaml 的 momentum.symbols 派生（data_multi/<sym>），
+与 bot 标的池单一事实源对齐；可用 --data-dir 覆盖。
 
 视觉参考 corridor-watch（Polymarket 监控终端）：蓝色边框 + 标题栏 +
 配置行 + 分隔线标的块 + 持仓表 + 底部状态栏。内容全部中文化。
@@ -126,12 +129,14 @@ def _title_bar(views: list[PanelView], mode: str, interval: str) -> Table:
     return bar
 
 
-def _cfg_line(symbols: int, interval: str, amount: float, threshold_pct: float,
+def _cfg_line(symbols: int, interval: str, amount: float,
               max_entry: float, views: list) -> Table:
-    """配置行（全局参数，只显示一次，标的块不再重复）+ 真实聚合 WS 连接状态（替代早期硬编码死文案）。"""
+    """配置行（全局参数，只显示一次，标的块不再重复）+ 真实聚合 WS 连接状态（替代早期硬编码死文案）。
+
+    穿越阈值分标的各异（threshold_by_symbol），不在此显示全局默认值，改在各标的块首行。"""
     left = Text(
         f"配置 标的 {symbols} · 每注 {amount:.0f} · 持有至结算 · {interval} · "
-        f"穿越±{threshold_pct:.2f}% · 入场上限 {max_entry:.2f}",
+        f"入场上限 {max_entry:.2f}",
         style="dim",
     )
 
@@ -158,125 +163,154 @@ def _cfg_line(symbols: int, interval: str, amount: float, threshold_pct: float,
     return bar
 
 
-def _symbol_block(v: PanelView, online: bool) -> Group:
-    """单标的块：现货价 / 涨跌概率 / 策略状态 / WS 状态 / 持仓 / 统计（只显示标特定的内容，窗口信息统一在顶部栏）。"""
-    lines: list = []
+def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
+    """单标的卡片：2 行内容 + 边框（4 卡/行也能读，标的信息一目了然）。
 
-    # 首行：在线灯 + 标的 + 现货价 + 涨跌（窗口信息统一在顶部栏显示）
-    head = Text("● " if online else "○ ", style="green" if online else "red")
-    head.append(Text(f"{v.symbol or '?'}  ", style="bold white"))
+    标题行 = 标的 + 分标的穿越阈值（阈值为 spec 单一事实源回落）
+    行1 = 现货价/偏离 + 涨跌概率；行2 = 策略状态 + 持仓/挂单 + 今日盈亏 + 连亏 + WS
+    """
+    body: list = []
 
+    # 行1：现货价 + 窗口内偏离 + 涨/跌盘口
+    l1 = Text()
     spot = parse_strategy_spot(v.strategy_state)
     if spot:
         price, dev = spot
-        arrow = "▲" if dev >= 0 else "▼"
-        head.append(Text(f"${price:,.2f} ", style="bold cyan"))
-        head.append(Text(f"{arrow}{abs(dev):.2f}%", style="green" if dev >= 0 else "red"))
+        l1.append(Text(f"${price:,.2f}", style="bold cyan"))
+        l1.append(Text(
+            f" {'▲' if dev >= 0 else '▼'}{abs(dev):.2f}%",
+            style="green" if dev >= 0 else "red",
+        ))
     else:
-        head.append(Text("$—", style="dim"))
-    lines.append(head)
-
-    # 第二行：涨/跌概率 + 策略状态
+        l1.append(Text("$—", style="dim"))
     prices = v.prices or {}
     up = prices.get("up_ask")
     down = prices.get("down_ask")
-    probs = Text("涨 ", style="dim")
-    probs.append(Text(_fmt_cents(up) + "¢", style="bold green") if up is not None else Text("—", style="dim"))
-    probs.append(Text("  跌 ", style="dim"))
-    probs.append(Text(_fmt_cents(down) + "¢", style="bold red") if down is not None else Text("—", style="dim"))
+    l1.append(Text("  涨", style="dim"))
+    l1.append(Text(_fmt_cents(up) + "¢", style="bold green") if up is not None else Text("—", style="dim"))
+    l1.append(Text(" 跌", style="dim"))
+    l1.append(Text(_fmt_cents(down) + "¢", style="bold red") if down is not None else Text("—", style="dim"))
+    body.append(l1)
+
+    # 行2：策略状态 + 持仓/挂单 + 今日盈亏 + 连亏 + WS 灯
+    l2 = Text()
     st = status_tail(v.strategy_state)
     if st:
-        probs.append(Text(f"  状态: {st}", style="dim"))
-    lines.append(probs)
-
-    # WS 连接状态（数据链路健康：盘口 book_sampler + 币安 ticker;●=已连 ○=重连中 ✖=已停）
-    ws = v.ws_status or {}
-    if ws:
-        ws_line = Text("WS ", style="dim")
-        for key, label in (("book", "盘口"), ("ticker", "币安")):
-            s = ws.get(key)
-            if s == "connected":
-                lit = Text(f"{label}●", style="bold green")
-            elif s == "reconnecting":
-                lit = Text(f"{label}○", style="bold yellow")
-            else:
-                lit = Text(f"{label}✖", style="dim")
-            ws_line.append(lit)
-            ws_line.append(Text("  ", style="dim"))
-        lines.append(ws_line)
-
-    # 持仓 / 挂单
+        l2.append(Text(st, style="bold yellow" if "穿越" in st else "dim"))
     if v.position:
         p = v.position
-        lines.append(Text(
-            f"持仓 {p['direction'].upper()} {p['size']:.2f}股 @{_fmt_cents(p['entry_price'])}分",
+        l2.append(Text(
+            f"  持{p['direction'].upper()}{p['size']:.1f}@{_fmt_cents(p['entry_price'])}",
             style="bold yellow",
         ))
     elif v.pending:
         p = v.pending
-        lines.append(Text(
-            f"挂单 {p['direction'].upper()} {p['size'] or '?'}股 @{_fmt_cents(p['price'])}分",
-            style="bold magenta",
-        ))
-    else:
-        lines.append(Text("持仓 —", style="dim"))
-    if v.paused:
-        lines.append(Text(f"⚠ 已暂停: {v.pause_reason or '熔断'}", style="bold red"))
-
-    # 统计行
+        l2.append(Text(f"  挂{p['direction'].upper()}", style="bold magenta"))
+    l2.append(Text("  今 ", style="dim"))
+    l2.append(_pnl_text(v.today_pnl))
     ts = v.today_stats
-    rs = v.recent_stats
-    stat = Text("今日 ")
-    stat.append(_pnl_text(v.today_pnl))
-    stat.append(f" ({ts['n']}笔 {_win_pct(ts)})" if ts else " (—)")
-    stat.append(Text("  累计 "))
-    if rs:
-        stat.append(_pnl_text(rs["pnl"]))
-        stat.append(f" ({rs['n']}笔 {_win_pct(rs)})")
-    else:
-        stat.append("—")
-    stat.append(Text(f"  连亏 {v.consecutive_losses}", style="dim"))
-    lines.append(stat)
+    if ts and ts.get("n"):
+        l2.append(Text(f" {_win_pct(ts)}", style="dim"))
+    l2.append(Text(f" 亏{v.consecutive_losses}", style="dim"))
+    ws = v.ws_status or {}
+    if ws:
+        l2.append(Text(" ", style="dim"))
+        for key, label in (("book", "盘"), ("ticker", "币")):
+            s = ws.get(key)
+            if s == "connected":
+                l2.append(Text(f"{label}●", style="bold green"))
+            elif s == "reconnecting":
+                l2.append(Text(f"{label}○", style="bold yellow"))
+            else:
+                l2.append(Text(f"{label}✖", style="dim"))
+    body.append(l2)
+    if v.paused:
+        body.append(Text(f"⚠ {v.pause_reason or '熔断'}", style="bold red"))
 
-    border = "green" if online else "red"
-    return Panel(Group(*lines), title=f"{v.symbol or '?'}", border_style=border, padding=(0, 1))
+    title = f"{v.symbol or '?'} ±{threshold:.2f}%" if threshold is not None else f"{v.symbol or '?'}"
+    return Panel(
+        Group(*body), title=title, title_align="left",
+        border_style="green" if online else "red", padding=(0, 1),
+    )
 
 
-def _history_table(views: list[PanelView], per_symbol: int = 3) -> Table:
-    """交易历史表：各标的最细交易明细，按时间倒序（最新在上）。
+def cards_per_row(width: int) -> int:
+    """卡片列数：宽终端 4 卡/行（~30 列/卡），中宽 2，窄屏 1（防折行）。"""
+    return 4 if width >= 120 else (2 if width >= 72 else 1)
 
-    每标的取最近 per_symbol 笔（panel_view.recent_trades 已带 size/label），
-    跨标的合并排序——市场/时间/方向/数量/价格/盈亏一目了然。
+
+def _symbol_cards(views: list[PanelView], thresholds: dict[str, float],
+                  online_flags: list[bool], width: int) -> Table:
+    """标的卡片网格：cards_per_row 列自适应，行内等高（空白补位）。"""
+    per_row = cards_per_row(width)
+    grid = Table(expand=True, box=None, pad_edge=False, show_edge=False,
+                 show_header=False, padding=(0, 1))
+    for _ in range(per_row):
+        grid.add_column(justify="left", ratio=1, no_wrap=False)
+    cards = [_card(v, on, thresholds.get(v.symbol)) for v, on in zip(views, online_flags)]
+    for i in range(0, len(cards), per_row):
+        chunk: list = cards[i:i + per_row]
+        chunk += [Text("")] * (per_row - len(chunk))  # 末行补空位，卡片宽度不被拉伸
+        grid.add_row(*chunk)
+    return grid
+
+
+def _history_table(records_by_dir: dict[str, list], max_rows: int = 12) -> Table:
+    """交易历史表：全量 trades.csv（不再受视图 RECENT_LIMIT 截断），按时间倒序。
+
+    行数 = 终端剩余高度（max_rows）——每标的保底 2 笔后其余额度按全局时间倒序填充，
+    避免单一活跃标的把其它标的挤出表外。
     """
     table = Table(expand=True, box=None, pad_edge=False, show_edge=False,
-                  header_style="bold white", padding=0)
-    table.add_column("时间", justify="left", style="dim", no_wrap=True, min_width=5)
-    table.add_column("标的", justify="left", no_wrap=True, min_width=4)
-    table.add_column("方向", justify="left", no_wrap=True, min_width=2)
-    table.add_column("数量(股)", justify="right", no_wrap=True, min_width=7)
-    table.add_column("入场", justify="right", no_wrap=True, min_width=5)
-    table.add_column("出场", justify="right", no_wrap=True, min_width=5)
-    table.add_column("盈亏", justify="right", no_wrap=True, min_width=6)
-    table.add_column("原因", justify="left", no_wrap=True, min_width=8)
+                  header_style="bold white", padding=(0, 1))
+    table.add_column("时间", justify="left", style="dim", no_wrap=True, width=12)
+    table.add_column("标的", justify="left", no_wrap=True, width=5)
+    table.add_column("方向", justify="left", no_wrap=True, width=4)
+    table.add_column("数量(股)", justify="right", no_wrap=True, width=9)
+    table.add_column("入场", justify="right", no_wrap=True, width=6)
+    table.add_column("出场", justify="right", no_wrap=True, width=6)
+    table.add_column("盈亏", justify="right", no_wrap=True, width=7)
+    table.add_column("原因", justify="left", no_wrap=True, ratio=1, min_width=8)
 
     def dir_name(d: str) -> str:
         return "涨" if d.upper() == "UP" else ("跌" if d.upper() == "DOWN" else d)
 
-    rows = []
-    for v in views:
-        for t in (v.recent_trades or [])[:per_symbol]:
-            rows.append((t["ts"], v.symbol or "?", t))
-    rows.sort(key=lambda r: r[0], reverse=True)  # 时间倒序：最新在上
+    rows: list[tuple[str, object]] = []
+    for recs in records_by_dir.values():
+        for r in recs:
+            rows.append((r.ts, r))
+    rows.sort(key=lambda x: x[0], reverse=True)  # ISO 时间倒序：最新在上
 
     if not rows:
         table.add_row("", "暂无交易", "", "", "", "", "", "")
         return table
-    for ts, sym, t in rows:
-        label = t.get("label") or t.get("reason") or ""
+
+    # 每标的保底 2 笔（公平）+ 其余按时间倒序填充（最新最多）
+    MIN_PER_SYMBOL = 2
+    picked: list[tuple[str, object]] = []
+    chosen: set[int] = set()
+    per: dict[str, int] = {}
+    for item in rows:
+        sym = item[1].symbol
+        if per.get(sym, 0) < MIN_PER_SYMBOL:
+            per[sym] = per.get(sym, 0) + 1
+            picked.append(item)
+            chosen.add(id(item[1]))
+    for item in rows:
+        if len(picked) >= max_rows:
+            break
+        if id(item[1]) not in chosen:
+            picked.append(item)
+            chosen.add(id(item[1]))
+    picked.sort(key=lambda x: x[0], reverse=True)
+    picked = picked[:max_rows]
+
+    for ts, r in picked:
+        label = r.reason or ""
         table.add_row(
-            ts, sym, dir_name(t["direction"]),
-            f"{t.get('size', 0):.2f}", _fmt_cents(t["entry"]), _fmt_cents(t["exit"]),
-            _pnl_text(t["pnl"]), label,
+            f"{ts[5:16].replace('T', ' ')}", r.symbol or "?", dir_name(r.direction),
+            f"{r.size:.2f}", _fmt_cents(r.entry_price), _fmt_cents(r.exit_price),
+            _pnl_text(r.pnl), label,
         )
     return table
 
@@ -325,13 +359,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="多标的聚合面板")
     parser.add_argument(
         "--data-dir",
-        default="data_multi/eth,data_multi/sol",
-        help="逗号分隔的数据目录列表（每标的一个 bot 进程一个）",
+        default=None,
+        help="逗号分隔的数据目录列表（默认从 config.yaml symbols 派生 data_multi/<sym>）",
     )
     parser.add_argument("--live", action="store_true", help="实盘模式（默认 dry-run；模式/目录派生与 monitor 一致）")
     args = parser.parse_args(argv)
 
-    dirs = [d.strip() for d in args.data_dir.split(",") if d.strip()]
+    from pmbot.config import load_config
+
+    # config 先加载：目录派生与配置摘要共用（单一事实源，加标的零改动）
+    cfg_loaded = None
+    try:
+        cfg_loaded = load_config(str(ROOT / "config.yaml"))
+    except Exception:
+        pass
+
+    if args.data_dir:
+        dirs = [d.strip() for d in args.data_dir.split(",") if d.strip()]
+    elif cfg_loaded is not None:
+        dirs = [f"data_multi/{s.lower()}" for s in cfg_loaded.symbols]
+    else:
+        dirs = ["data_multi/eth", "data_multi/sol"]
     paths_list = [RuntimePaths(data_dir=d, mode="live" if args.live else "dry-run") for d in dirs]
     mode = "live" if args.live else "dry-run"
 
@@ -341,18 +389,19 @@ def main(argv: list[str] | None = None) -> int:
     amount = 1.0
     threshold_pct = 0.08
     max_entry = 0.65
-    from pmbot.config import load_config
-
-    cfg_loaded = None
-    try:
-        cfg_loaded = load_config(str(ROOT / "config.yaml"))
+    if cfg_loaded is not None:
         symbols = len(cfg_loaded.symbols)
         interval = cfg_loaded.market_interval
         amount = cfg_loaded.amount_per_trade
         threshold_pct = getattr(cfg_loaded, "threshold_pct", 0.08)
         max_entry = getattr(cfg_loaded, "max_entry_price", 0.65)
-    except Exception:
-        pass
+    # 分标的穿越阈值：threshold_by_symbol 覆盖 + 全局默认兑底（YAML 键为字符串）
+    global_threshold = threshold_pct
+    tbs = getattr(cfg_loaded, "threshold_by_symbol", {}) if cfg_loaded else {}
+    thresholds = {
+        s: float(tbs.get(s, global_threshold))
+        for s in (cfg_loaded.symbols if cfg_loaded else [d.split("/")[-1].upper() for d in dirs])
+    }
 
     global _checks
     with Live(refresh_per_second=1 / REFRESH_SEC, screen=False, console=console) as live:
@@ -363,16 +412,21 @@ def main(argv: list[str] | None = None) -> int:
             per_dir_trades = {d: load_records(ROOT / d) for d in dirs}
             online_flags = [_is_online(ROOT / d) for d in dirs]
 
+            # 高度预算：固定开销(边框/标题/配置/分隔/表头/汇总/状态/操作) + 卡片行数,
+            # 剩余全部给交易历史（行数随终端高度自适应，不再固定 3 笔/标的）
+            card_lines = ((len(views) + cards_per_row(console.width) - 1)
+                          // cards_per_row(console.width)) * 4
+            max_rows = max(3, console.height - 11 - card_lines)
+
             body = Group(
                 _title_bar(views, mode, interval),
-                _cfg_line(symbols, interval, amount, threshold_pct, max_entry, views),
+                _cfg_line(symbols, interval, amount, max_entry, views),
+                Text("─" * max(10, console.width - 4), style="dim"),
+                _symbol_cards(views, thresholds, online_flags, console.width),
                 Text("─" * max(10, console.width - 4), style="dim"),
             )
-            for v, on in zip(views, online_flags):
-                body.renderables.append(_symbol_block(v, on))
-                body.renderables.append(Text("─" * max(10, console.width - 4), style="dim"))
 
-            body.renderables.append(_history_table(views))
+            body.renderables.append(_history_table(per_dir_trades, max_rows))
             body.renderables.append(_deploy_line(amount, symbols, per_dir_trades))
             body.renderables.append(Text("─" * max(10, console.width - 4), style="dim"))
             body.renderables.append(_status_bar(views, online_flags))
