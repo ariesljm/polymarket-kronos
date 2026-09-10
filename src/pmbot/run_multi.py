@@ -54,10 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="多标的单进程主循环（每标的一个线程）")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument(
-        "--symbols", default="ETH,SOL", help="逗号分隔标的列表，与 --data-dirs 一一对应"
+        "--symbols", default="ETH,SOL,XRP,DOGE,BNB", help="逗号分隔标的列表，与 --data-dirs 一一对应"
     )
     parser.add_argument(
-        "--data-dirs", default="data_multi/eth,data_multi/sol",
+        "--data-dirs", default="data_multi/eth,data_multi/sol,data_multi/xrp,data_multi/doge,data_multi/bnb",
         help="逗号分隔数据目录列表（每标的一个，顺序对应 --symbols）",
     )
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="模拟运行（默认）")

@@ -25,12 +25,15 @@ market_interval: 5m        # 市场/K线频率：5m / 15m / 1h（Polymarket slug
 # 首日实证穿越后 Polymarket 秒级极化、taker 追高档 EV 负；
 # 真实交易分档（10 笔）>0.50 档累计 -3.72、<0.50 全赢 → max_entry_price 0.50。
 momentum:
-  symbols: [ETH, SOL]        # 交易标的池（BTC 降级为纯信号源：只供反向过滤参考，不下单）
+  symbols: [ETH, SOL, XRP, DOGE, BNB]  # 交易标的池（BTC 降级纯信号源不下单；HYPE 无 Binance K线不可用；
+                                       # ZEC 阈值 0.20 才压到 80% 命中线以下水平，缓议）
   amount_per_trade: 1        # 每注金额（USDC）
   threshold_pct: 0.08        # 穿越阈值 %%：Binance 相对窗口开盘偏离此值 → 同向入场
                              # （5m 回测 EV +0.15~0.40/笔；0.05-0.10 均显著，0.08 平衡触发率与命中率）
-  threshold_by_symbol: {ETH: 0.10, SOL: 0.12}   # 分标的阈值覆盖：SOL 波动>ETH>BTC，高波动需更高阈值
-                                                # （30 天扫描：ETH 0.10→83.9%命中，SOL 0.12→81.8%）
+  threshold_by_symbol: {ETH: 0.10, SOL: 0.12, XRP: 0.15, DOGE: 0.15, BNB: 0.10}
+                             # 分标的阈值：窗口振幅 ZEC>XRP>DOGE>SOL>ETH>BNB>BTC，高波动需更高阈值
+                             # （30 天扫描 8640 窗/标的：ETH 0.10→84.1% SOL 0.12→81.8%
+                             #   XRP 0.15→80.6% DOGE 0.15→82.4% BNB 0.10→86.8%）
   btc_contradiction_pct: 0.08   # BTC 反向矛盾过滤：标的穿越方向与 BTC 反向时跳过入场
                                 # （30 天：反向命中率 41% vs 平均 80%；昨晚 5 笔反向 -3.09；见 btc_cross_asset_signal.md）
   take_profit: 0.95          # 绝对止盈价：价格到 0.95 止盈（接近持有到结算，赢收 1.0 输收 0，redeem 无费）
