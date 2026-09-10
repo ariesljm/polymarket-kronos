@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -165,11 +166,20 @@ class StateStore:
     def load(self) -> TradeState | None:
         if not self.status_path.is_file():
             return None
-        try:
-            data = json.loads(self.status_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError):
-            return None
-        if "symbol" not in data:
+        data = None
+        for attempt in range(3):
+            try:
+                data = json.loads(self.status_path.read_text(encoding="utf-8"))
+                break
+            except (json.JSONDecodeError, ValueError):
+                return None  # 内容损坏（半写/空文件）→ 无状态，不重试
+            except OSError:
+                # 写方 os.replace 与杀软/索引短暂占用目标文件 → 小幅重试后仍失败按无状态降级
+                # （面板每 2s 读、bot 每 1s 原子写，Windows 下存在读瞬时 PermissionError 竞态）
+                if attempt == 2:
+                    return None
+                time.sleep(0.05 * (attempt + 1))
+        if data is None or "symbol" not in data:
             return None
         if data.get("position"):
             data["position"] = self._load_position(data["position"])

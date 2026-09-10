@@ -9,7 +9,7 @@
 用法: uv run python scripts/multi_panel.py [--data-dir data_multi/eth,data_multi/sol] [--live]
 循环读取各标的数据目录,每 2 秒刷新。视图构建复用 panel_view.build_multi_view
 （与 monitor 共用同一读面;模式/目录经 RuntimePaths 派生）。
-start_multi.bat 启动 bot 后自动进入本面板；Ctrl-C 退出面板不影响 bot。
+start_multi.bat 启动 bot 后自动进入本面板；Ctrl-C 停止 bot 并退出面板。
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from pmbot.ledger import load_records  # noqa: E402
 from pmbot.panel_view import (  # noqa: E402
+    EXIT_LABELS,
     PanelView,
     build_multi_view,
     parse_strategy_spot,
@@ -41,6 +42,7 @@ from rich.text import Text  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 REFRESH_SEC = 2.0
 OFFLINE_GRACE_SEC = 20.0  # status.json 超过该时长未更新 → 判定离线
+CARD_MIN_COL_W = 38  # 卡片最小外宽（内容 ~32 + 边框/内边距/列间距）：低于此值内容会折行
 GATE_TRADES = 200  # 统计门限：样本量
 GATE_T = 1.96  # 统计门限：|t|
 
@@ -87,12 +89,6 @@ def _t_stat(trades: list) -> float | None:
     return mean / (var / n) ** 0.5
 
 
-def _win_pct(stats: dict | None) -> str:
-    if not stats or not stats.get("n"):
-        return "—"
-    return f"{stats['wins'] / stats['n']:.0%}"
-
-
 def _pnl_text(pnl: float) -> Text:
     return Text(f"{pnl:+.2f}", style="green" if pnl > 0 else ("red" if pnl < 0 else "white"))
 
@@ -130,10 +126,13 @@ def _title_bar(views: list[PanelView], mode: str, interval: str) -> Table:
 
 
 def _cfg_line(symbols: int, interval: str, amount: float,
-              max_entry: float, views: list) -> Table:
+              max_entry: float, views: list, online_flags: list[bool]) -> Table:
     """配置行（全局参数，只显示一次，标的块不再重复）+ 真实聚合 WS 连接状态（替代早期硬编码死文案）。
 
-    穿越阈值分标的各异（threshold_by_symbol），不在此显示全局默认值，改在各标的块首行。"""
+    穿越阈值分标的各异（threshold_by_symbol），不在此显示全局默认值，改在各标的块首行。
+    WS 聚合必须与在线判定同源：bot 停机后 status.json 仍留着上次的 connected，
+    不查新鲜度会显示假“已连”（与底部“离线”自相矛盾）。
+    """
     left = Text(
         f"配置 标的 {symbols} · 每注 {amount:.0f} · 持有至结算 · {interval} · "
         f"入场上限 {max_entry:.2f}",
@@ -141,16 +140,24 @@ def _cfg_line(symbols: int, interval: str, amount: float,
     )
 
     def ws_agg(key: str, label: str) -> Text:
-        """聚合全部标的的 WS 状态:全连=●已连 / 部分=○N/M重连 / 全停=✖已停。"""
-        sts = [v.ws_status.get(key) for v in views if v.ws_status and v.ws_status.get(key)]
-        if not sts:
+        """聚合 WS 状态：仅在线标的计入；全离线=✖离线 / 部分离线单列 N。"""
+        total = len(views)
+        offline = sum(1 for on in online_flags if not on)
+        if total == 0:
             return Text(f"{label}?", style="dim")
-        if all(s == "connected" for s in sts):
+        if offline == total:
+            return Text(f"{label}✖离线", style="dim")
+        conn = sum(
+            1 for v, on in zip(views, online_flags)
+            if on and v.ws_status and v.ws_status.get(key) == "connected"
+        )
+        if offline:
+            return Text(f"{label}○{conn}/{total}（{offline}离线）", style="bold yellow")
+        if conn == total:
             return Text(f"{label}●已连", style="bold green")
-        if all(s == "stopped" for s in sts):
+        if conn == 0:
             return Text(f"{label}✖已停", style="dim")
-        n = sts.count("connected")
-        return Text(f"{label}○{n}/{len(sts)}重连", style="bold yellow")
+        return Text(f"{label}○{conn}/{total}重连", style="bold yellow")
 
     right = Text("config.yaml  ", style="dim")
     right.append(ws_agg("book", "盘口"))
@@ -192,31 +199,36 @@ def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
     l1.append(Text(_fmt_cents(down) + "¢", style="bold red") if down is not None else Text("—", style="dim"))
     body.append(l1)
 
-    # 行2：策略状态 + 持仓/挂单 + 今日盈亏 + 连亏 + WS 灯
+    # 行2：持仓/挂单置首 + 反色高亮，**空仓显式写出**（原先只在有仓时显示文字，
+    # 无仓时靠"没有文字"推断 → 看不出是否持仓）+ 今日盈亏 + 连亏 + WS
+    # （持仓/挂单时不再重复策略状态，保证 4 卡/行不折行；明细交给历史表与底部汇总）
     l2 = Text()
-    st = status_tail(v.strategy_state)
-    if st:
-        l2.append(Text(st, style="bold yellow" if "穿越" in st else "dim"))
     if v.position:
         p = v.position
-        l2.append(Text(
-            f"  持{p['direction'].upper()}{p['size']:.1f}@{_fmt_cents(p['entry_price'])}",
-            style="bold yellow",
-        ))
+        l2.append(Text(f"持{p['direction'].upper()} {p['size']:.1f}", style="bold black on yellow"))
     elif v.pending:
         p = v.pending
-        l2.append(Text(f"  挂{p['direction'].upper()}", style="bold magenta"))
-    l2.append(Text("  今 ", style="dim"))
+        l2.append(Text(f"挂{p['direction'].upper()}", style="bold black on magenta"))
+    else:
+        l2.append(Text("空仓", style="dim"))
+        st = status_tail(v.strategy_state) or ""
+        if "已穿越" in st:
+            st = "🔺UP" if "UP" in st.upper() else "🔻DOWN"
+        elif "等待穿越" in st:
+            st = "⏳等待"
+        if st:
+            l2.append(Text(" "))
+            l2.append(Text(st, style="bold yellow" if "穿" in st or "UP" in st or "DOWN" in st else "dim"))
+    l2.append(Text(" 今", style="dim"))
     l2.append(_pnl_text(v.today_pnl))
-    ts = v.today_stats
-    if ts and ts.get("n"):
-        l2.append(Text(f" {_win_pct(ts)}", style="dim"))
-    l2.append(Text(f" 亏{v.consecutive_losses}", style="dim"))
+    if v.consecutive_losses:
+        l2.append(Text(f" 亏{v.consecutive_losses}", style="dim"))
     ws = v.ws_status or {}
     if ws:
         l2.append(Text(" ", style="dim"))
         for key, label in (("book", "盘"), ("ticker", "币")):
-            s = ws.get(key)
+            # 离线时 status.json 陈旧：一律显 ✖（防上次运行的 connected 残留）
+            s = ws.get(key) if online else None
             if s == "connected":
                 l2.append(Text(f"{label}●", style="bold green"))
             elif s == "reconnecting":
@@ -235,8 +247,15 @@ def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
 
 
 def cards_per_row(width: int) -> int:
-    """卡片列数：宽终端 4 卡/行（~30 列/卡），中宽 2，窄屏 1（防折行）。"""
-    return 4 if width >= 120 else (2 if width >= 72 else 1)
+    """卡片列数：按实测内容宽度定档（防折行）。
+
+    卡内容最宽行 ~32 列（长价位 + 涨/跌盘口），加边框/内边距/列间距 → 每卡需 38 列：
+    4 卡/行需 ≥152 / 3 卡 ≥114 / 2 卡 ≥76 / 否则 1 卡。
+    """
+    for n in (4, 3, 2):
+        if width // n >= CARD_MIN_COL_W:
+            return n
+    return 1
 
 
 def _symbol_cards(views: list[PanelView], thresholds: dict[str, float],
@@ -306,7 +325,8 @@ def _history_table(records_by_dir: dict[str, list], max_rows: int = 12) -> Table
     picked = picked[:max_rows]
 
     for ts, r in picked:
-        label = r.reason or ""
+        # 原因中文化：复用 panel_view.EXIT_LABELS（展示文案单一事实源，与面板状态同源）
+        label = EXIT_LABELS.get(r.reason, r.reason)
         table.add_row(
             f"{ts[5:16].replace('T', ' ')}", r.symbol or "?", dir_name(r.direction),
             f"{r.size:.2f}", _fmt_cents(r.entry_price), _fmt_cents(r.exit_price),
@@ -420,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
 
             body = Group(
                 _title_bar(views, mode, interval),
-                _cfg_line(symbols, interval, amount, max_entry, views),
+                _cfg_line(symbols, interval, amount, max_entry, views, online_flags),
                 Text("─" * max(10, console.width - 4), style="dim"),
                 _symbol_cards(views, thresholds, online_flags, console.width),
                 Text("─" * max(10, console.width - 4), style="dim"),
@@ -430,11 +450,7 @@ def main(argv: list[str] | None = None) -> int:
             body.renderables.append(_deploy_line(amount, symbols, per_dir_trades))
             body.renderables.append(Text("─" * max(10, console.width - 4), style="dim"))
             body.renderables.append(_status_bar(views, online_flags))
-            body.renderables.append(Text(
-                "操作: Ctrl-C 退出面板(不停止 bot) · 停止全部: start_multi.bat stop · "
-                "再次观察: uv run python scripts/multi_panel.py",
-                style="dim",
-            ))
+            body.renderables.append(Text("Ctrl-C 停止 bot 并退出", style="dim"))
 
             frame = Panel(body, border_style="blue", padding=(0, 1))
             live.update(frame)
