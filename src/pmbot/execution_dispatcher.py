@@ -75,6 +75,15 @@ class ExecutionDispatcher:
     def state(self) -> TradeState:
         return self._state_getter()
 
+    @staticmethod
+    def _rej_tag(symbol: str, window_start: int, direction: str, ask: str, reason: str) -> str:
+        """拒绝建仓的统一结构化后缀（供 EV(ask) 离线分析脚本解析）。
+
+        格式: " | rej sym=ETH win=1789000000 dir=down ask=0.950 reason=cap"
+        与前置中文文案拼在同一行，人读日志与机器解析两不误。
+        """
+        return f" | rej sym={symbol} win={window_start} dir={direction} ask={ask} reason={reason}"
+
     # ---- 接缝方法（LifecycleDeps 消费） ----
 
     def execute(self, action: Action, market: MarketInfo, now_sec: int) -> None:
@@ -97,10 +106,13 @@ class ExecutionDispatcher:
                     sig = getattr(st, "signal", None)
                     tok = token_for(market, sig.direction) if sig is not None else None
                     ask = self.book.best_ask(tok, size=1.0) if tok is not None else None
+                    direction = sig.direction.value if sig is not None else "?"
+                    ask_str = f"{ask:.3f}" if ask is not None else "无报价"
                     logger.info(
-                        "跳过：entry_price_cap（方向 %s ask=%s）",
-                        sig.direction.value if sig is not None else "?",
-                        f"{ask:.3f}" if ask is not None else "无报价",
+                        "跳过：entry_price_cap（方向 %s ask=%s）%s",
+                        direction,
+                        ask_str,
+                        self._rej_tag(st.symbol, market.window_start, direction, ask_str, "cap"),
                     )
                 except Exception:
                     logger.info("跳过：entry_price_cap")
@@ -144,7 +156,13 @@ class ExecutionDispatcher:
         # 5 股加权价对小单系统性偏贵，会把可开仓堵在阈值外（C：定价量级对齐）
         ask = self.book.best_ask(token, size=1.0)
         if ask is None:
-            logger.warning("市价买入跳过：盘口无报价 %s", token[:16])
+            logger.warning(
+                "市价买入跳过：盘口无报价 %s%s",
+                token[:16],
+                self._rej_tag(
+                    st.symbol, market.window_start, action.direction.value, "none", "noquote"
+                ),
+            )
             # 无报价冷却：本窗口 N 秒内不再重试（信号不变时每 tick 都会再触发
             # PLACE_MARKET，无冷却则缺失盘口时每秒重试；冷却后短暂恢复仍能入场）
             st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
@@ -158,8 +176,11 @@ class ExecutionDispatcher:
         cap = o.max_entry_price if o else self.max_entry_price
         if cap > 0 and ask > cap:
             logger.info(
-                "执行层拦截：决策后盘口极化 ask=%.3f > cap=%.2f（不追价，%ds 后重试）",
+                "执行层拦截：决策后盘口极化 ask=%.3f > cap=%.2f（不追价，%ds 后重试）%s",
                 ask, cap, BUY_RETRY_COOLDOWN_SEC,
+                self._rej_tag(
+                    st.symbol, market.window_start, action.direction.value, f"{ask:.3f}", "exec_cap"
+                ),
             )
             st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
             self._save()
