@@ -12,3 +12,4 @@ docs/reports/
 data_live/
 data_*/
 src/logs/
+.scratch/proxy_probe/
