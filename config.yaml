@@ -25,9 +25,18 @@ market_interval: 5m        # 市场/K线频率：5m / 15m / 1h（Polymarket slug
 # 首日实证穿越后 Polymarket 秒级极化、taker 追高档 EV 负；
 # 真实交易分档（10 笔）>0.50 档累计 -3.72、<0.50 全赢 → max_entry_price 0.50。
 momentum:
-  symbols: [ETH, SOL, XRP, DOGE, BNB]  # 交易标的池（BTC 降级纯信号源不下单；HYPE 无 Binance K线不可用；
-                                       # ZEC 阈值 0.20 才压到 80% 命中线以下水平，缓议）
-  amount_per_trade: 1        # 每注金额（USDC）
+  symbols: [BTC, ETH, SOL, XRP, DOGE, BNB]  # 交易标的池（HYPE 无 Binance K线不可用；
+                                            # ZEC 阈值 0.20 才压到 80% 命中线以下水平，缓议）
+                                            # BTC 重新纳入（2026-09-11，原为纯信号源不下单）：
+                                            # 秒级盘口实测（crossing_ask.py, 9/5 录制 2.9 天 849 窗）穿越瞬间
+                                            # ask 中位 0.51、≤0.60 占 62%（小币同期实际仅 12%），且穿越后
+                                            # +1s~+10s 不漂移 → 盘口钝、延迟容忍度高；cap 0.60 下成交机会充足。
+                                            # 旧降级依据（7 笔全亏 -3.26）是 cap 更宽时期的高价追单，非 BTC 无 edge。
+  amount_per_trade: 1        # 每注金额（USDC）。市价单(FOK) **无** 5 股下限：实测他人以 $1.05
+                             # 成交 140+ 笔 1.2 股单（py-clob-client #301）；5 股下限只针对
+                             # GTC/GTD 限价单（validate_limit_order 守的就是这条，保持不变）。
+                             # 市价单可能有**美元金额**下限（未确证具体值）——若实盘出现
+                             # "Size ... lower than the minimum" 拒单，先提到 $1.05 试。
   threshold_pct: 0.08        # 穿越阈值 %%：Binance 相对窗口开盘偏离此值 → 同向入场
                              # （5m 回测 EV +0.15~0.40/笔；0.05-0.10 均显著，0.08 平衡触发率与命中率）
   # 分标的阈值机制已删除（2026-09-10 实盘证伪：升阈致 0 成交，见

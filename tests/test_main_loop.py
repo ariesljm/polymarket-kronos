@@ -85,6 +85,7 @@ class FakeExecutor:
         self.sell_proceeds_value = None
         self.settle_proceeds_value = None
         self.live_positions_value = None
+        self.market_buy_exc = None  # 非 None 时 market_buy 抛出（模拟服务端拒单）
         self._sampler = None
 
     @property
@@ -114,6 +115,8 @@ class FakeExecutor:
 
     def market_buy(self, token_id, amount):
         self.calls.append(("market_buy", token_id, amount))
+        if self.market_buy_exc is not None:
+            raise self.market_buy_exc
         ask = self.best_ask(token_id)
         if ask is None:
             return None
@@ -1753,6 +1756,29 @@ def test_no_quote_cooldown_expires_and_retries(tmp_path):
     loop.tick(now_ms=1_000_100_000)
     assert ex.calls and ex.calls[0][0] == "market_buy"
     assert loop.state.retry_until_sec is None  # 建仓成功清除冷却
+
+
+def test_rejected_market_buy_sets_cooldown_and_never_raises(tmp_path):
+    """服务端拒单（最小单量/余额不足）：异常不得逸出 tick，且必须设冷却。
+
+    回归：拒单异常路径曾不设 retry_until_sec 且异常逸出 tick → 信号不变时每 tick（1s）
+    重复下单刷屏。
+    """
+    import time
+
+    ex = FakeExecutor()
+    ex.market_buy_exc = RuntimeError("Size (1.08) lower than the minimum: 5")
+    loop = make_loop(tmp_path, executor=ex)
+    loop.tick(now_ms=1_000_000_000)  # 不得抛异常
+    assert loop.state.retry_until_sec is not None  # 冷却已设置
+    assert len([c for c in ex.calls if c[0] == "market_buy"]) == 1  # 确实尝试过
+
+    # 引擎的冷却判定读**墙钟**（TradingLoop._now_sec），而 tick 注入的是测试假时间；
+    # 基准不同，故须把冷却截止改写到墙钟基准才能验证“冷却期内不重试”。生产环境两者
+    # 同源（都走 time.time()），无此问题——但既有冷却用例都因这个基准差而形同虚设。
+    loop.state.retry_until_sec = int(time.time()) + 30
+    loop.tick(now_ms=1_000_005_000)
+    assert len([c for c in ex.calls if c[0] == "market_buy"]) == 1  # 未重试
 
 
 def test_save_status_syncs_memory_strategy_state(tmp_path):

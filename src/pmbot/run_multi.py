@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from types import FrameType
 
-from pmbot.run import build_loop
+from pmbot.run import build_loop, resolve_proxy
 
 LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
@@ -54,10 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="多标的单进程主循环（每标的一个线程）")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument(
-        "--symbols", default="ETH,SOL,XRP,DOGE,BNB", help="逗号分隔标的列表，与 --data-dirs 一一对应"
+        "--symbols", default="BTC,ETH,SOL,XRP,DOGE,BNB", help="逗号分隔标的列表，与 --data-dirs 一一对应"
     )
     parser.add_argument(
-        "--data-dirs", default="data_multi/eth,data_multi/sol,data_multi/xrp,data_multi/doge,data_multi/bnb",
+        "--data-dirs", default="data_multi/btc,data_multi/eth,data_multi/sol,data_multi/xrp,data_multi/doge,data_multi/bnb",
         help="逗号分隔数据目录列表（每标的一个，顺序对应 --symbols）",
     )
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="模拟运行（默认）")
@@ -81,6 +81,23 @@ def main(argv: list[str] | None = None) -> int:
     mode = "dry-run" if args.dry_run else "live"
 
     log_dir = _setup_multi_logging(mode)
+
+    # 实盘前置自检（真钱守门）：先写回代理环境——py_clob_client 的 httpx 客户端
+    # 在首次调用时才创建，环境变量必须在此之前就位；不通过则拒绝启动。
+    if not args.dry_run:
+        from pmbot.clob_executor import ClobExecutor
+        from pmbot.preflight import live_advisories, live_preflight
+
+        resolve_proxy()
+        problems = live_preflight(cfg, ClobExecutor())
+        if problems:
+            for p in problems:
+                logging.error("实盘自检未通过：%s", p)
+            logging.error("拒绝以实盘模式启动（修正后重试；先干跑请用 start_multi.bat）")
+            return 3
+        for note in live_advisories(cfg):
+            logging.warning("实盘提醒：%s", note)
+        logging.info("实盘自检通过：凭证 / 余额 / 授权 均正常")
     bundles: list = []
     loops: list = []
     for sym, dd in zip(symbols, data_dirs):

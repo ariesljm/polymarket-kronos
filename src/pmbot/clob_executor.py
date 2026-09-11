@@ -154,16 +154,25 @@ class ClobExecutor:
             )
         return self._client
 
-    def collateral_balance(self) -> float | None:
-        """代理钱包的 pUSD 抵押余额（最小单位 1e6）。"""
+    def collateral_snapshot(self) -> tuple[float | None, dict]:
+        """(抵押余额, 授权表) 一次查询（实盘自检用）；授权表形如 {合约: 额度}。
+
+        授权为 0 表示未 approve、下单会被服务端拒——与余额同源一次取回，
+        自检不必发两次请求。查询异常向上抛（调用方决定降级）。
+        """
         from py_clob_client_v2 import AssetType, BalanceAllowanceParams
 
         r = self._get_client().get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        if isinstance(r, dict) and r.get("balance") is not None:
-            return int(r["balance"]) / 1e6
-        return None
+        if not isinstance(r, dict):
+            return None, {}
+        bal = r.get("balance")
+        return (int(bal) / 1e6 if bal is not None else None), (r.get("allowances") or {})
+
+    def collateral_balance(self) -> float | None:
+        """代理钱包的 pUSD 抵押余额（最小单位 1e6）。"""
+        return self.collateral_snapshot()[0]
 
     # ---- data-api 公开端点（/positions、/activity）----
 

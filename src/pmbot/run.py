@@ -74,6 +74,26 @@ class LoopBundle:
                 _lg.exception("stop %s 失败", type(c).__name__)
 
 
+DEFAULT_PROXY = "http://127.0.0.1:10808"
+
+
+def resolve_proxy() -> str:
+    """解析本机代理并**写回环境变量**（WS / REST / CLOB 三条链路的单一事实源）。
+
+    为什么要写回 os.environ：py_clob_client_v2 没有代理参数，只靠 httpx 的
+    trust_env 读 HTTP(S)_PROXY（或 Windows 系统代理）。cmd/bat 启动时环境里没
+    这个变量，一旦系统代理被关（v2rayN 切"不改变系统代理"），实盘下单会静默
+    直连被墙——把兜底值显式写进环境，使下单链路不再依赖系统代理开关。
+
+    另：websockets 17 的 proxy=None 是强制直连（不读环境变量），故返回值仍须
+    显式传给三条 WS；data_source 传 {"https": None} 显式覆盖，不受此影响。
+    """
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or DEFAULT_PROXY
+    os.environ.setdefault("HTTPS_PROXY", proxy)
+    os.environ.setdefault("HTTP_PROXY", proxy)
+    return proxy
+
+
 def build_loop(cfg, *, symbol: str, paths: RuntimePaths, dry_run: bool, poll_sec: int) -> LoopBundle:
     """构造单标的主循环全栈（共享 Config/代理; 独立状态/数据目录/WS 线程）。
 
@@ -91,12 +111,8 @@ def build_loop(cfg, *, symbol: str, paths: RuntimePaths, dry_run: bool, poll_sec
     from pmbot.user_stream import UserStream
 
     data_dir = paths.data_dir
-    # 无环境变量时兜底本机默认代理：websockets 17 的 proxy=None 是强制直连（不读
-    # 环境变量），cmd/bat 启动时若环境里没有 HTTPS_PROXY，Polymarket WS 会静默
-    # 直连被墙 → 15s 握手超时无限重连。与 clob_executor.fetch_book 的 REST 兜底
-    # 硬编码默认值同源，保证 WS/REST 链路一致。
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
-        or "http://127.0.0.1:10808"
+    # 代理：兜底本机默认值并写回环境（理由见 resolve_proxy）
+    proxy = resolve_proxy()
 
     # Binance 实时价线程提前创建：momentum 策略用它做穿越检测（WS ~1s 推送，
     # 比每 tick REST 快；更早发现穿越 → 更可能抓做市商未调价的便宜档）。
@@ -189,10 +205,23 @@ def main(argv: list[str] | None = None) -> int:
     paths = paths_for(not args.dry_run, args.data_dir)
     data_dir = paths.data_dir
 
-    # 代理从环境读取（墙内访问 Polymarket/Binance 需代理；记录在启动横幅）。
-    # 无环境变量时兜底本机默认代理，理由同 build_loop（websockets proxy=None 强制直连）。
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
-        or "http://127.0.0.1:10808"
+    # 代理从环境读取并写回（墙内访问 Polymarket 需代理；记录在启动横幅）。
+    proxy = resolve_proxy()
+
+    # 实盘前置自检：不通过则拒绝启动（真钱守门；干跑发现不了的问题在此拦下）
+    if not args.dry_run:
+        from pmbot.clob_executor import ClobExecutor
+        from pmbot.preflight import live_advisories, live_preflight
+
+        problems = live_preflight(cfg, ClobExecutor())
+        if problems:
+            for p in problems:
+                logging.error("实盘自检未通过：%s", p)
+            logging.error("拒绝以实盘模式启动（修正后重试；先干跑请用 start_multi.bat）")
+            return 3
+        for note in live_advisories(cfg):
+            logging.warning("实盘提醒：%s", note)
+        logging.info("实盘自检通过：凭证 / 余额 / 授权 均正常")
 
     bundle = build_loop(cfg, symbol=symbol, paths=paths,
                         dry_run=args.dry_run, poll_sec=args.poll)

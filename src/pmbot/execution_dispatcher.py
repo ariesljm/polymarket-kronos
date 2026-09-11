@@ -28,9 +28,9 @@ from pmbot.types import (
 
 logger = logging.getLogger(__name__)
 
-# 盘口无报价建仓冷却（秒）：窗口内建仓尝试因无盘口失败后，暂停重试这么久，
-# 防止缺失盘口/市场无订单簿时每 tick 每秒重试刷屏（窗口内信号不变会反复触发
-# PLACE_MARKET，靠 retry_until_sec 冷却拦截）。
+# 建仓尝试失败冷却（秒）：本窗口内建仓因**无盘口**或**下单被服务端拒**（最小单量/
+# 余额不足/合规等）失败后，暂停重试这么久。防每秒重试刷屏下单（信号不变时每 tick
+# 都会再触发 PLACE_MARKET）；冷却后短暂恢复仍能入场。
 BUY_RETRY_COOLDOWN_SEC = 10
 
 
@@ -196,9 +196,27 @@ class ExecutionDispatcher:
             self._save()
             return
         target_size = shares_for_amount(action.amount, ask)
-        filled = self.trade.market_buy(token, action.amount)
+        try:
+            filled = self.trade.market_buy(token, action.amount)
+        except Exception as e:
+            # 服务端拒单（最小单量 / 余额不足 / 合规等）：必须走同一冷却，否则
+            # 异常路径不设 retry_until_sec → 信号不变时每 tick（1s）重复下单刷屏。
+            logger.error(
+                "市价买入被拒：%s（%s: %s），%ds 后重试%s",
+                token[:16], type(e).__name__, e, BUY_RETRY_COOLDOWN_SEC,
+                self._rej_tag(
+                    st.symbol, market.window_start, action.direction.value, f"{ask:.3f}", "rejected"
+                ),
+            )
+            st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
+            self._save()
+            return
         if filled is None:
-            logger.warning("市价买入失败/无成交数据：%s，下 tick 重试", token[:16])
+            logger.warning(
+                "市价买入失败/无成交数据：%s，%ds 后重试", token[:16], BUY_RETRY_COOLDOWN_SEC,
+            )
+            st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
+            self._save()
             return
         entry = filled.avg_price or ask
         size = filled.filled_size or target_size
