@@ -616,7 +616,7 @@ class TradingLoop:
                 self.state.strategy_state = text
         # WS 连接状态（面板展示:盘口 book_sampler + 币安 ticker;断线重连可观测）
         ws: dict[str, str] = {}
-        samp = getattr(self.book, "sampler", None)
+        samp = self.book.sampler
         if samp is not None:
             ws["book"] = samp.connection_status()
         if getattr(self, "_ticker", None) is not None:
