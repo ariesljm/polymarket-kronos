@@ -2,7 +2,7 @@
 
 import pytest
 
-from pmbot.clob_executor import ClobExecutor, SimExecutor
+from pmbot.clob_executor import BOOK_REST_TIMEOUT_SEC, ClobExecutor, SimExecutor
 from pmbot.executor_protocols import min_shares_for_price
 
 
@@ -219,6 +219,10 @@ class FakeSampler:
         age = self._ages.get(token)
         return age is not None and age <= STALE_AGE_SEC
 
+    def snapshot_age(self, token):
+        """快照年龄（秒）：无快照返回 None（与 BookSampler.snapshot_age 同语义）。"""
+        return self._ages.get(token)
+
     def update_snapshot(self, token, book):
         self._snaps[token] = book
         self._ages[token] = 0.0  # 回填后视为新鲜
@@ -237,10 +241,26 @@ def test_best_ask_fresh_snapshot_no_rest(monkeypatch):
     ex.attach_sampler(s)
     rest_calls = {"n": 0}
     monkeypatch.setattr(ex, "fetch_book",
-                        lambda t: rest_calls.__setitem__("n", rest_calls["n"] + 1) or _book(ask=0.90))
+                        lambda t, timeout=6.0: rest_calls.__setitem__("n", rest_calls["n"] + 1) or _book(ask=0.90))
     assert ex.best_ask("tok-a") == 0.50
     assert ex.best_ask("tok-a", size=1.0) == 0.50
     assert rest_calls["n"] == 0
+
+
+def test_best_ask_moderately_stale_uses_snapshot(monkeypatch):
+    """中等陈旧（1s < age ≤ MAX_BOOK_AGE_SEC）→ 仍用快照，不走 REST。
+
+    这是速度契约：WS 一断，后台兜底 1s 一轮使快照 1~2s 旧；若此时同步
+    REST，盘口穿越窗口（秒级）会被 6s 等待耗光。
+    """
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    s = FakeSampler()
+    s.attach("tok-a", _book(ask=0.50), 2.0)  # 中等陈旧，> STALE_AGE_SEC(1.0)
+    ex.attach_sampler(s)
+    called = []
+    monkeypatch.setattr(ex, "fetch_book", lambda t, timeout=6.0: called.append(t) or _book(ask=0.90))
+    assert ex.best_ask("tok-a") == 0.50  # 用快照，不用 0.90 新价
+    assert called == []  # 没触发 REST
 
 
 def test_best_ask_stale_snapshot_refreshes_rest(monkeypatch):
@@ -249,7 +269,7 @@ def test_best_ask_stale_snapshot_refreshes_rest(monkeypatch):
     s = FakeSampler()
     s.attach("tok-a", _book(ask=0.10), 30.0)  # 陈旧
     ex.attach_sampler(s)
-    monkeypatch.setattr(ex, "fetch_book", lambda t: _book(ask=0.60))
+    monkeypatch.setattr(ex, "fetch_book", lambda t, timeout=6.0: _book(ask=0.60))
     assert ex.best_ask("tok-a") == 0.60  # 新价（不再用 0.10 旧快照）
     assert s._snaps["tok-a"]["asks"][0]["price"] == "0.60"  # 已回填
     assert s._ages["tok-a"] == 0.0  # 回填后新鲜
@@ -262,7 +282,7 @@ def test_best_ask_stale_rest_failure_returns_none(monkeypatch):
     s.attach("tok-a", _book(ask=0.10), 30.0)  # 陈旧
     ex.attach_sampler(s)
 
-    def boom(t):
+    def boom(t, timeout=6.0):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(ex, "fetch_book", boom)
@@ -274,7 +294,7 @@ def test_best_ask_missing_snapshot_uses_rest(monkeypatch):
     ex = ClobExecutor(private_key="0x" + "0" * 64)
     s = FakeSampler()  # 无任何快照
     ex.attach_sampler(s)
-    monkeypatch.setattr(ex, "fetch_book", lambda t: _book(ask=0.60))
+    monkeypatch.setattr(ex, "fetch_book", lambda t, timeout=6.0: _book(ask=0.60))
     assert ex.best_ask("tok-a") == 0.60
     assert ex.best_ask("no-sampler-token") == 0.60  # 无采样器也走 REST
 
@@ -302,7 +322,7 @@ def test_best_bid_stale_refreshes_rest(monkeypatch):
     s = FakeSampler()
     s.attach("tok-a", _book(bid=0.20), 30.0)  # 陈旧
     ex.attach_sampler(s)
-    monkeypatch.setattr(ex, "fetch_book", lambda t: _book(bid=0.70))
+    monkeypatch.setattr(ex, "fetch_book", lambda t, timeout=6.0: _book(bid=0.70))
     assert ex.best_bid("tok-a") == 0.70
     assert s._snaps["tok-a"]["bids"][0]["price"] == "0.70"
 
@@ -338,3 +358,79 @@ def test_sim_sell_price_fallback_matches_live():
     ex._live = type("L", (), {"best_bid": lambda self, t, size=5.0: None})()
     fill = ex.market_sell("tok", 2.0)
     assert fill.avg_price == 0.0
+
+
+class _FakeBookResp:
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"asks": [["0.5", "10"]], "bids": [["0.4", "10"]]}
+
+
+class _FakeSampler:
+    """只供 _best_price 测试：固定快照 + 年龄。"""
+
+    def __init__(self, book=None, age=0.0, size_map=None):
+        self._book = book
+        self._age = age
+        self.updated = []
+
+    def snapshot(self, token_id):
+        return self._book
+
+    def snapshot_age(self, token_id):
+        return self._age if self._book is not None else None
+
+    def update_snapshot(self, token_id, book):
+        self.updated.append((token_id, book))
+
+
+def _asks_book(price):
+    return {"asks": [{"price": price, "size": "100"}],
+            "bids": [{"price": "0.10", "size": "100"}]}
+
+
+def test_best_price_uses_snapshot_without_rest(monkeypatch):
+    """快照在阈值内 → 直接用，不走 REST（决策路径零阻塞）。
+
+    回归：曾对陈旧快照直接同步 fetch_book（6s 超时）——盘口穿越后秒级极化，
+    等于永远开不了仓。"""
+    ex = ClobExecutor()
+    ex.attach_sampler(_FakeSampler(book=_asks_book("0.50"), age=1.0))
+    called = []
+    monkeypatch.setattr(ex, "fetch_book", lambda t, timeout=6.0: called.append(t) or {})
+    assert ex.best_ask("tok", size=1.0) == pytest.approx(0.50)
+    assert called == []  # 没触发 REST
+
+
+def test_best_price_stale_snapshot_uses_short_timeout(monkeypatch):
+    """快照过旧 → 用短超时现拉（而非 6s 阻塞），并回填采样器。"""
+    ex = ClobExecutor()
+    sampler = _FakeSampler(book=_asks_book("0.50"), age=10.0)
+    ex.attach_sampler(sampler)
+    seen = {}
+
+    def fake_fetch(token_id, timeout=6.0):
+        seen["timeout"] = timeout
+        return _asks_book("0.60")
+
+    monkeypatch.setattr(ex, "fetch_book", fake_fetch)
+    assert ex.best_ask("tok", size=1.0) == pytest.approx(0.60)
+    assert seen["timeout"] == BOOK_REST_TIMEOUT_SEC
+    assert seen["timeout"] < 6.0  # 明显短于原阻塞值
+    assert sampler.updated  # 回填，下 tick 不再 REST
+
+
+def test_fetch_book_timeout_passed_to_requests(monkeypatch):
+    """fetch_book 的 timeout 透传到 requests。"""
+    ex = ClobExecutor()
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return _FakeBookResp()
+
+    monkeypatch.setattr("requests.get", fake_get)
+    ex.fetch_book("123", timeout=1.5)
+    assert seen["timeout"] == 1.5

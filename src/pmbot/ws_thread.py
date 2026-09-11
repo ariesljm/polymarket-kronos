@@ -20,7 +20,8 @@ from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_BASE = 5.0  # 重连退避起步（秒）：行情数据新鲜度优先——断线 5s 内重试
+RECONNECT_BASE = 2.0  # 重连退避起步（秒）：行情数据新鲜度优先——断线 2s 内重试
+                     # （原 5s：盘口穿越窗口仅数秒，5s 盲区等于丢掉整个入场机会）
 RECONNECT_MAX = 60.0  # 重连退避上限（秒）
 STALE_IDLE_SEC = 25.0  # 无数据僵尸连接检测：超过该时长无任何消息 → 主动重连
 MAX_QUEUE = 256  # 接收队列上限：websockets 默认 16 太紧，盘口高流量时稍慢即满

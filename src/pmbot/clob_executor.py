@@ -24,6 +24,14 @@ from pmbot.executor_protocols import (
 
 logger = logging.getLogger(__name__)
 
+# 决策价可接受的最大快照年龄（秒）。WS 断线时 BookSampler 后台 REST 兜底 1s
+# 一轮，快照通常 ≤2s；放宽到 3s 使 "略陈旧" 不再触发同步 REST（那会在
+# 盘口秒级极化时错过整个入场窗口）。超过此值才现拉，且用短超时快速失败。
+MAX_BOOK_AGE_SEC = 3.0
+# 决策路径现拉盘口的超时（秒）：足够覆盖实测 0.7~1.3s 的正常往返，
+# 又不至于让一次卡顿拖死 tick。
+BOOK_REST_TIMEOUT_SEC = 2.0
+
 
 class ClobExecutor:
     """实盘执行器：Polymarket CLOB 下单/撤单/卖出/盘口/余额。"""
@@ -67,19 +75,22 @@ class ClobExecutor:
             pass
 
     def _best_price(self, token_id: str, side: str, size: float) -> float | None:
-        """可执行价（单一实现，best_ask/best_bid 共用）：新鲜快照 → 加权价。
+        """可执行价（单一实现，best_ask/best_bid 共用）：内存快照 → 加权价。
 
-        快照缺失/陈旧（新鲜度判定单一事实源：BookSampler.is_fresh 与健康检查共用）
-        → REST 现拉并回填（下个 tick 不再重复）；REST 失败 → None
-        （宁缺毋滥，不报误导价，下 tick 重试）。
-        决策价永远基于时效内盘口，不再无条件信任不知年龄的快照。
+        快路径：快照年龄 ≤ MAX_BOOK_AGE_SEC 直接用（WS 实时更新；断线时
+        BookSampler 后台 REST 兜底 1s 一轮保持新鲜）。
+
+        绝不在决策路径同步等 REST：盘口穿越后秒级极化，等几秒 = 放弃入场
+        （回归：曾对陈旧快照直接 fetch_book，6s 超时下穿越瞬间的便宜档全部
+        错过——WS 一断就永远开不了仓）。无快照/过旧时才短超时现拉（冷启动/
+        新 token），失败即 None（宁缺毋滥，下 tick 重试）。
         """
         book = self._sampler_snapshot(token_id)
-        fresh = self._sampler is not None and self._sampler.is_fresh(token_id)
-        if book is not None and fresh:
+        age = self._sampler.snapshot_age(token_id) if self._sampler is not None else None
+        if book is not None and (age is None or age <= MAX_BOOK_AGE_SEC):
             return weighted_price(book, side, size=size)
         try:
-            book = self.fetch_book(token_id)
+            book = self.fetch_book(token_id, timeout=BOOK_REST_TIMEOUT_SEC)
         except Exception:
             return None
         self._sampler_update(token_id, book)
@@ -94,17 +105,19 @@ class ClobExecutor:
         """挂载 BookSampler（盘口快照优先读内存，REST 兜底）。"""
         self._sampler = sampler
 
-    def fetch_book(self, token_id: str) -> dict:
+    def fetch_book(self, token_id: str, timeout: float = 6.0) -> dict:
         """公开盘口查询（无需认证；BookSampler REST 兜底用）。
 
-        走代理：clob.polymarket.com 直连被墙（py_clob_client 无 proxy 参数,
-        其 get_order_book 直连必超时——REST 兜底曾 5884 次失败与此同源）。
+        走代理：clob.polymarket.com 直连在本机网络间歇不可达（实测直连/代理
+        各有偶发超时，代理为既定路径且 WS 本就必须走它）。
+        timeout 可调：后台兜底用默认 6s；决策路径传短超时（见 _best_price），
+        禁止在盘口秒级极化时长时间阻塞。
         """
         import requests
 
         r = requests.get(
             f"{CLOB_HOST}/book?token_id={token_id}",
-            timeout=6,
+            timeout=timeout,
             proxies={"https": os.environ.get("HTTPS_PROXY", "http://127.0.0.1:10808")},
             headers={"User-Agent": "pmbot/1.0"},
         )
@@ -526,8 +539,8 @@ class SimExecutor:
     def attach_sampler(self, sampler: SamplerProto) -> None:
         self._live.attach_sampler(sampler)
 
-    def fetch_book(self, token_id: str) -> dict:
-        return self._live.fetch_book(token_id)
+    def fetch_book(self, token_id: str, timeout: float = 6.0) -> dict:
+        return self._live.fetch_book(token_id, timeout=timeout)
 
     def api_auth(self) -> dict | None:
         return self._live.api_auth()

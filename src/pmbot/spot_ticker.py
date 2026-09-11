@@ -1,12 +1,15 @@
-"""Binance 实时价后台线程：WS miniTicker 推送 + REST 兜底。
+"""Binance 实时价后台线程：WS 实时成交流 + REST 兜底。
 
 用途：决策引擎的「方向一致性过滤」数据源——窗口起点至今的实时移动
 （live_delta_pct）只在信号方向与实时走势大幅矛盾时跳过入场，
 不替代盘口价（止盈/止损仍用 Polymarket 盘口 bid）。
 
-- WS：wss://data-stream.binance.vision/ws/<symbol>@miniTicker（主站
+- WS：wss://data-stream.binance.vision/ws/<symbol>@aggTrade（主站
   stream.binance.com 大陆不可达 HTTP 451，用与 data-api.binance.vision
-  配套的数据流镜像；实测直连可达，~1s 推送一条）
+  配套的数据流镜像；实测直连可达）
+  —— 用 aggTrade（实时逐笔成交）而非 miniTicker（固定 1s 快照）：
+  momentum 的入场价完全取决于穿越发现得多快（盘口穿越后秒级极化），
+  固定 1s 粒度 = 最多 1s 后才看到穿越，足以错过未调价的便宜档。
 - REST 兜底：镜像 ticker/price，断线重连等待期间 1s 轮询（与 BookSampler
   同模式——本环境 WS 稳定性差，兜底是时效主力）
 - 消费方：TradingLoop.build_view 计算 live_delta_pct（线程安全读内存）。
@@ -29,8 +32,9 @@ from pmbot.ws_thread import ReconnectingWsThread
 logger = logging.getLogger(__name__)
 
 # Binance 数据流镜像 WS（与 K 线 REST 镜像同源；单流 GET 连接，无需订阅消息）
-# WS stream 路径用小写交易对（btcusdt@miniTicker）；REST 端点用大写（镜像 400 拒小写）
-WS_URL_TMPL = "wss://data-stream.binance.vision/ws/{sym}@miniTicker"
+# WS stream 路径用小写交易对（btcusdt@aggTrade）；REST 端点用大写（镜像 400 拒小写）
+# aggTrade（实时逐笔）而非 miniTicker（1s 快照）：穿越检测延迟是入场价的核心变量
+WS_URL_TMPL = "wss://data-stream.binance.vision/ws/{sym}@aggTrade"
 # REST 兜底（断线等待期间 1s 轮询；强制直连不跟随代理——data_source 同款实证）
 REST_URL_TMPL = "https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}"
 REST_POLL_SEC = 1.0
@@ -90,11 +94,13 @@ class SpotTickerThread(ReconnectingWsThread):
             data = json.loads(raw)
         except json.JSONDecodeError:
             return
-        close = data.get("c")
-        if close is None:
+        # aggTrade 实时成交价在 "p"；miniTicker 收盘价在 "c"（兼容两种流，
+        # 两者语义同为 last trade price，仅推送频率不同）
+        price_raw = data.get("p") if data.get("e") == "aggTrade" else data.get("c")
+        if price_raw is None:
             return
         try:
-            price = float(close)
+            price = float(price_raw)
         except (TypeError, ValueError):
             return
         self._update(price)

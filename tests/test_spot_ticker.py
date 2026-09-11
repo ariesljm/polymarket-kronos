@@ -1,4 +1,4 @@
-"""SpotTickerThread 测试：WS miniTicker 解析、REST 兜底注入、端到端 WS 收价。"""
+"""SpotTickerThread 测试：WS 成交流（aggTrade/miniTicker）解析、REST 兜底注入、端到端 WS 收价。"""
 
 import json
 
@@ -11,6 +11,11 @@ from pmbot.data_source import normalize_symbol
 def mini_ticker(price: float) -> str:
     return json.dumps({"e": "24hrMiniTicker", "s": "BTCUSDT",
                        "c": f"{price}", "o": "70000", "h": "80000", "l": "65000"})
+
+
+def agg_trade(price: float) -> str:
+    return json.dumps({"e": "aggTrade", "s": "BTCUSDT", "p": f"{price}",
+                       "q": "0.5", "T": 1789000000000, "a": 123})
 
 
 def test_ws_url_uses_mirror_endpoint():
@@ -28,6 +33,19 @@ def test_handle_message_parses_mini_ticker():
     assert t.latest_price() == 78148.1
     t._handle_message(mini_ticker(78150.5))
     assert t.latest_price() == 78150.5
+
+
+def test_handle_message_parses_agg_trade():
+    """aggTrade（实时成交，当前主用流）→ 取 p 字段为最新价。
+
+    换流动机：miniTicker 固定 1s 推送，穿越检测最多晚 1s；盘口穿越后秒级
+    极化，早 1s 才能抓到未调价的便宜档。两者 p/c 语义同为 last trade price。
+    """
+    t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
+    t._handle_message(agg_trade(78_200.0))
+    assert t.latest_price() == 78_200.0
+    t._handle_message(agg_trade(78_205.5))
+    assert t.latest_price() == 78_205.5
 
 
 def test_handle_message_ignores_garbage():
@@ -79,7 +97,7 @@ def test_normalize_symbol_shared_single_source():
     assert normalize_symbol("btcusdt") == "BTCUSDT"  # 大小写幂等（原两实现互不相同）
     assert normalize_symbol("ETH/USDT") == "ETHUSDT"
     t = SpotTickerThread(symbol="BTCUSDT")
-    assert t.symbol == "BTCUSDT" and t.ws_url.endswith("btcusdt@miniTicker")
+    assert t.symbol == "BTCUSDT" and t.ws_url.endswith("btcusdt@aggTrade")
 
 
 # ---- 端到端 WS（patch websockets.connect → FakeWS，同 BookSampler 测试模式） ----
