@@ -13,6 +13,7 @@ import logging
 from typing import Callable
 
 from pmbot.executor_protocols import MarketBook, TradeExecutor, shares_for_amount
+from pmbot.entry_gate import resolve
 from pmbot.market_discovery import MarketInfo
 from pmbot.state import StateStore, TradeState
 from pmbot.engine import BREAKER_MESSAGES  # 暂停文案单一事实源（_exec_pause 消费）
@@ -52,6 +53,7 @@ class ExecutionDispatcher:
         save_status: Callable[[], None],
         taker_fee_pct: float = 0.0,
         breaker_cfg: "EngineConfig" | None = None,
+        min_entry_price: float = 0.0,  # config 入场价下限（执行层二次校验同用闸门；无自适应）
         max_entry_price: float = 0.0,  # config 入场价上限（执行层二次校验基准；auto_tune 覆盖经 getter 注入）
         auto_override: Callable[[], "AutoTuneOverride" | None] | None = None,
     ) -> None:
@@ -68,6 +70,7 @@ class ExecutionDispatcher:
         self._save = save_status
         self.taker_fee_pct = taker_fee_pct
         self.max_entry_price = max_entry_price  # config 基准；每次下单取 auto_override 最新有效值
+        self.min_entry_price = min_entry_price
         self._auto_override = auto_override
         self.breaker_cfg = breaker_cfg  # EngineConfig：暂停文案消费 engine.BREAKER_MESSAGES（单一事实源）
 
@@ -168,18 +171,25 @@ class ExecutionDispatcher:
             st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC
             self._save()
             return
-        # 执行层二次校验：引擎 decide 的 max_entry 初判基于决策时刻 book 快照，
+        # 执行层二次校验：引擎 decide 的入场价区间初判基于决策时刻 book 快照，
         # 决策与下单之间 book 被 WS 线程异步更新（穿越后盘口秒级极化）——
-        # 若当前 ask 已 > cap，放弃追价（宁错过不高买：高追仓位历史净亏）。
-        # auto_tune 完整覆盖值经 getter 每次取最新（无常驻可变字段需跨 tick 同步）。
+        # 当前 ask 越界即放弃（宁错过不错买）。与引擎共用同一闸门（entry_gate）；
+        # auto_tune delta 覆盖经 getter 每次取最新（无常驻可变字段需跨 tick 同步）。
         o = self._auto_override() if self._auto_override is not None else None
-        cap = o.max_entry_price if o else self.max_entry_price
-        if cap > 0 and ask > cap:
+        gate = resolve(self.min_entry_price, self.max_entry_price, o)
+        reason = gate.check(ask)
+        if reason is not None:
+            if reason == "entry_price_cap":
+                detail = f"盘口极化 ask={ask:.3f} > cap={gate.max_price:.2f}（不追价）"
+                tag = "exec_cap"
+            else:
+                detail = f"盘口走低 ask={ask:.3f} < floor={gate.min_price:.2f}（不接刀）"
+                tag = "exec_floor"
             logger.info(
-                "执行层拦截：决策后盘口极化 ask=%.3f > cap=%.2f（不追价，%ds 后重试）%s",
-                ask, cap, BUY_RETRY_COOLDOWN_SEC,
+                "执行层拦截：%s，%ds 后重试%s",
+                detail, BUY_RETRY_COOLDOWN_SEC,
                 self._rej_tag(
-                    st.symbol, market.window_start, action.direction.value, f"{ask:.3f}", "exec_cap"
+                    st.symbol, market.window_start, action.direction.value, f"{ask:.3f}", tag
                 ),
             )
             st.retry_until_sec = now_sec + BUY_RETRY_COOLDOWN_SEC

@@ -2,12 +2,15 @@
 
 from types import SimpleNamespace
 
+from pmbot.engine import AutoTuneOverride
 from pmbot.execution_dispatcher import ExecutionDispatcher
 from pmbot.state import TradeState
-from pmbot.types import Direction, Position
+from pmbot.types import Action, ActionType, Direction, Fill, Position
 
 
-def make_dispatcher(*, dry_run=True, fee=0.03, trades=None, statuses=None):
+def make_dispatcher(*, dry_run=True, fee=0.03, trades=None, statuses=None,
+                    book=None, trade=None, min_entry=0.0, max_entry=0.0,
+                    auto_override=None):
     """标准测试替身：store.log_trade / save_status 用真列表记录调用。"""
     trades = [] if trades is None else trades
     statuses = [] if statuses is None else statuses
@@ -17,13 +20,16 @@ def make_dispatcher(*, dry_run=True, fee=0.03, trades=None, statuses=None):
 
     return ExecutionDispatcher(
         state=TradeState(symbol="BTC", mode="dry-run" if dry_run else "live"),
-        trade=SimpleNamespace(),
-        book=SimpleNamespace(),
+        trade=trade if trade is not None else SimpleNamespace(),
+        book=book if book is not None else SimpleNamespace(),
         store=SimpleNamespace(log_trade=log_trade),
         dry_run=dry_run,
         step_sec=300,
         save_status=lambda: statuses.append(1),
         taker_fee_pct=fee,
+        min_entry_price=min_entry,
+        max_entry_price=max_entry,
+        auto_override=auto_override,
     ), trades
 
 
@@ -81,3 +87,62 @@ def test_fee_loss_counts_towards_breaker():
     st = disp.state
     assert st.consecutive_losses == 1
     assert st.daily_loss > 0.30  # 0.5×1.03 − 0.2×0.97 = 0.321
+
+
+# ---- 执行层入场价闸门（决策后盘口二次校验）：与引擎共用 entry_gate ----
+
+def _book(ask):
+    return SimpleNamespace(best_ask=lambda token_id, size=1.0: ask)
+
+
+def _market():
+    return SimpleNamespace(window_start=1780000000, yes_token_id="Y", no_token_id="N")
+
+
+def _place():
+    return Action(ActionType.PLACE_MARKET, direction=Direction.UP, amount=1.0)
+
+
+def test_exec_gate_rejects_ask_above_cap():
+    """决策后盘口极化越过上限 → 拦截，不调用下单。"""
+    calls = []
+    trade = SimpleNamespace(market_buy=lambda *a, **k: calls.append(a))
+    disp, _ = make_dispatcher(book=_book(0.75), trade=trade, max_entry=0.60)
+    disp.execute(_place(), _market(), 1780000000)
+    assert calls == []
+    assert disp.state.retry_until_sec == 1780000000 + 10  # 同一冷却，不每 tick 重试
+
+
+def test_exec_gate_rejects_ask_below_floor():
+    """决策后盘口走低跌破下限 → 拦截（执行层自此与引擎对称校验下限）。"""
+    calls = []
+    trade = SimpleNamespace(market_buy=lambda *a, **k: calls.append(a))
+    disp, _ = make_dispatcher(book=_book(0.25), trade=trade, min_entry=0.30, max_entry=0.60)
+    disp.execute(_place(), _market(), 1780000000)
+    assert calls == []
+    assert disp.state.retry_until_sec == 1780000000 + 10
+
+
+def test_exec_gate_override_narrows_cap():
+    """auto_tune 覆盖收窄上限：config max=0.60 但 override=0.40 → ask 0.50 被拦。"""
+    calls = []
+    trade = SimpleNamespace(market_buy=lambda *a, **k: calls.append(a))
+    disp, _ = make_dispatcher(
+        book=_book(0.50), trade=trade, max_entry=0.60,
+        auto_override=lambda: AutoTuneOverride(max_entry_price=0.40, take_profit=0.95),
+    )
+    disp.execute(_place(), _market(), 1780000000)
+    assert calls == []
+
+
+def test_exec_gate_passes_in_range_ask():
+    """ask 落在区间内 → 放行下单，建立持仓。"""
+    trade = SimpleNamespace(
+        market_buy=lambda *a, **k: Fill(order_id="o1", avg_price=0.50, filled_size=2.0)
+    )
+    disp, _ = make_dispatcher(book=_book(0.50), trade=trade, min_entry=0.30, max_entry=0.60)
+    disp.state.window_start = 1780000000  # 建仓用状态窗口起点
+    disp.execute(_place(), _market(), 1780000000)
+    assert disp.state.position is not None
+    assert disp.state.window_bet_placed is True
+    assert disp.state.retry_until_sec is None

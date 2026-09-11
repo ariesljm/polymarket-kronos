@@ -7,7 +7,7 @@
 from dataclasses import replace
 
 from pmbot.config import EngineConfig
-from pmbot.engine import decide
+from pmbot.engine import AutoTuneOverride, decide
 from pmbot.types import ActionType, Direction, MarketView, PendingOrder, Position, Signal, StateView
 
 # 与默认配置一致的固定引擎配置，方便断言
@@ -314,6 +314,24 @@ def test_take_profit_is_absolute():
     # 0.94 < 0.95 未达止盈 → 继续持有
     action = decide(CFG, make_state(), make_market(best_bid=0.94, position=make_position(entry_price=0.20)),
                     make_signal("skip", 0.5))
+    assert action.type is ActionType.SKIP
+
+
+def test_override_take_profit_lowers_exit_target():
+    """auto_tune delta 止盈覆盖：override.take_profit=0.80 → bid 0.85 触止盈（config 0.95 本不触发）。"""
+    market = make_market(best_bid=0.85, position=make_position())
+    assert decide(CFG, make_state(), market, make_signal("skip", 0.5)).type is ActionType.SKIP
+    action = decide(CFG, make_state(), market, make_signal("skip", 0.5),
+                    override=AutoTuneOverride(take_profit=0.80))
+    assert action.type is ActionType.SELL
+    assert action.reason == "take_profit"
+
+
+def test_empty_override_keeps_config():
+    """delta 空（全 None）→ 行为与无 override 一致（回落 config）。"""
+    market = make_market(best_bid=0.85, position=make_position())
+    action = decide(CFG, make_state(), market, make_signal("skip", 0.5),
+                    override=AutoTuneOverride())
     assert action.type is ActionType.SKIP
 
 

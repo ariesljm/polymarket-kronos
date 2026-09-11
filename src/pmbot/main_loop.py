@@ -108,6 +108,7 @@ class TradingLoop:
             save_status=self.save_status,
             taker_fee_pct=self.config.taker_fee_pct,
             breaker_cfg=self.config.to_engine_config(),
+            min_entry_price=self.config.min_entry_price,
             max_entry_price=self.config.max_entry_price,
             auto_override=lambda: self._auto,
         )
@@ -585,9 +586,10 @@ class TradingLoop:
                 config_take_profit=self.config.take_profit,
             )
             if override != self._auto:
-                changed = bool(override.max_entry_price or override.take_profit)
                 self._auto = override
-                if changed:
+                adjusted = (override.max_entry_price is not None
+                            or override.take_profit is not None)
+                if adjusted:
                     logger.info("auto_tune 调整参数: %s", tune_reason(override, stats))
                 else:
                     logger.info("auto_tune 评估(维持配置): %s", tune_reason(override, stats))

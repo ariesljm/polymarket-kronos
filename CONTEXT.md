@@ -18,6 +18,8 @@ Polymarket 加密货币涨跌（Up/Down）策略交易框架：策略信号（St
 ### 决策引擎与视图
 
 - **决策引擎（engine.decide）** — 纯函数 `decide(config, state, market, signal, now_sec=None) → Action`，不碰 IO。测试接缝：注入 `StateView/MarketView` 纯数据。config 入参为 `EngineConfig` 窄视图（引擎决策参数，由 Config 字段白名单自动映射），不接整 `Config`——消费方表达真实依赖。建仓冷却（盘口无报价 N 秒内不再决策）经 `StateView.retry_until_sec` 注入、now 由调用方传入——决策规则不再散落编排层。
+- **入场价闸门（entry_gate）** — 入场价区间 [下限, 上限] 判定的单一事实源：`resolve(config_min, config_max, override) → EntryGate`（上限经 auto_tune 覆盖、下限直取 config）→ `EntryGate.check(ask) → 越界原因 | None`。`engine.decide` 初判与 `ExecutionDispatcher` 执行层二次校验共用同一接口：决策与下单之间盘口被 WS 线程异步更新（穿越后秒级极化），两处须按同一区间判定——曾各自实现上限比较（engine 另含下限、执行层无下限），`override if override else config` 回落散在两处。闸门无 IO 无状态，纯函数注入 ask 直接测。
+- **自适应调参（auto_tune）** — 分价格带按真实交易 EV 生成引擎参数覆盖 delta（`AutoTuneOverride`：字段 None = 不覆盖、非 None = 覆盖值）。`tune(trades, min_band_n, config_max_entry, config_take_profit)` 只收窄不放宽（样本足且累计 EV ≤ 0 的带下界为新上限；不低于 config 即置 None 不产生无效覆盖）+ 门槛保护（全局样本 < min_band_n → 空 delta）；低带（≤0.45）胜率 > 55% 且严格上调才覆盖止盈（0.99）。回落收口在解析层：上限在 `entry_gate.resolve`（engine 与执行层两处共用）、止盈在 `engine._manage_position`（单一消费方内联）；消费方不自行 if/else。main_loop 每 60s 重算，日志按 delta 是否非空报「调整参数」否则「评估(维持配置)」。
 - **状态视图（StateView）** — 决策输入：连亏/日亏/本窗口已下注/暂停。
 - **市场视图（MarketView）** — 决策输入：窗口剩余秒、目标方向 best ask/bid、当前持仓、挂单。
 - **接缝方法（seam methods）** — TradingLoop 上生命周期消费的公开方法：`refresh_pending / build_view / decide / execute / save_status`。不要改回下划线私有穿透。`execute` 与 `refresh_pending` 委托 `ExecutionDispatcher`（执行分派器），但接缝仍在 TradingLoop。

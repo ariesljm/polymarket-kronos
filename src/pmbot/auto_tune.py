@@ -5,10 +5,10 @@
   (噪声会越调越差;52 笔首日数据 0-0.65 全正、0.8+ 全负的结论只在样本足够时生效)
 - 只收窄不放宽:默认 max_entry 0.65 有研究依据,仅在数据证明"某带真实亏损"
   时向下收窄;正向数据不主动放宽(避免小样本追高)
-- 一切调整写日志 + status 可复盘,随时可关(engine override=None 即退化为纯 config)
+- 一切调整写日志 + status 可复盘,随时可关(override 字段全 None 即退化为纯 config)
 
-用法: main_loop 每 60s 读 ledger → band_stats(trades) → tune() 生成 override
-     → 注入 engine.decide(override.max_entry_price / take_profit 覆盖 config)
+用法: main_loop 每 60s 读 ledger → band_stats(trades) → tune() 生成 override(delta)
+     → 注入 engine.decide(override.max_entry_price 覆盖入场价上限 / take_profit 覆盖止盈)
 """
 
 from __future__ import annotations
@@ -74,19 +74,17 @@ def tune(
     config_take_profit: float = 0.95,
     bands: tuple[tuple[float, float], ...] = BANDS,
 ) -> AutoTuneOverride:
-    """由真实交易统计生成引擎参数覆盖（无足够证据返回空 override = 维持 config）。
+    """由真实交易统计生成引擎参数覆盖 delta（无足够证据返回空 delta = 维持 config）。
 
     max_entry_price: 从低到高按带累计 EV,首个「样本足且累计 EV ≤ 0」的带的
-    下界作为新上限（收窄,不出现在 config 之上）。
+    下界作为新上限（收窄,不出现在 config 之上）；无调整 → None。
     take_profit: 低价带(≤0.45)样本足且胜率 > 55% → 上调到 0.99（接近持有到结算,
-    研究:低带持到结算 EV +2.83 vs 早止盈 +0.29）。
+    研究:低带持到结算 EV +2.83 vs 早止盈 +0.29）；无严格上调 → None。
     """
     stats = band_stats(trades, bands)
     total_n = sum(s.n for s in stats.values())
     if total_n < min_band_n:
-        return AutoTuneOverride(
-            max_entry_price=config_max_entry, take_profit=config_take_profit,
-        )  # 全局样本不足：有效值 = config 默认（完整覆盖值，调参未触发）
+        return AutoTuneOverride()  # 全局样本不足：不覆盖任何参数（delta 空）
 
     # ---- max_entry: 累计 EV 扫描 ----
     new_max: float | None = None
@@ -98,7 +96,8 @@ def tune(
             new_max = lo  # 该带下界起进入负 EV 区间 → 收窄上限
             break
     if new_max is not None:
-        new_max = min(new_max, config_max_entry)  # 只收窄不改宽
+        # 只收窄不改宽：收窄结果不低于 config = 无有效覆盖（delta 空，不产生无效覆盖）
+        new_max = new_max if new_max < config_max_entry else None
 
     # ---- take_profit: 低价带胜率 ----
     low = BandStat(0, 0.0, 0)
@@ -106,23 +105,19 @@ def tune(
         if b[0] >= _LOW_BAND[0] and b[1] <= _LOW_BAND[1]:
             low = BandStat(low.n + s.n, low.pnl + s.pnl, low.wins + s.wins)
     new_tp: float | None = None
-    if low.n >= min_band_n and low.win_rate > 0.55:
-        new_tp = 0.99  # 低带胜率显著 → 更接近持有（止盈 0.99 近似持有到结算）
+    if low.n >= min_band_n and low.win_rate > 0.55 and 0.99 > config_take_profit:
+        new_tp = 0.99  # 低带胜率显著且严格上调 → 更接近持有（0.99 近似持有到结算）
 
-    # 完整覆盖值：未调整字段填充 config（消费者只读，无需再次回落）
-    return AutoTuneOverride(
-        max_entry_price=new_max if new_max is not None else config_max_entry,
-        take_profit=new_tp if new_tp is not None and new_tp > config_take_profit else config_take_profit,
-    )
+    # delta：未调整字段留 None（回落由消费方解析层完成，不在 tune 内填充 config）
+    return AutoTuneOverride(max_entry_price=new_max, take_profit=new_tp)
 
 
-def tune_reason(override: AutoTuneOverride, stats: dict[tuple[float, float], BandStat],
-                config_max_entry: float = 0.65, config_take_profit: float = 0.95) -> str:
-    """人类可读的调参原因（日志/复盘用）。override 为完整覆盖值，与 config 默认对比判调整。"""
+def tune_reason(override: AutoTuneOverride, stats: dict[tuple[float, float], BandStat]) -> str:
+    """人类可读的调参原因（日志/复盘用）。override 为 delta：字段非 None 即本次调整。"""
     parts = []
-    if override.max_entry_price != config_max_entry:
+    if override.max_entry_price is not None:
         parts.append(f"max_entry {override.max_entry_price:.2f}(带 EV≤0)")
-    if override.take_profit != config_take_profit:
+    if override.take_profit is not None:
         parts.append(f"take_profit {override.take_profit:.2f}(低带胜率高)")
     if not parts:
         parts.append("无调整(样本不足或带 EV 均正)")

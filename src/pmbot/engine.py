@@ -13,11 +13,13 @@ from pmbot.config import EngineConfig
 
 @dataclass(frozen=True)
 class AutoTuneOverride:
-    """自适应调参覆盖（auto_tune 生成）:完整覆盖值——字段恒有值（无调整时为
-    对应 config 默认），消费者直读，不做 None→config 回落（回落收口在 tune()）。"""
+    """自适应调参覆盖（auto_tune 生成）：delta 语义——字段 None = 不覆盖该参数
+    （维持 config）；非 None = 覆盖值。回落由消费方收口（上限在 entry_gate.resolve
+    一处；止盈在 _manage_position 内联——单一消费方不另立解析函数）。"""
 
-    max_entry_price: float = 0.0
-    take_profit: float = 0.0
+    max_entry_price: float | None = None
+    take_profit: float | None = None
+from pmbot.entry_gate import resolve
 from pmbot.exit_rules import position_exit_levels
 from pmbot.types import Action, ActionType, Direction, MarketView, Position, Signal, StateView
 
@@ -120,9 +122,11 @@ def _manage_position(config: EngineConfig, position: Position, best_bid: float |
     if best_bid is None:
         return Action(ActionType.SKIP)
     # 止盈止损：共享 exit_rules 单一事实源（回测/面板同公式）
-    # auto_tune 完整覆盖值：override 恒有值（无调整 = config 默认），直读不回落
+    # auto_tune delta：override.take_profit 非 None 才覆盖 config
     tp, sl = position_exit_levels(
-        position.entry_price, override.take_profit if override else config.take_profit,
+        position.entry_price,
+        override.take_profit if override and override.take_profit is not None
+        else config.take_profit,
         config.stop_loss,
     )
     if best_bid >= tp:
@@ -155,16 +159,12 @@ def _maybe_enter(config: EngineConfig, signal: Signal, best_ask: float | None,
     # → 跳过入场（模型窗口起点预测被实时走势证伪，市价追单大概率高位接盘）；默认关
     if signal_contradicted(signal.direction, live_delta_pct, config.contradiction_skip_pct):
         return Action(ActionType.SKIP, reason="contradiction")
-    # 入场价上限：盘口 ask 高于此价不入场（追高仓位历史净亏；0 = 关闭）。
-    # 无报价（None）不拦——执行层缺报价本就放弃建仓。
-    # auto_tune 完整覆盖值：override 恒有值（无调整 = config 默认），直读不回落
-    cap = override.max_entry_price if override else config.max_entry_price
-    if cap > 0 and best_ask is not None and best_ask > cap:
-        return Action(ActionType.SKIP, reason="entry_price_cap")
-    # 入场价下限：盘口 ask 低于此价不入场（0.45-0.55 五五开档历史净亏 -2.52/31 笔，
-    # 该档位无信息优势且买卖价差双向吞噬；0 = 关闭）。
-    if config.min_entry_price > 0 and best_ask is not None and best_ask < config.min_entry_price:
-        return Action(ActionType.SKIP, reason="entry_price_floor")
+    # 入场价区间：盘口 ask 落在 [下限, 上限] 之外不入场（单一事实源 entry_gate；
+    # 上限经 auto_tune 覆盖、下限直取 config）。无报价（None）不拦——执行层缺
+    # 报价本就放弃建仓。执行层决策后二次校验走同一闸门（盘口秒级极化）。
+    reason = resolve(config.min_entry_price, config.max_entry_price, override).check(best_ask)
+    if reason is not None:
+        return Action(ActionType.SKIP, reason=reason)
     # 市价入场：预测后立即按 1 USDC 目标买入（份额=金额/盘口价，可小数，无 5 股限制）
     if signal.direction is Direction.UP and signal.p_up > config.p_up_buy:
         return Action(ActionType.PLACE_MARKET, direction=Direction.UP, amount=config.amount_per_trade)
