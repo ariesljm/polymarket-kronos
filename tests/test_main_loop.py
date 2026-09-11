@@ -53,6 +53,9 @@ class FakeStrategy:
         self.refresh_calls += 1
         return self._refresh
 
+    def status_text(self):  # 对齐 Strategy 基类契约（无专属状态）
+        return None
+
 
 class FakeDiscovery:
     step_ms = 900_000  # 15m（与测试窗口对齐）
