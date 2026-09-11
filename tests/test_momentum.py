@@ -1,4 +1,4 @@
-"""momentum 策略测试：分标的阈值 + BTC 反向矛盾过滤。"""
+"""momentum 策略测试：全局穿越阈值 + BTC 反向矛盾过滤。"""
 
 from pmbot.config import StrategyConfig
 from pmbot.strategies.momentum import MomentumStrategy
@@ -9,7 +9,6 @@ def make_strategy(
     *,
     symbol="ETH",
     threshold_pct=0.08,
-    threshold_by_symbol=None,
     btc_contradiction_pct=0.0,
     fetch_price=None,
     fetch_window_open=None,
@@ -17,7 +16,6 @@ def make_strategy(
 ):
     sc = StrategyConfig(
         threshold_pct=threshold_pct,
-        threshold_by_symbol=threshold_by_symbol or {},
         btc_contradiction_pct=btc_contradiction_pct,
     )
     return MomentumStrategy(
@@ -29,18 +27,10 @@ def make_strategy(
     )
 
 
-def test_threshold_by_symbol_override():
-    """分标的阈值覆盖默认值：SOL 用 0.12，ETH 用 0.10。"""
-    sol = make_strategy(symbol="SOL", threshold_by_symbol={"ETH": 0.10, "SOL": 0.12})
-    assert sol.threshold_pct == 0.12
-    eth = make_strategy(symbol="ETH", threshold_by_symbol={"ETH": 0.10, "SOL": 0.12})
-    assert eth.threshold_pct == 0.10
-
-
-def test_threshold_default_when_symbol_not_listed():
-    """未列出的标的回退默认 threshold_pct。"""
-    btc = make_strategy(symbol="BTC", threshold_pct=0.08, threshold_by_symbol={"ETH": 0.10})
-    assert btc.threshold_pct == 0.08
+def test_threshold_is_global_single_value():
+    """穿越阈值全局单值：不同标的取同一 threshold_pct（分标的覆盖已删除，见 ADR-0004）。"""
+    assert make_strategy(symbol="SOL", threshold_pct=0.08).threshold_pct == 0.08
+    assert make_strategy(symbol="ETH", threshold_pct=0.08).threshold_pct == 0.08
 
 
 def test_btc_contradiction_filters_up_signal():

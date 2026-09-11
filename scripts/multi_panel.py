@@ -129,7 +129,7 @@ def _cfg_line(symbols: int, interval: str, amount: float,
               max_entry: float, views: list, online_flags: list[bool]) -> Table:
     """配置行（全局参数，只显示一次，标的块不再重复）+ 真实聚合 WS 连接状态（替代早期硬编码死文案）。
 
-    穿越阈值分标的各异（threshold_by_symbol），不在此显示全局默认值，改在各标的块首行。
+    穿越阈值全局单值，在各标的块首行显示（分标的覆盖已回退，见 ADR-0004）。
     WS 聚合必须与在线判定同源：bot 停机后 status.json 仍留着上次的 connected，
     不查新鲜度会显示假“已连”（与底部“离线”自相矛盾）。
     """
@@ -258,7 +258,7 @@ def cards_per_row(width: int) -> int:
     return 1
 
 
-def _symbol_cards(views: list[PanelView], thresholds: dict[str, float],
+def _symbol_cards(views: list[PanelView], threshold: float,
                   online_flags: list[bool], width: int) -> Table:
     """标的卡片网格：cards_per_row 列自适应，行内等高（空白补位）。"""
     per_row = cards_per_row(width)
@@ -266,7 +266,7 @@ def _symbol_cards(views: list[PanelView], thresholds: dict[str, float],
                  show_header=False, padding=(0, 1))
     for _ in range(per_row):
         grid.add_column(justify="left", ratio=1, no_wrap=False)
-    cards = [_card(v, on, thresholds.get(v.symbol)) for v, on in zip(views, online_flags)]
+    cards = [_card(v, on, threshold) for v, on in zip(views, online_flags)]
     for i in range(0, len(cards), per_row):
         chunk: list = cards[i:i + per_row]
         chunk += [Text("")] * (per_row - len(chunk))  # 末行补空位，卡片宽度不被拉伸
@@ -394,12 +394,15 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
+    # 目录前缀随模式派生：--live 必须指向 data_live/*（曾硬编码 data_multi/*，
+    # 导致 `multi_panel.py --live` 挂着实盘标签却读干跑目录）
+    prefix = "data_live" if args.live else "data_multi"
     if args.data_dir:
         dirs = [d.strip() for d in args.data_dir.split(",") if d.strip()]
     elif cfg_loaded is not None:
-        dirs = [f"data_multi/{s.lower()}" for s in cfg_loaded.symbols]
+        dirs = [f"{prefix}/{s.lower()}" for s in cfg_loaded.symbols]
     else:
-        dirs = ["data_multi/eth", "data_multi/sol"]
+        dirs = [f"{prefix}/eth", f"{prefix}/sol"]
     paths_list = [RuntimePaths(data_dir=d, mode="live" if args.live else "dry-run") for d in dirs]
     mode = "live" if args.live else "dry-run"
 
@@ -415,13 +418,6 @@ def main(argv: list[str] | None = None) -> int:
         amount = cfg_loaded.amount_per_trade
         threshold_pct = getattr(cfg_loaded, "threshold_pct", 0.08)
         max_entry = getattr(cfg_loaded, "max_entry_price", 0.65)
-    # 分标的穿越阈值：threshold_by_symbol 覆盖 + 全局默认兑底（YAML 键为字符串）
-    global_threshold = threshold_pct
-    tbs = getattr(cfg_loaded, "threshold_by_symbol", {}) if cfg_loaded else {}
-    thresholds = {
-        s: float(tbs.get(s, global_threshold))
-        for s in (cfg_loaded.symbols if cfg_loaded else [d.split("/")[-1].upper() for d in dirs])
-    }
 
     global _checks
     with Live(refresh_per_second=1 / REFRESH_SEC, screen=False, console=console) as live:
@@ -442,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
                 _title_bar(views, mode, interval),
                 _cfg_line(symbols, interval, amount, max_entry, views, online_flags),
                 Text("─" * max(10, console.width - 4), style="dim"),
-                _symbol_cards(views, thresholds, online_flags, console.width),
+                _symbol_cards(views, threshold_pct, online_flags, console.width),
                 Text("─" * max(10, console.width - 4), style="dim"),
             )
 

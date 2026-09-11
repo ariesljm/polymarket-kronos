@@ -72,10 +72,8 @@ class MomentumStrategy(Strategy):
         self.symbol = symbol
         self.interval = sc.market_interval
         self.step_ms = step_ms_for(self.interval)
-        # 分标的穿越阈值：threshold_by_symbol 覆盖默认 threshold_pct
-        # （SOL 波动 > ETH > BTC，同样 % 下 SOL 假穿越多，需更高阈值）
-        tb = getattr(sc, "threshold_by_symbol", None) or {}
-        self.threshold_pct = tb.get(symbol, getattr(sc, "threshold_pct", 0.08))
+        # 穿越阈值：全局单值（曾试分标的覆盖 → 升阈致 0 成交已回退，见 ADR-0004）
+        self.threshold_pct = getattr(sc, "threshold_pct", 0.08)
         # BTC 反向矛盾过滤阈值（0 = 关闭）：标的穿越方向与 BTC 反向时跳过
         self.btc_contradiction_pct = getattr(sc, "btc_contradiction_pct", 0.0)
         # 依赖注入（测试用 fake；运行态默认走 Binance REST）
@@ -138,7 +136,8 @@ class MomentumStrategy(Strategy):
         独立噪音，非市场动量）。BTC 价默认 REST 拉取（~1s，反向状态非瞬时
         事件，延迟可接受）；每窗口懒加载 BTC 基准。
         """
-        if self.btc_contradiction_pct <= 0:
+        # BTC 自身交易时跳过：自己与自己比永远不矛盾，且每 tick 会多一次 BTC REST 调用
+        if self.btc_contradiction_pct <= 0 or self.symbol == "BTC":
             return False
         if self._btc_base is None:
             self._btc_base = self._fetch_symbol_window_open("BTC")

@@ -12,7 +12,7 @@ config.py 本身无需改动。
 from __future__ import annotations
 
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -45,7 +45,7 @@ DEFAULTS: dict = {
     "min_entry_price": 0.0,      # 入场价下限：盘口 ask 低于此价不入场（0 = 关闭）
     "taker_fee_pct": 0.0,        # dry-run 模拟 taker 手续费率（按成交金额；实盘 pnl=余额差已含费）
     "threshold_pct": 0.08,     # momentum 策略：Binance 相对窗口开盘穿越阈值 %%——穿越后同向入场
-    "threshold_by_symbol": {},  # 分标的穿越阈值覆盖（如 {ETH: 0.10, SOL: 0.12}）
+    # 分标的阈值机制已删除（升阈致 0 成交，见 docs/adr/0004-revert-per-symbol-threshold.md）
     "btc_contradiction_pct": 0.0,  # BTC 反向矛盾过滤阈值（0 = 关闭）
     "take_profit": 0.95,
     "stop_loss": 0.20,
@@ -86,7 +86,6 @@ class StrategyConfig:
 
     market_interval: str = "5m"
     threshold_pct: float = 0.08  # momentum：穿越阈值 %%（相对窗口开盘）
-    threshold_by_symbol: dict = field(default_factory=dict)  # 分标的覆盖 {ETH: 0.10, SOL: 0.12}
     btc_contradiction_pct: float = 0.0  # BTC 反向矛盾过滤阈值（0 = 关闭）
 
 
@@ -119,8 +118,6 @@ class Config:
     taker_fee_pct: float = 0.0
     # momentum 策略：Binance 相对窗口开盘穿越阈值 %%（穿越后同向入场）
     threshold_pct: float = 0.08
-    # 分标的穿越阈值覆盖（{ETH: 0.10, SOL: 0.12}；未列标的用 threshold_pct）
-    threshold_by_symbol: dict = field(default_factory=dict)
     # BTC 反向矛盾过滤阈值 %%（0 = 关闭；标的穿越方向与 BTC 反向时跳过入场）
     btc_contradiction_pct: float = 0.0
 
@@ -136,7 +133,6 @@ class Config:
         return StrategyConfig(
             market_interval=self.market_interval,
             threshold_pct=self.threshold_pct,
-            threshold_by_symbol=self.threshold_by_symbol,
             btc_contradiction_pct=self.btc_contradiction_pct,
         )
 
@@ -206,12 +202,6 @@ def load_config(path: str | Path) -> Config:
     thr = _field(s, "threshold_pct", _as_float, lo=0, lo_excl=True,
                  hint="momentum 穿越阈值，如 0.08 = 0.08%")
 
-    tbs = s.get("threshold_by_symbol", {}) or {}
-    if not isinstance(tbs, dict):
-        raise ConfigError("threshold_by_symbol 必须是 dict（如 {ETH: 0.10, SOL: 0.12}）")
-    for _k, _v in tbs.items():
-        _as_float(_v, f"threshold_by_symbol.{_k}")
-
     btc_cp = _field(s, "btc_contradiction_pct", _as_float, lo=0,
                     hint="0 表示关闭 BTC 反向矛盾过滤")
 
@@ -239,7 +229,6 @@ def load_config(path: str | Path) -> Config:
         min_entry_price=miep,
         taker_fee_pct=tfp,
         threshold_pct=thr,
-        threshold_by_symbol=tbs,
         btc_contradiction_pct=btc_cp,
     )
 
