@@ -126,6 +126,24 @@ def test_connected_flag_updates(fake_connect):
         s.join(timeout=2)
 
 
+def test_user_stream_disables_stale_idle_detection():
+    """UserStream 是事件流（只推订单/成交，空闲正常）→ 禁用僵尸检测。
+
+    回归：曾用行情流阈值（25s）判僵尸，UserStream 连接后无事件推送时
+    被误判（日志见 '99046s 无数据' 的荒谬初始值）→ 无限重连循环刷屏。
+    """
+    assert UserStream.stale_idle_sec is None
+
+
+def test_user_stream_on_connect_resets_last_data_ts(fake_connect):
+    """连接成功重置 _last_data_ts：防连接后长时间无数据时用初始值 0 误判僵尸。"""
+    s = UserStream(auth=AUTH)
+    assert s._last_data_ts == 0.0
+    s._on_connect()
+    assert s._last_data_ts > 0.0
+    assert s.connected is True
+
+
 def test_subscribe_markets_push_update(fake_connect):
     """连接后 markets 变化 → 增量 subscribe/unsubscribe 消息。"""
     state = fake_connect([["PONG"]])

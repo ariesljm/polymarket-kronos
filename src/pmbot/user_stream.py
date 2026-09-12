@@ -26,6 +26,9 @@ class UserStream(ReconnectingWsThread):
     """后台线程跑 asyncio 事件循环：认证 WS → 事件队列。"""
 
     ws_url = WS_URL
+    # 事件流（只推订单/成交，稀疏）：空闲是正常的，不适用行情流的僵尸检测
+    # （否则连接后在无事件推送时被判僵尸→无限重连循环）
+    stale_idle_sec = None
 
     def __init__(self, auth: dict | None = None, proxy: str | None = None,
                  ws_url: str = WS_URL) -> None:
@@ -70,6 +73,7 @@ class UserStream(ReconnectingWsThread):
         super().run()
 
     def _on_connect(self) -> None:
+        super()._on_connect()  # 重置 _last_data_ts（见基类说明）
         self.connected = True
         logger.info("用户 WS 已连接（auth ok）")
 

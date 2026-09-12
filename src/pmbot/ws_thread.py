@@ -17,13 +17,14 @@ import threading
 import time
 
 from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
 RECONNECT_BASE = 2.0  # 重连退避起步（秒）：行情数据新鲜度优先——断线 2s 内重试
                      # （原 5s：盘口穿越窗口仅数秒，5s 盲区等于丢掉整个入场机会）
 RECONNECT_MAX = 60.0  # 重连退避上限（秒）
-STALE_IDLE_SEC = 25.0  # 无数据僵尸连接检测：超过该时长无任何消息 → 主动重连
+STALE_IDLE_SEC = 25.0  # 行情流无数据僵尸检测阈值；事件流（UserStream）置 stale_idle_sec=None 禁用
 MAX_QUEUE = 256  # 接收队列上限：websockets 默认 16 太紧，盘口高流量时稍慢即满
 # → pause_reading → TCP 背压 → 服务端 1013 slow consumer（实证 2 次）。
 # 调到 256 给足缓冲；处理是纯内存 dict 操作，不会真实积压到爆。
@@ -36,6 +37,10 @@ class ReconnectingWsThread(threading.Thread):
     reconnect_base: float = RECONNECT_BASE
     reconnect_max: float = RECONNECT_MAX
     disconnect_poll_sec: float = 2.0  # 断线等待期间子类兜底钩子的轮询间隔（秒）
+    # 僵尸连接检测阈值（秒）：行情流长时间无数据 → 主动重连。None = 禁用
+    # （事件流如 UserStream 空闲是正常的——它只推订单/成交事件，稀疏；
+    # 误判僵尸会导致“连接成功 → 10s 后判僵尸 → 重连”无限循环刷屏）
+    stale_idle_sec: float | None = STALE_IDLE_SEC
     # 应用层心跳间隔（秒）：Polymarket Market/User Channel 要求客户端每 10s
     # 主动发 PING（不发会被 ~10s 后断开）。None=禁用（Binance 单流靠协议层
     # ping，发应用层 PING 文本无益且可能被当作未知消息）。
@@ -147,8 +152,10 @@ class ReconnectingWsThread(threading.Thread):
         try:
             while not self._stop.is_set():
                 await asyncio.sleep(interval)
-                # 僵尸连接检测：长时间无数据（服务端静默但连接未关）→ 主动断开触发重连
-                if time.monotonic() - self._last_data_ts > STALE_IDLE_SEC:
+                # 僵尸连接检测：长时间无数据（服务端静默但连接未关）→ 主动断开触发重连。
+                # stale_idle_sec=None 表示该流不适用（事件流空闲是正常的）。
+                stale = self.stale_idle_sec
+                if stale is not None and time.monotonic() - self._last_data_ts > stale:
                     logger.warning(
                         "%s 僵尸连接（%.0fs 无数据），主动重连",
                         self.__class__.__name__, time.monotonic() - self._last_data_ts,
@@ -183,7 +190,13 @@ class ReconnectingWsThread(threading.Thread):
     # ---- 子类钩子 ----
 
     def _on_connect(self) -> None:
-        """连接成功回调（默认无操作）。"""
+        """连接成功回调（默认无操作）。
+
+        子类覆写时须调用 super()._on_connect()：基类在此重置 _last_data_ts，
+        否则连接后若长时间无数据（事件流空闲），僵尸检测会拿初始值 0 误判
+        （曾见 “100703s 无数据” 的荒谬日志 + 无限重连循环）。
+        """
+        self._last_data_ts = time.monotonic()
 
     def _fallback_once(self) -> None:
         """断线 + 重连等待期间的周期兜底钩子（默认无操作；如 REST 轮询保持数据新鲜）。
@@ -233,6 +246,10 @@ class ReconnectingWsThread(threading.Thread):
                     await ws.send(json.dumps(
                         {"operation": "subscribe", payload_key: sorted(add)}))
                 self._last_subscribed = set(wanted)
+            except ConnectionClosed:
+                # WS 已正常关闭（窗口切换/重连竞态）：不告警——重连时 _send_subscribe
+                # 全量重订阅兜底（曾打完整 traceback 刷屏）
+                logger.debug("订阅增量同步时连接已关闭（重连将全量订阅）")
             except Exception:
                 if on_error is not None:
                     on_error()
