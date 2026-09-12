@@ -13,6 +13,8 @@ from pathlib import Path
 
 from rich.console import Console
 
+import pytest
+
 from pmbot.ledger import load_records
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "multi_panel.py"
@@ -87,3 +89,39 @@ def test_countdown_bar_color_scales_with_remaining():
     red = _render(multi_panel._countdown_bar(
         [PanelView(symbol="ETH", window_remaining_sec=30)], "5m"))
     assert "00:30" in red
+
+
+def test_main_refreshes_in_loop_not_single_frame(monkeypatch):
+    """回归：main 必须循环刷新（旧实现只渲染一帧就 return 0）。
+
+    事故：删除底部状态栏时误删 `while True:`（缩进仍然合法，测试照常全绿）。
+    后果是面板“闪一下”就退出，而退出会连带停掉 bot（启动 4 秒后优雅停机），
+    且首帧显示的是上一轮残留 status → 看起来像 bot 离线/盘口全空。
+    """
+    renders = []
+
+    class FakeLive:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def update(self, frame):
+            renders.append(frame)
+            if len(renders) >= 3:
+                raise KeyboardInterrupt  # 结束无限循环（生产由 Ctrl-C 触发）
+
+    monkeypatch.setattr(multi_panel, "Live", FakeLive)
+    monkeypatch.setattr(multi_panel.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(multi_panel, "build_multi_view", lambda *a, **kw: [])
+    monkeypatch.setattr(multi_panel, "load_records", lambda *a, **kw: [])
+    monkeypatch.setattr(multi_panel, "console", Console(file=io.StringIO(), width=200))
+
+    with pytest.raises(KeyboardInterrupt):
+        multi_panel.main(["--live", "--data-dir", "data_live/btc"])
+
+    assert len(renders) == 3  # 旧实现只有 1 帧

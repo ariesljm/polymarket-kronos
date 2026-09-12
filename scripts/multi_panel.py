@@ -424,6 +424,9 @@ def main(argv: list[str] | None = None) -> int:
         max_entry = getattr(cfg_loaded, "max_entry_price", 0.65)
 
     with Live(refresh_per_second=1 / REFRESH_SEC, screen=False, console=console) as live:
+        # 刷新循环：每 REFRESH_SEC 秒重建整帧（去掉 while 会只渲染一帧就退出，
+        # 面板变成“闪一下”的摆设，且退出后连带停掉 bot —— 回归事故，勿删）。
+        while True:
             # cfg 一次加载复用（build_live_view 不再每标的每 2s 重复解析 config.yaml）
             views = build_multi_view(paths_list, str(ROOT / "config.yaml"), cfg=cfg_loaded)
             # 按标的过滤（api 流水是全钱包的，不过滤聚合会每笔 ×N 重复）
