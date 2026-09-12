@@ -43,6 +43,10 @@ WS_URL_TMPL = (
 # REST 兜底（断线等待期间 1s 轮询；强制直连不跟随代理——data_source 同款实证）
 REST_URL_TMPL = "https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}"
 REST_POLL_SEC = 1.0
+# 价格新鲜度阈值（秒）：WS 连着但静默（服务端不推、连接未断）时 _ts 停止前进，
+# latest_price 发现超阈值会先同步 REST 兜底一次——防止冻结价悄悄喂给决策引擎
+# （穿越检测对旧价静默失效：无报错、无日志；基类僵尸检测对 Binance 流是禁用的）
+STALE_PRICE_SEC = 5.0
 
 
 class SpotTickerThread(ReconnectingWsThread):
@@ -77,16 +81,30 @@ class SpotTickerThread(ReconnectingWsThread):
     # ---- 消费方接口（线程安全） ----
 
     def latest_price(self) -> float | None:
-        """最近一次 Binance 实时价（线程安全）。尚无成功拉取返回 None。"""
+        """最近一次 Binance 实时价（线程安全）。尚无成功拉取返回 None。
+
+        新鲜度保护："连着但静默"（WS 存活但超过 STALE_PRICE_SEC 无推送）时
+        返回旧价前先同步 REST 兜底一次；REST 也失败则退回旧价、下个 tick 再试
+        （决策引擎拿到旧价好过拿 None）。
+        """
         with self._lock:
-            return self._price
+            price = self._price
+            stale = self._ts > 0 and time.monotonic() - self._ts > STALE_PRICE_SEC
+        if stale:
+            self._rest_fallback()
+            with self._lock:
+                return self._price
+        return price
 
     def snapshot(self) -> dict | None:
-        """价格快照（面板顶栏用，与 SpotPrice.snapshot 兼容）：{"price", "delta"}。"""
+        """价格快照（面板现货价用，与 SpotPrice.snapshot 兼容）：
+        {"price", "delta", "age"}——age = 距上次更新的秒数（币安 feed 静默在
+        面板可见，不靠肉眼看价格僵死）。"""
         with self._lock:
             if self._price is None:
                 return None
-            return {"price": self._price, "delta": self._delta}
+            return {"price": self._price, "delta": self._delta,
+                    "age": time.monotonic() - self._ts}
 
     # ---- WS 钩子（ReconnectingWsThread 子类实现） ----
 

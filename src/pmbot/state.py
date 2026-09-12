@@ -49,6 +49,7 @@ class TradeState:
     retry_until_sec: int | None = None  # 盘口无报价建仓失败冷却截止（秒）；None=无冷却
     strategy_state: str | None = None  # 策略专属状态文案（momentum 基准/偏离等；面板显示）
     ws: dict | None = None  # WS 连接状态快照 {"book": str, "ticker": str}（save_status 写入,面板 WS 行显示）
+    spot: dict | None = None  # Binance 实时价快照 {"price","delta","age"}（save_status 写入；面板现货价全精度显示）
 
     def roll_window(self, window_start: int) -> None:
         """窗口切换：重置本窗口下注标记与挂单（持仓不应跨窗口，结算兜底）。"""

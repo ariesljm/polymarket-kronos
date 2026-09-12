@@ -1,6 +1,7 @@
 """SpotTickerThread 测试：WS 成交流（aggTrade/miniTicker）解析、REST 兜底注入、端到端 WS 收价。"""
 
 import json
+import time
 
 import pytest
 
@@ -98,13 +99,43 @@ def test_rest_url_uses_mirror():
 
 
 def test_snapshot_compatible_with_panel():
-    """snapshot() 与旧 SpotPrice 兼容（面板顶栏 {"price","delta"} 语义）。"""
+    """snapshot() 与旧 SpotPrice 兼容（面板 {"price","delta"} 语义）+ age 字段。"""
     t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
     assert t.snapshot() is None  # 尚未拉取
     t._handle_message(mini_ticker(77_000.0))
-    assert t.snapshot() == {"price": 77_000.0, "delta": 0.0}
+    snap = t.snapshot()
+    assert snap["price"] == 77_000.0 and snap["delta"] == 0.0 and snap["age"] >= 0
     t._handle_message(mini_ticker(77_050.0))
-    assert t.snapshot() == {"price": 77_050.0, "delta": 50.0}
+    snap = t.snapshot()
+    assert snap["price"] == 77_050.0 and snap["delta"] == 50.0 and snap["age"] >= 0
+
+
+def test_latest_price_fresh_returns_cached_without_fetch():
+    """新鲜价直接返回缓存，不触发 REST（防每 tick 同步请求风暴）。"""
+    calls = []
+    t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: calls.append(1) or None)
+    t._handle_message(mini_ticker(77_000.0))
+    assert t.latest_price() == 77_000.0
+    assert calls == []
+
+
+def test_latest_price_stale_triggers_rest_fallback():
+    """新鲜度保护：WS 静默超过 STALE_PRICE_SEC → 返回前先同步 REST 兜底一次。"""
+    t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: 77_500.0)
+    t._handle_message(mini_ticker(77_000.0))
+    with t._lock:
+        t._ts = time.monotonic() - 10  # 伪造静默：10s 无更新
+    assert t.latest_price() == 77_500.0  # REST 兜底价已生效
+    assert t.snapshot()["price"] == 77_500.0
+
+
+def test_latest_price_stale_rest_failure_keeps_old_price():
+    """静默期间 REST 也失败 → 退回旧价（决策引擎拿到旧价好过拿 None）。"""
+    t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
+    t._handle_message(mini_ticker(77_000.0))
+    with t._lock:
+        t._ts = time.monotonic() - 10
+    assert t.latest_price() == 77_000.0
 
 
 def test_normalize_symbol_shared_single_source():

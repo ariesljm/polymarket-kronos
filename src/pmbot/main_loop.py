@@ -621,4 +621,10 @@ class TradingLoop:
             ws["ticker"] = self._ticker.connection_status()
         if ws:
             extra["ws"] = ws
+        # Binance 实时价快照（面板现货价全精度显示；age=距上次更新秒数，feed 静默
+        # 在面板可见）——策略展示文案反推价只有 0.001% 量化台阶（BTC≈0.77 美元）
+        if self._ticker is not None:
+            snap = self._ticker.snapshot()
+            if snap is not None:
+                extra["spot"] = snap
         self._store.save(self.state, extra=extra)

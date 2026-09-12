@@ -188,13 +188,21 @@ def make_pending(direction=Direction.UP, price=0.45, order_id="oid-1"):
 
 
 class FakeTicker:
-    """Binance 实时价线程替身（SpotTickerThread 窄接口：latest_price）。"""
+    """Binance 实时价线程替身（SpotTickerThread 窄接口：latest_price / snapshot）。"""
 
     def __init__(self, price=None):
         self._price = price
 
     def latest_price(self):
         return self._price
+
+    def connection_status(self) -> str:
+        return "connected"
+
+    def snapshot(self):
+        if self._price is None:
+            return None
+        return {"price": self._price, "delta": 0.0, "age": 0.0}
 
 
 # ---- 动态轮询间隔（活跃持仓高频，止盈/止损及时触发） ----
@@ -1799,3 +1807,14 @@ def test_save_status_syncs_memory_strategy_state(tmp_path):
     import json
     data = json.loads(Path(str(tmp_path / "status.json")).read_text(encoding="utf-8"))
     assert data.get("strategy_state") == "策略状态: momentum 基准 100.0 偏离 +0.5%"
+
+
+def test_save_status_writes_spot_snapshot(tmp_path):
+    """save_status 写入币安实时价快照（全精度），面板现货价不再反解量化文案。"""
+    loop = make_loop(tmp_path, ticker=FakeTicker(price=77_777.0))
+    loop.save_status()
+    import json
+
+    data = json.loads(Path(str(tmp_path / "status.json")).read_text(encoding="utf-8"))
+    assert data["spot"]["price"] == 77_777.0
+    assert "delta" in data["spot"] and "age" in data["spot"]

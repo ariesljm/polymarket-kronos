@@ -605,8 +605,17 @@ def test_view_carries_spot_price():
     assert v2.spot is None
 
 
+def test_view_prefers_status_spot_over_panel_spot():
+    """bot 写入 status.spot（全精度 WS 价）优先于 Web 控制台注入的 panel.spot。"""
+    v = build_view(
+        status_dict(spot={"price": 77123.45, "delta": 1.2, "age": 0.3}),
+        trades_rows(), now_sec=WINDOW_START,
+        panel=PanelConfig(spot={"price": 2345.67, "delta": 12.3}))
+    assert v.spot == {"price": 77123.45, "delta": 1.2, "age": 0.3}
+
+
 def test_spot_ticker_snapshot_and_delta():
-    """SpotTickerThread 快照与涨跌差（面板顶栏语义，与旧 SpotPrice 兼容）。"""
+    """SpotTickerThread 快照与涨跌差（面板顶栏语义，与旧 SpotPrice 兼容）+ age。"""
     import json
 
     from pmbot.spot_ticker import SpotTickerThread
@@ -614,9 +623,11 @@ def test_spot_ticker_snapshot_and_delta():
     t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
     assert t.snapshot() is None  # 尚未拉取
     t._handle_message(json.dumps({"e": "24hrMiniTicker", "s": "BTCUSDT", "c": "2000.0"}))
-    assert t.snapshot() == {"price": 2000.0, "delta": 0.0}  # 首次无 delta
+    snap = t.snapshot()
+    assert snap["price"] == 2000.0 and snap["delta"] == 0.0 and snap["age"] >= 0
     t._handle_message(json.dumps({"e": "24hrMiniTicker", "s": "BTCUSDT", "c": "2010.0"}))
-    assert t.snapshot() == {"price": 2010.0, "delta": 10.0}
+    snap = t.snapshot()
+    assert snap["price"] == 2010.0 and snap["delta"] == 10.0 and snap["age"] >= 0
 
 
 def test_live_view_uses_config_interval(tmp_path, monkeypatch):

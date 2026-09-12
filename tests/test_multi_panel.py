@@ -125,3 +125,37 @@ def test_main_refreshes_in_loop_not_single_frame(monkeypatch):
         multi_panel.main(["--live", "--data-dir", "data_live/btc"])
 
     assert len(renders) == 3  # 旧实现只有 1 帧
+
+
+def test_card_prefers_spot_snapshot_over_strategy_quantized():
+    """卡片现货价优先用 status["spot"] 全精度价，而非反解文案的 0.001% 量化台阶。"""
+    from pmbot.panel_view import PanelView
+
+    v = PanelView(
+        symbol="BTC",
+        strategy_state="策略状态: momentum 基准 77,200.01 偏离 +0.032%",
+        spot={"price": 77_224.65, "delta": 3.2, "age": 0.4})
+    rendered = _render(multi_panel._card(v, True, None))
+    assert "$77,224.65" in rendered      # spot 全精度价
+    assert "$77,224.71" not in rendered  # 反解量化价（基准×(1+0.032%)≈77,224.71）
+    assert "▲0.03%" in rendered         # 窗口偏离% 仍来自策略文案
+    assert "⚠币安" not in rendered       # age 0.4s 新鲜，不提示
+
+
+def test_card_shows_ticker_staleness_warning():
+    """币安 feed 静默（age>2s）在卡片上可见，不靠肉眼看价格僵死。"""
+    from pmbot.panel_view import PanelView
+
+    v = PanelView(symbol="BTC", spot={"price": 77_000.0, "delta": 0.0, "age": 6.7})
+    rendered = _render(multi_panel._card(v, True, None))
+    assert "⚠币安7s前" in rendered
+
+
+def test_card_falls_back_to_strategy_price_without_spot():
+    """无 status.spot（旧版本 bot 数据）→ 回落反解策略文案价。"""
+    from pmbot.panel_view import PanelView
+
+    v = PanelView(symbol="BTC",
+                  strategy_state="策略状态: momentum 基准 77,200.01 偏离 +0.032%")
+    rendered = _render(multi_panel._card(v, True, None))
+    assert "$77,224.71" in rendered

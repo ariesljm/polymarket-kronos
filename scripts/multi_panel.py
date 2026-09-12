@@ -185,17 +185,28 @@ def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
     body: list = []
 
     # 行1：现货价 + 窗口内偏离 + 涨/跌盘口
+    # 现货价优先取 bot 写入 status["spot"] 的全精度 WS 价——反解策略展示文案
+    # 仅有 0.001% 量化台阶（BTC≈0.77 美元），安静时段看起来"价格不动"；
+    # 偏离% 仍是文案反推（窗口偏离 = 穿越信号语义，与价格精度无关）。
     l1 = Text()
-    spot = parse_strategy_spot(v.strategy_state)
-    if spot:
-        price, dev = spot
+    parsed_s = parse_strategy_spot(v.strategy_state)  # (价格, 偏离%)
+    dev = parsed_s[1] if parsed_s else None
+    spot_snap = v.spot or {}
+    price = spot_snap.get("price") if spot_snap.get("price") is not None else (
+        parsed_s[0] if parsed_s else None)
+    if price is not None:
         l1.append(Text(_fmt_price(price), style="bold cyan"))
-        l1.append(Text(
-            f" {'▲' if dev >= 0 else '▼'}{abs(dev):.2f}%",
-            style="green" if dev >= 0 else "red",
-        ))
+        if dev is not None:
+            l1.append(Text(
+                f" {'▲' if dev >= 0 else '▼'}{abs(dev):.2f}%",
+                style="green" if dev >= 0 else "red",
+            ))
     else:
         l1.append(Text("$—", style="dim"))
+    # 币安 feed 年龄（>2s 才提示：静默断流在卡片上可见，不靠肉眼看价格僵死）
+    age = spot_snap.get("age")
+    if age is not None and age > 2.0:
+        l1.append(Text(f" ⚠币安{age:.0f}s前", style="yellow" if age < 5 else "red"))
     prices = v.prices or {}
     up = prices.get("up_ask")
     down = prices.get("down_ask")

@@ -306,7 +306,9 @@ def build_view(status: TradeState | None, trades: list,
             v.startup_wait_sec = status.skip_until_sec - now_sec
         v.live_positions = status.live_positions or []
         v.config_summary = panel.config_summary
-        v.spot = panel.spot
+        # 现货价快照：优先 bot 实时写入的 status["spot"]（全精度 WS 价），回落
+        # Web 控制台注入的 panel.spot（旧单标的 SpotPrice 轮询）
+        v.spot = getattr(status, "spot", None) or panel.spot
         v.balance = status.balance
         _fill_status_note(v, status, trades)
 
