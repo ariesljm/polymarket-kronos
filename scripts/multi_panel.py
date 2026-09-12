@@ -323,16 +323,33 @@ def _history_table(records_by_dir: dict[str, list], max_rows: int = 12) -> Table
     return table
 
 
-def _deploy_line(amount: float, symbols: int, per_dir_trades: dict[str, list]) -> Text:
-    """底部汇总行：投入 / 累计盈亏 / 胜率 / 统计门限。"""
+def _deploy_line(amount: float, symbols: int, per_dir_trades: dict[str, list],
+                 views: list[PanelView], mode: str) -> Text:
+    """底部汇总行：实盘=钱包余额 + 今日盈亏（按钱包差额）；dry-run=投入；累计/胜率共用。
+
+    余额/day_start 经 build_view 从状态读（wallet 30s 刷新，live only）；
+    dry-run 无真实余额（SimExecutor 余额委托真实钱包，未配置时 None）→ 保持投入文案。
+    """
     all_trades = [t for ts in per_dir_trades.values() for t in ts]
     n = len(all_trades)
     total = sum(t.pnl for t in all_trades)
     wins = sum(1 for t in all_trades if t.pnl > 0)
     t_val = _t_stat(all_trades)
 
-    t = Text("投入 ", style="dim")
-    t.append(f"${amount * symbols:,.0f}  ", style="bold")
+    t = Text()
+    if mode == "live":
+        bal = next((v.balance for v in views if v.balance is not None), None)
+        t.append("余额 ", style="dim")
+        t.append(Text(f"${bal:,.2f}" if bal is not None else "$—",
+                      style="bold green" if bal else "dim"))
+        # 今日盈亏：各标交易聚合求和（与卡片同口径；live 钱包是全局的，6 标的 status 同值）
+        if views:
+            t.append("  今日 ")
+            t.append(_pnl_text(sum(v.today_pnl for v in views)))
+            t.append(Text("（按交易）", style="dim"))
+    else:
+        t.append("投入 ", style="dim")
+        t.append(f"${amount * symbols:,.0f}  ", style="bold")
     t.append("  累计 ")
     t.append(_pnl_text(total))
     t.append(f"  胜率 {wins / n:.0%}" if n else "  胜率 —", style="dim")
@@ -413,7 +430,8 @@ def main(argv: list[str] | None = None) -> int:
             _checks += 1
             # cfg 一次加载复用（build_live_view 不再每标的每 2s 重复解析 config.yaml）
             views = build_multi_view(paths_list, str(ROOT / "config.yaml"), cfg=cfg_loaded)
-            per_dir_trades = {d: load_records(ROOT / d) for d in dirs}
+            # 按标的过滤（api 流水是全钱包的，不过滤聚合会每笔 ×N 重复）
+            per_dir_trades = {d: load_records(ROOT / d, symbol=Path(d).name.upper()) for d in dirs}
             online_flags = [_is_online(ROOT / d) for d in dirs]
 
             # 高度预算：固定开销(边框/标题/配置/分隔/表头/汇总/状态/操作) + 卡片行数,
@@ -431,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             body.renderables.append(_history_table(per_dir_trades, max_rows))
-            body.renderables.append(_deploy_line(amount, symbols, per_dir_trades))
+            body.renderables.append(_deploy_line(amount, symbols, per_dir_trades, views, mode))
             body.renderables.append(Text("─" * max(10, console.width - 4), style="dim"))
             body.renderables.append(_status_bar(views, online_flags))
             body.renderables.append(Text("Ctrl-C 停止 bot 并退出", style="dim"))

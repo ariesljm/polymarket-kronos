@@ -80,24 +80,33 @@ def records_from_csv(path: str | Path) -> list[TradeRecord]:
     return records
 
 
-def load_records(data_dir: str | Path) -> list[TradeRecord]:
+def load_records(data_dir: str | Path, symbol: str | None = None) -> list[TradeRecord]:
     """统一读面：返回 TradeRecord 列表（api 流水配对优先，引擎记录回退）。
 
     判据唯一：api_trades.csv 存在且含数据行（同步中断/半写会留下空表头，
     此时回退 trades.csv 的完整引擎业务记录）才优先；否则回退 trades.csv；
     两者都不存在返回 []。
+
+    symbol: 按标的过滤（api 流水是全钱包的——live 下每个标的目录都同步了
+    同一份全钱包 api_trades.csv，不过滤会把其它标的的交易混入本标的视图：
+    单标的面板串标、多标的聚合每笔 ×N 重复。None = 不过滤）。
     """
     data_dir = Path(data_dir)
     api = data_dir / "api_trades.csv"
+    recs: list[TradeRecord] = []
     if api.is_file():
         with open(api, encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         if rows:
-            return build_records(rows)
-    trades = data_dir / "trades.csv"
-    if trades.is_file():
-        return records_from_csv(trades)
-    return []
+            recs = build_records(rows)
+    if not recs:
+        trades = data_dir / "trades.csv"
+        if trades.is_file():
+            recs = records_from_csv(trades)
+    if symbol:
+        want = symbol.upper()
+        recs = [r for r in recs if r.symbol.upper() == want]
+    return recs
 
 
 def build_records(rows: list[dict]) -> list["TradeRecord"]:

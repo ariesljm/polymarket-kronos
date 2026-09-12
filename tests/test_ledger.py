@@ -68,6 +68,34 @@ def test_load_records_empty_dir(tmp_path):
     assert load_records(tmp_path) == []
 
 
+def test_load_records_filters_by_symbol(tmp_path):
+    """api 流水是全钱包的（live 每标的目录同步同一份）→ symbol 过滤只留本标的。
+
+    不过滤曾让单标的视图串入其它标的交易、多标的聚合每笔 ×N 重复
+    （实盘上线前检查发现：6 个标的目录各一份全钱包 api_trades.csv）。
+    """
+    api_rows = [
+        {"ts": 100, "type": "trade", "side": "BUY", "size": 2, "price": 0.5,
+         "usdc_size": 1.04, "condition_id": "c-eth", "title": "t",
+         "slug": "eth-updown-5m-100", "outcome": "Up", "tx_hash": "b1"},
+        {"ts": 200, "type": "redeem", "side": "", "size": 2, "price": "",
+         "usdc_size": 2.0, "condition_id": "c-eth", "title": "t",
+         "slug": "eth-updown-5m-100", "outcome": "Up", "tx_hash": "r1"},
+        {"ts": 300, "type": "trade", "side": "BUY", "size": 2, "price": 0.5,
+         "usdc_size": 1.04, "condition_id": "c-btc", "title": "t",
+         "slug": "btc-updown-5m-300", "outcome": "Down", "tx_hash": "b2"},
+        {"ts": 400, "type": "redeem", "side": "", "size": 2, "price": "",
+         "usdc_size": 2.0, "condition_id": "c-btc", "title": "t",
+         "slug": "btc-updown-5m-300", "outcome": "Down", "tx_hash": "r2"},
+    ]
+    _write_csv(tmp_path / "api_trades.csv", ["ts", "type", "side", "size", "price",
+                                             "usdc_size", "condition_id", "title", "slug", "outcome", "tx_hash"], api_rows)
+    assert len(load_records(tmp_path)) == 2  # 全钱包：两个标的都不过滤
+    eth = load_records(tmp_path, symbol="ETH")
+    assert [r.symbol for r in eth] == ["ETH"]
+    assert load_records(tmp_path, symbol="DOGE") == []  # 无该标的流水
+
+
 def test_load_records_empty_api_file(tmp_path):
     """api_trades.csv 只有表头（同步中断半写）→ 回退 trades.csv 的完整业务记录。
 

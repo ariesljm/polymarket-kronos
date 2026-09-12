@@ -46,3 +46,26 @@ def test_history_table_ts_is_local_not_utc(tmp_path):
     assert local in rendered
     if local != utc_slice:  # 非 UTC 时区：必须与 UTC 串不同，才算真的转换过
         assert utc_slice not in rendered
+
+
+def test_deploy_line_live_shows_wallet_balance():
+    """实盘底部汇总：显示钱包余额 + 今日盈亏（与卡片同口径），不再显示假投入。"""
+    from pmbot.panel_view import PanelView
+
+    views = [
+        PanelView(symbol="ETH", balance=100.5, today_pnl=0.55),
+        PanelView(symbol="BTC", balance=100.5, today_pnl=-0.11),
+    ]
+    rendered = _render(multi_panel._deploy_line(1.0, 2, {}, views, "live"))
+    assert "$100.50" in rendered
+    assert "今日" in rendered and "按交易" in rendered
+    assert "投入" not in rendered  # 实盘不再用 amount×symbols 冒充投入
+
+
+def test_deploy_line_dry_run_shows_invested():
+    """dry-run 无真实余额（委托真实钱包查询，未配凭证为 None）→ 保持投入文案。"""
+    from pmbot.panel_view import PanelView
+
+    views = [PanelView(symbol="ETH"), PanelView(symbol="BTC")]
+    rendered = _render(multi_panel._deploy_line(1.0, 6, {}, views, "dry-run"))
+    assert "投入" in rendered and "$6" in rendered

@@ -447,11 +447,12 @@ def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
         book = _read_book_prices(paths.log_dir)
         if book is not None:
             st.market_prices = book
+    symbol = symbol or (st.symbol if st else None)
     from pmbot.ledger import load_records
 
-    trades = load_records(paths.data_dir)
-
-    symbol = symbol or (st.symbol if st else None)
+    # 按标的过滤：api 流水是全钱包的（live 下每标的目录同步同一份 api_trades.csv），
+    # 不过滤则单标的视图串入其它标的交易、多标的聚合每笔 ×N 重复
+    trades = load_records(paths.data_dir, symbol=symbol)
     from pmbot.config import load_config
 
     model_variant = "—"
