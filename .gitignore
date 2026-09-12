@@ -13,3 +13,6 @@ data_live/
 data_*/
 src/logs/
 .scratch/proxy_probe/
+.scratch/*.txt
+.scratch/*.csv
+.scratch/*.log
