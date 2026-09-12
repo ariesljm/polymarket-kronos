@@ -86,6 +86,9 @@ class FakeExecutor:
         self.settle_proceeds_value = None
         self.live_positions_value = None
         self.market_buy_exc = None  # 非 None 时 market_buy 抛出（模拟服务端拒单）
+        self.last_max_price = None  # 最近一次买单调用的保护价（验证闸门上限透传）
+        self.last_min_price = None  # 最近一次卖单调用的保护价
+        self.warmed = []            # warmup 收到的 token 集合
         self._sampler = None
 
     @property
@@ -103,7 +106,8 @@ class FakeExecutor:
         self.calls.append(("cancel", order_id))
         return True
 
-    def market_sell(self, token_id, size):
+    def market_sell(self, token_id, size, min_price=None):
+        self.last_min_price = min_price
         self.calls.append(("sell", token_id, size))
         return Fill(order_id="sell-oid", avg_price=self.best_bid_value)
 
@@ -113,7 +117,8 @@ class FakeExecutor:
     def settle_proceeds(self, condition_id):
         return self.settle_proceeds_value
 
-    def market_buy(self, token_id, amount):
+    def market_buy(self, token_id, amount, max_price=None):
+        self.last_max_price = max_price
         self.calls.append(("market_buy", token_id, amount))
         if self.market_buy_exc is not None:
             raise self.market_buy_exc
@@ -121,6 +126,9 @@ class FakeExecutor:
         if ask is None:
             return None
         return Fill(order_id="sim-mk", avg_price=ask, filled_size=amount / ask)
+
+    def warmup(self, token_ids):
+        self.warmed.append(list(token_ids))
 
     def best_bid(self, token_id, size=5.0):
         return self.best_bid_value
@@ -733,7 +741,7 @@ def test_sell_failure_keeps_position(tmp_path):
     """市价卖出失败（网络/已结算 token 失效）→ 保留持仓，不崩 tick。"""
 
     class FailSell(FakeExecutor):
-        def market_sell(self, token_id, size):
+        def market_sell(self, token_id, size, min_price=None):
             raise RuntimeError("balance 0")
 
     ex = FailSell()
@@ -1395,7 +1403,7 @@ def test_start_skips_in_progress_window(tmp_path):
 def test_settle_pnl_uses_settle_price(tmp_path):
     """结算（窗口到期自动兑付）盈亏 = 真实兑付到账 − 成本（V2 无手续费：兑付额 = size×1.0）。"""
     class FeeExecutor(BalanceExecutor):
-        def market_buy(self, token_id, amount):
+        def market_buy(self, token_id, amount, max_price=None):
             return Fill(order_id="mk-1", avg_price=0.57, filled_size=1.754384)
 
     ex = FeeExecutor(balance=8.788843)

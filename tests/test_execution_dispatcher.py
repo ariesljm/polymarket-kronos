@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from pmbot.engine import AutoTuneOverride
 from pmbot.execution_dispatcher import ExecutionDispatcher
+from pmbot.executor_protocols import MIN_TICK_PRICE
 from pmbot.state import TradeState
 from pmbot.types import Action, ActionType, Direction, Fill, Position
 
@@ -101,6 +102,63 @@ def _market():
 
 def _place():
     return Action(ActionType.PLACE_MARKET, direction=Direction.UP, amount=1.0)
+
+
+def test_exec_passes_gate_cap_as_protection_price():
+    """闸门上限透传为市价单保护价：下单瞬间盘口若已极化到上限之上，FOK 直接拒单
+    （宁错过不追高），而非照极化价成交。"""
+    seen = {}
+
+    def buy(token_id, amount, max_price=None):
+        seen["max_price"] = max_price
+        return Fill(order_id="o1", avg_price=0.50, filled_size=2.0)
+
+    disp, _ = make_dispatcher(book=_book(0.50), trade=SimpleNamespace(market_buy=buy),
+                              min_entry=0.30, max_entry=0.60)
+    disp.state.window_start = 1780000000
+    disp.execute(_place(), _market(), 1780000000)
+    assert seen["max_price"] == 0.60
+
+
+def test_exec_no_cap_passes_no_protection_price():
+    """上限未配置（0）→ 不传保护价（None），保持 SDK 自动算吃穿价的行为。"""
+    seen = {}
+
+    def buy(token_id, amount, max_price=None):
+        seen["max_price"] = max_price
+        return Fill(order_id="o1", avg_price=0.50, filled_size=2.0)
+
+    disp, _ = make_dispatcher(book=_book(0.50), trade=SimpleNamespace(market_buy=buy))
+    disp.state.window_start = 1780000000
+    disp.execute(_place(), _market(), 1780000000)
+    assert seen["max_price"] is None
+
+
+def test_exec_sell_passes_min_tick_as_protection_price():
+    """平仓市价卖传最小 tick 作保护价：接受任何合法价（平仓只求成交），
+    与 SDK 自动算吃穿价等价，但省掉下单前的一次 get_order_book REST。"""
+    seen = {}
+
+    def sell(token_id, size, min_price=None):
+        seen["min_price"] = min_price
+        return Fill(order_id="s1", avg_price=0.80, filled_size=2.0)
+
+    disp, _ = make_dispatcher(trade=SimpleNamespace(market_sell=sell))
+    disp.state.position = make_pos(size=2.0)
+    disp.state.window_start = 1780000000
+    disp.execute(Action(ActionType.SELL, reason="take_profit"), _market(), 1780000000)
+    assert seen["min_price"] == MIN_TICK_PRICE
+
+
+def test_subscribe_sampler_warms_token_metadata():
+    """窗口订阅时预热下单客户端 token 元数据（每窗口 token 新 → 否则每笔首单
+    都要在下单关键路径上多花 2 次 REST）。"""
+    warmed = []
+    sampler = SimpleNamespace(subscribe=lambda tokens, direction_map=None: None)
+    trade = SimpleNamespace(warmup=lambda tokens: warmed.append(list(tokens)))
+    disp, _ = make_dispatcher(trade=trade, book=SimpleNamespace(sampler=sampler))
+    disp.subscribe_sampler(_market())
+    assert warmed == [["Y", "N"]]
 
 
 def test_exec_gate_rejects_ask_above_cap():

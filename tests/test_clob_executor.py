@@ -3,6 +3,7 @@
 import pytest
 
 from pmbot.clob_executor import BOOK_REST_TIMEOUT_SEC, ClobExecutor, SimExecutor
+from pmbot.executor_protocols import MIN_TICK_PRICE
 from pmbot.executor_protocols import min_shares_for_price
 
 
@@ -434,3 +435,85 @@ def test_fetch_book_timeout_passed_to_requests(monkeypatch):
     monkeypatch.setattr("requests.get", fake_get)
     ex.fetch_book("123", timeout=1.5)
     assert seen["timeout"] == 1.5
+
+
+class _OrderArgsRecorder:
+    """记录 create_and_post_market_order 收到的 order_args.price。"""
+
+    def __init__(self):
+        self.price = "unset"
+
+    def create_and_post_market_order(self, order_args=None, options=None, **kw):
+        self.price = order_args.price
+        return None  # 无响应 → 调用方返回 None（只验参数透传）
+
+
+def test_market_buy_passes_protection_price(monkeypatch):
+    """买入保护价透传到市价单（0 = 不传，SDK 自动算吃穿价）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    client = _OrderArgsRecorder()
+    monkeypatch.setattr(ex, "_get_client", lambda: client)
+    ex.market_buy("tok", 1.0, max_price=0.60)
+    assert client.price == 0.60
+    ex.market_buy("tok", 1.0)
+    assert client.price == 0.0
+
+
+def test_market_sell_passes_protection_price(monkeypatch):
+    """卖出保护价透传到市价单（平仓传最小 tick = 接受任何合法价）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    client = _OrderArgsRecorder()
+    monkeypatch.setattr(ex, "_get_client", lambda: client)
+    ex.market_sell("tok", 5.0, min_price=MIN_TICK_PRICE)
+    assert client.price == MIN_TICK_PRICE
+
+
+def test_warmup_calls_tick_size_per_token(monkeypatch):
+    """预热对每个 token 调 get_tick_size（内部填 __ensure_market_info_cached）。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    seen = []
+
+    class FakeClient:
+        def get_tick_size(self, tid):
+            seen.append(tid)
+            return "0.01"
+
+    monkeypatch.setattr(ex, "_get_client", lambda: FakeClient())
+    ex.warmup(["a", "b"])
+    assert seen == ["a", "b"]
+
+
+def test_warmup_dedupes_repeated_tokens(monkeypatch):
+    """subscribe_sampler 在每 tick 路径上 → 同一 token 只实际请求一次。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    seen = []
+
+    class FakeClient:
+        def get_tick_size(self, tid):
+            seen.append(tid)
+            return "0.01"
+
+    monkeypatch.setattr(ex, "_get_client", lambda: FakeClient())
+    ex.warmup(["a", "b"])
+    ex.warmup(["a", "b"])
+    ex.warmup(["b", "c"])
+    assert seen == ["a", "b", "c"]
+
+
+def test_warmup_is_silent_on_failure(monkeypatch):
+    """预热失败静默：凭证未就绪或单 token 失败不得阻断窗口订阅。"""
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+
+    def boom():
+        raise RuntimeError("no creds")
+
+    monkeypatch.setattr(ex, "_get_client", boom)
+    ex.warmup(["a"])  # 不抛
+
+
+def test_sim_market_buy_respects_protection_price(monkeypatch):
+    """dry-run 保护价拒绝语义与实盘一致（不因未模拟而高估成交率）。"""
+    ex = SimExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "best_ask", lambda t, size=5.0: 0.90)
+    assert ex.market_buy("tok", 1.0, max_price=0.60) is None  # 越界拒单
+    assert ex.market_buy("tok", 1.0) is not None              # 不传保护价 → 成交

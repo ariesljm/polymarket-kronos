@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from pmbot.executor_protocols import MarketBook, TradeExecutor, shares_for_amount
+from pmbot.executor_protocols import MIN_TICK_PRICE, MarketBook, TradeExecutor, shares_for_amount
 from pmbot.entry_gate import resolve
 from pmbot.market_discovery import MarketInfo
 from pmbot.state import StateStore, TradeState
@@ -197,7 +197,9 @@ class ExecutionDispatcher:
             return
         target_size = shares_for_amount(action.amount, ask)
         try:
-            filled = self.trade.market_buy(token, action.amount)
+            # 保护价 = 闸门上限：下单瞬间盘口若已极化到上限之上，FOK 直接拒单
+            # （宁错过不追高）；同时省掉 SDK 拉盘口算吃穿价的一次 REST。
+            filled = self.trade.market_buy(token, action.amount, max_price=gate.max_price or None)
         except Exception as e:
             # 服务端拒单（最小单量 / 余额不足 / 合规等）：必须走同一冷却，否则
             # 异常路径不设 retry_until_sec → 信号不变时每 tick（1s）重复下单刷屏。
@@ -246,7 +248,9 @@ class ExecutionDispatcher:
             return
         token = token_for(market, pos.direction)
         try:
-            fill = self.trade.market_sell(token, pos.size)
+            # 平仓只求成交：显式传最小 tick 作保护价（= 接受任何合法价，与 SDK
+            # 自动算吃穿价等价），但跳过 SDK 的 get_order_book 一次 REST。
+            fill = self.trade.market_sell(token, pos.size, min_price=MIN_TICK_PRICE)
         except Exception:
             logger.warning("市价卖出失败（%s %s %.4f 股），保留持仓等待下一 tick",
                            token[:16], pos.direction.value, pos.size)
@@ -343,5 +347,8 @@ class ExecutionDispatcher:
                 [market.yes_token_id, market.no_token_id],
                 direction_map={market.yes_token_id: "up", market.no_token_id: "down"},
             )
+        # 下单客户端 token 元数据预热：每窗口 token 都新，缓存永不命中（每窗口最多
+        # 1 笔 → 每笔都是首单），预热把下单前的 2 次 REST 移到窗口订阅时。
+        self.trade.warmup([market.yes_token_id, market.no_token_id])
         if user_stream is not None:
             user_stream.subscribe_markets([market.condition_id])

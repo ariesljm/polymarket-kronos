@@ -100,3 +100,25 @@ def test_btc_filter_skipped_when_btc_price_missing():
     s._btc_base = 100.0
     sig = s.generate_signal()
     assert sig.direction is Direction.UP
+
+
+def test_status_text_base_precision_survives_panel_roundtrip():
+    """基准价经面板反推后仍准确（回归：`{:.1f}` 把 DOGE 0.0838 截成 0.1，误差 19%）。
+
+    面板用 parse_strategy_spot（基准×(1+偏离)）反推现货价，故状态文案的基准
+    必须有足够有效数字；固定 1 位小数时低价币不仅误差大，且价格在其量级内
+    怎么动都格式化回同一个串 → 面板价格看起来长期不变。
+    """
+    from pmbot.panel_view import parse_strategy_spot
+
+    for price in (0.08384, 1.3514, 99.76, 77242.95):
+        s = make_strategy(
+            symbol="DOGE",
+            fetch_price=lambda p=price: p,
+            fetch_window_open=lambda p=price: p,   # 基准=最新价 → 偏离 0
+        )
+        s.generate_signal()
+        parsed = parse_strategy_spot(s.status_text())
+        assert parsed is not None, s.status_text()
+        # 反推误差须远小于 0.08% 穿越阈值
+        assert abs(parsed[0] - price) / price < 1e-4, f"{price} → {parsed[0]}"
