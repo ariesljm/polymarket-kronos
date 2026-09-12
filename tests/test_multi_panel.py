@@ -69,3 +69,21 @@ def test_deploy_line_dry_run_shows_invested():
     views = [PanelView(symbol="ETH"), PanelView(symbol="BTC")]
     rendered = _render(multi_panel._deploy_line(1.0, 6, {}, views, "dry-run"))
     assert "投入" in rendered and "$6" in rendered
+
+
+def test_countdown_bar_color_scales_with_remaining():
+    """倒计时颜色随剩余比例变：>50% 绿、20-50% 黄、<20% 红（接近禁入）。"""
+    from pmbot.panel_view import PanelView
+
+    # 5m 窗口，剩 240s（80%）→ 绿
+    green = _render(multi_panel._countdown_bar(
+        [PanelView(symbol="ETH", window_remaining_sec=240)], "5m"))
+    assert "04:00" in green and "█" in green
+    # 剩 90s（30%）→ 黄
+    yellow = _render(multi_panel._countdown_bar(
+        [PanelView(symbol="ETH", window_remaining_sec=90)], "5m"))
+    assert "01:30" in yellow
+    # 剩 30s（10%）→ 红（接近禁入）
+    red = _render(multi_panel._countdown_bar(
+        [PanelView(symbol="ETH", window_remaining_sec=30)], "5m"))
+    assert "00:30" in red

@@ -79,25 +79,44 @@ def _is_online(data_dir: str | Path) -> bool:
 
 # ---- 渲染 ----
 
-def _title_bar(views: list[PanelView], mode: str, interval: str) -> Table:
-    """标题栏：程序名 | 市场描述 | 右侧统一窗口信息（三个标的同时刻,只显示一次）。"""
-    win = "窗口 — 剩 —"
-    if views:
-        label = views[0].window_label  # "09-05 16:40-16:45"
-        rem = views[0].window_remaining_sec
-        rem_txt = f"{rem // 60}分{rem % 60:02d}秒" if rem is not None else "—"
-        win = f"窗口 {label} 剩 {rem_txt}"
+def _title_bar(views: list[PanelView], mode: str, interval: str) -> Text:
+    """标题行：PMBOT + 市场描述 + 模式 + 窗口范围（倒计时移到独立视觉行）。"""
     t = Text("PMBOT", style="bold white")
     t.append("  ", style="dim")
     t.append(f"Polymarket {interval} 涨跌 momentum", style="cyan")
-    t.append(f"  {'实盘' if mode == 'live' else 'dry-run 模拟'}",
+    t.append(f"  {'🔴 实盘' if mode == 'live' else '🟡 模拟'}",
              style="bold red" if mode == "live" else "bold yellow")
-    right = Text(win, style="dim")
-    bar = Table(expand=True, box=None, pad_edge=False, show_edge=False, padding=0, show_header=False)
-    bar.add_column(justify="left", no_wrap=True)
-    bar.add_column(justify="right", no_wrap=True, min_width=24)
-    bar.add_row(t, right)
-    return bar
+    if views:
+        t.append(f"    窗口 {views[0].window_label}", style="dim")
+    return t
+
+
+def _countdown_bar(views: list[PanelView], interval: str = "5m") -> Text:
+    """窗口倒计时视觉锚点：大字剩分秒 + 进度条，颜色随剩余比例变。
+
+    绿（>50%）/ 黄（20-50%）/ 红（<20%，接近 no_entry_before_end_sec=60s 禁入阈值）——
+    进度条按 window_remaining_sec / 窗口总长 比例填充，一跟看到窗口还剩多少。
+    """
+    if not views or views[0].window_remaining_sec is None:
+        return Text("⏱ 窗口 —", style="dim")
+    win = {"5m": 300, "15m": 900, "1h": 3600}.get(interval, 300)
+    rem = views[0].window_remaining_sec
+    ratio = max(0.0, min(1.0, rem / win)) if win else 0.0
+    if ratio > 0.5:
+        color = "green"
+    elif ratio > 0.2:
+        color = "yellow"
+    else:
+        color = "bold red"
+    m, s = divmod(rem, 60)
+    bar_len = 36
+    filled = int(bar_len * ratio)
+    t = Text("⏱ 剩 ", style="dim")
+    t.append(f"{m:02d}:{s:02d}  ", style=f"bold {color}")
+    t.append(Text("█" * filled, style=color))
+    t.append(Text("░" * (bar_len - filled), style="dim"))
+    t.append(f"  {ratio*100:>3.0f}%", style=color)
+    return t
 
 
 def _cfg_line(symbols: int, interval: str, amount: float,
@@ -411,14 +430,15 @@ def main(argv: list[str] | None = None) -> int:
             per_dir_trades = {d: load_records(ROOT / d, symbol=Path(d).name.upper(), source="engine") for d in dirs}
             online_flags = [_is_online(ROOT / d) for d in dirs]
 
-            # 高度预算：固定开销(边框/标题/配置/分隔/表头/汇总/状态/操作) + 卡片行数,
+            # 高度预算：固定开销(边框/标题/倒计时/配置/分隔/表头/汇总/状态/操作) + 卡片行数,
             # 剩余全部给交易历史（行数随终端高度自适应，不再固定 3 笔/标的）
             card_lines = ((len(views) + cards_per_row(console.width) - 1)
                           // cards_per_row(console.width)) * 4
-            max_rows = max(3, console.height - 11 - card_lines)
+            max_rows = max(3, console.height - 12 - card_lines)
 
             body = Group(
                 _title_bar(views, mode, interval),
+                _countdown_bar(views, interval),
                 _cfg_line(symbols, interval, amount, max_entry, views, online_flags),
                 Text("─" * max(10, console.width - 4), style="dim"),
                 _symbol_cards(views, threshold_pct, online_flags, console.width),
