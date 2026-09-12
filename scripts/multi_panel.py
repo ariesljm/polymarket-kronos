@@ -47,7 +47,6 @@ GATE_TRADES = 200  # 统计门限：样本量
 GATE_T = 1.96  # 统计门限：|t|
 
 console = Console()
-_checks = 0  # 刷新计数（底部状态栏 checks）
 
 
 # ---- 工具 ----
@@ -361,25 +360,6 @@ def _deploy_line(amount: float, symbols: int, per_dir_trades: dict[str, list],
     return t
 
 
-def _status_bar(views: list[PanelView], online_flags: list[bool]) -> Text:
-    """底部状态栏：检查次数 + 各标的涨跌价（映射 corridor-watch 的 [lock] checks）。"""
-    t = Text("[锁定]", style="bold yellow")
-    t.append(f"  检查 {_checks:,}", style="dim")
-    for v, on in zip(views, online_flags):
-        prices = v.prices or {}
-        up = prices.get("up_ask")
-        spot = parse_strategy_spot(v.strategy_state)
-        if not on:
-            t.append(Text(f"  {v.symbol or '?'} 离线", style="red"))
-            continue
-        t.append(Text(f"  {v.symbol or '?'} ", style="bold"))
-        if up is not None:
-            t.append(Text(f"涨{fmt_cents(up)}¢", style="green"))
-        if spot:
-            t.append(Text(f" {spot[1]:+.2f}%", style="dim"))
-    return t
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="多标的聚合面板")
     parser.add_argument(
@@ -424,10 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         threshold_pct = getattr(cfg_loaded, "threshold_pct", 0.08)
         max_entry = getattr(cfg_loaded, "max_entry_price", 0.65)
 
-    global _checks
     with Live(refresh_per_second=1 / REFRESH_SEC, screen=False, console=console) as live:
-        while True:
-            _checks += 1
             # cfg 一次加载复用（build_live_view 不再每标的每 2s 重复解析 config.yaml）
             views = build_multi_view(paths_list, str(ROOT / "config.yaml"), cfg=cfg_loaded)
             # 按标的过滤（api 流水是全钱包的，不过滤聚合会每笔 ×N 重复）
@@ -451,7 +428,6 @@ def main(argv: list[str] | None = None) -> int:
             body.renderables.append(_history_table(per_dir_trades, max_rows))
             body.renderables.append(_deploy_line(amount, symbols, per_dir_trades, views, mode))
             body.renderables.append(Text("─" * max(10, console.width - 4), style="dim"))
-            body.renderables.append(_status_bar(views, online_flags))
             body.renderables.append(Text("Ctrl-C 停止 bot 并退出", style="dim"))
 
             frame = Panel(body, border_style="blue", padding=(0, 1))
