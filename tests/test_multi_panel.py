@@ -143,12 +143,21 @@ def test_card_prefers_spot_snapshot_over_strategy_quantized():
 
 
 def test_card_shows_ticker_staleness_warning():
-    """币安 feed 静默（age>2s）在卡片上可见，不靠肉眼看价格僵死。"""
+    """币安 feed 静默在卡片上可见，不靠肉眼看价格僵死。
+
+    阈值：>5s 黄（稀疏标的正常推送间隔 2-5s，2s 阈值会频繁误报）、≥10s 红。
+    """
     from pmbot.panel_view import PanelView
 
-    v = PanelView(symbol="BTC", spot={"price": 77_000.0, "delta": 0.0, "age": 6.7})
-    rendered = _render(multi_panel._card(v, True, None))
-    assert "⚠币安7s前" in rendered
+    # 稀疏标的正常间隔（2-5s）不提示，防误报刷屏
+    quiet = PanelView(symbol="DOGE", spot={"price": 0.085, "delta": 0.0, "age": 3.5})
+    assert "⚠币安" not in _render(multi_panel._card(quiet, True, None))
+    # 超过 5s：黄色提示
+    late = PanelView(symbol="BTC", spot={"price": 77_000.0, "delta": 0.0, "age": 6.7})
+    assert "⚠币安7s前" in _render(multi_panel._card(late, True, None))
+    # 超过 10s：红色（真卡死，REST 兜底已接管 5s）
+    stuck = PanelView(symbol="BTC", spot={"price": 77_000.0, "delta": 0.0, "age": 12.0})
+    assert "⚠币安12s前" in _render(multi_panel._card(stuck, True, None))
 
 
 def test_card_falls_back_to_strategy_price_without_spot():

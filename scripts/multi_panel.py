@@ -203,10 +203,11 @@ def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
             ))
     else:
         l1.append(Text("$—", style="dim"))
-    # 币安 feed 年龄（>2s 才提示：静默断流在卡片上可见，不靠肉眼看价格僵死）
+    # 币安 feed 年龄（>5s 才提示：稀疏标的（DOGE/XRP/BNB/SOL）正常推送间隔就有
+    # 2-5s，2s 阈值会把正常节流当异常闪黄；红 ≥10s = 真卡死（REST 兜底已介入）
     age = spot_snap.get("age")
-    if age is not None and age > 2.0:
-        l1.append(Text(f" ⚠币安{age:.0f}s前", style="yellow" if age < 5 else "red"))
+    if age is not None and age > 5.0:
+        l1.append(Text(f" ⚠币安{age:.0f}s前", style="yellow" if age < 10 else "red"))
     prices = v.prices or {}
     up = prices.get("up_ask")
     down = prices.get("down_ask")
