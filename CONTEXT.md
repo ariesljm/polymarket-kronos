@@ -13,7 +13,7 @@ Polymarket 加密货币涨跌（Up/Down）策略交易框架：策略信号（St
 - **挂单（pending order）** — `PendingOrder`：未成交限价单（方向/价/股数/order_id）。与"持仓"是互斥状态。当前策略市价入场不产生新挂单；pending 仅保留兼容旧状态恢复/WS 成交确认路径。
 - **决策（Action）** — 决策引擎输出：`PLACE_MARKET / CANCEL / SELL / SKIP / PAUSE`，含 reason（take_profit / stop_loss / time_stop / settle 等）。
 - **熔断（circuit breaker）** — 连亏 N 笔或单日亏 N USDC 自动暂停；人工改 status.json `paused=false` 恢复并清零计数。判定/文案单一事实源 `engine.circuit_breaker`（纯函数，(reason_key, 文案) | None）：tick 与决策引擎共用，`ExecutionDispatcher._exec_pause` 也消费同一 `BREAKER_MESSAGES`（写入 pause_reason 不再自拼短文案）。恢复侧对称事实源 `TradeState.clear_breaker()`：resume 指令分支与人工恢复分支共用清零清单（paused/was_paused/连亏/日亏/pause_reason）。
-- **引擎级兜底（engine-level fallback）** — TradingLoop 负责的跨窗口关注点（日界/熔断/窗口切换/跨窗口撤单/结算兜底），与单窗口生命周期逻辑分离。结算兜底序列收敛于 `_settle_expired(now_sec, defer_only=)`（defer 转待结算槽 + Settler 推进一处定义）：tick 前置检查走完整推进，窗口切换分支 defer_only=True 只转槽不重复查询（步骤1 已推进过同一 settle_pending）。单窗口的成交检测/决策/执行/落盘委托 ExecutionDispatcher（执行分派器深模块），TradingLoop 退化为纯编排器。
+- **引擎级兜底（engine-level fallback）** — TradingLoop 负责的跨窗口关注点（日界/熔断/窗口切换/跨窗口撤单/结算兜底），与单窗口生命周期逻辑分离。结算兜底序列收敛于 `_defer_expired_position(now_sec, force=)` + `_advance_settlement(now_sec)`（defer 转待结算槽 + Settler 推进两处，原 `_settle_expired(defer_only=)` 已分拆）：tick 前置检查走完整推进（步骤1），窗口切换分支 force=True 只转槽不重复推进（步骤1 已推进过同一 settle_pending）。单窗口的成交检测/决策/执行/落盘委托 ExecutionDispatcher（执行分派器深模块），TradingLoop 退化为纯编排器。
 
 ### 决策引擎与视图
 
@@ -40,7 +40,7 @@ Polymarket 加密货币涨跌（Up/Down）策略交易框架：策略信号（St
 - **幽灵持仓（ghost position）** — 本地记录有持仓但 Polymarket 实际无该标的持仓（崩溃/强杀残留）：核对时清除并警告；**清除有宽限保护**（持仓窗口结束 + 180s 后仍无才判幽灵，防买入后 /positions 索引延迟误清）；反向（本地无但远端有）未跟踪持仓**自动接管**（slug 可解析窗口起点时，重建 position 恢复止损/结算管理；非 bot 市场格式只警告不接管）；查询失败不核对（防误清真实持仓）。
 - **盘口采样器（BookSampler）** — 高频盘口 WS 线程（REST 兜底），内存快照供执行器报价，book.json 落盘供面板 1s 级展示。
 - **用户流（UserStream）** — 认证 WS（订单/成交推送）→ 事件队列，主循环 tick drain。无凭证时空转。
-- **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/心跳应答/停止/4 钩子 + 订阅集合动态推送 `_push_subscriptions`：跨线程统一 `run_coroutine_threadsafe` 调度——`loop.create_task` 从非事件循环线程调用不是线程安全的曾致丢任务窗口）。新 WS 流应继承它而非复制样板。**心跳：应答不主动**——Polymarket 应用层心跳为服务端发 PING 文本、客户端回 PONG；客户端主动发 PING 被判非法（1008 policy violation，曾致盘口流 3 秒断连循环）。
+- **可重连 WS 线程（ReconnectingWsThread）** — 两个 WS 线程的公共骨架（指数退避重连/心跳/停止/兜底钩子 + 订阅集合动态推送 `_push_subscriptions`：跨线程统一 `run_coroutine_threadsafe` 调度——`loop.create_task` 从非事件循环线程调用不是线程安全的曾致丢任务窗口）。新 WS 流应继承它而非复制样板。**心跳：客户端主动每 10s 发 PING**——Polymarket Market/User Channel 官方规则：不发会被服务端 ~10s 后断开（曾“应答不主动、主动发 PING 非法 1008”为旧误判，实为当时频率/格式问题，已回退；`_answer_heartbeat` 保留双向兼容）。**断线兜底钩子 `_fallback_once`**：断线即时 + 重连等待期间按 `disconnect_poll_sec` 周期调用（BookSampler/SpotTickerThread 为 REST 轮询、UserStream 置断开标记）——曾以 `_on_disconnect`/`_while_disconnected` 双钩子表达同一意图，样板在子类间重复，收敛为单钩子。
 - **市场格式（slug/outcome）** — Polymarket 市场格式解析单一事实源在 `types.py`（window_start_from_slug / symbol_from_slug / direction_from_outcome）：曾把 slug `rsplit` 三处、outcome→方向映射两处当字符串手工处理。外部数据重建持仓走 `rebuilt_position` 工厂（entered_remaining_sec = 窗口剩余，负数截 0）：挂单成交 / API 成交 / 钱包接管三条路径共用。
 - **盘口定价（weighted_price / best_price）** — `book_price.py` 纯函数，单一事实源：按可成交量加权均价，**流动性不足返回 None**（宁缺毋滥，不显示误导价）。执行器与面板落盘必须共用，禁止本地复刻。
 - **盘口展示（book.json）** — 面板盘口单一来源：BookSampler 每 1s 落盘 book.json，monitor 只读它；tick 不再写 status.market_prices（曾是双写死工作，monitor 用 book.json 覆盖 status）。
@@ -49,7 +49,7 @@ Polymarket 加密货币涨跌（Up/Down）策略交易框架：策略信号（St
 
 ### 展示与验证
 
-- **监控面板（monitor）** — 只读 TUI，独立进程：从 `StateStore.load()` 读状态、trades.csv、book.json 构建视图。任何异常只显示不崩溃。展示逻辑（`build_view`/`render`/`PanelView`/`PanelConfig`）提取至 `panel_view.py` 深模块（纯函数 + 类型化视图，TUI 与 Web 控制台共用）；实时价轮询提取至 `spot_price.py`（`SpotPrice` 后台线程）。`monitor.py` 只负责 CLI 入口与 TUI/Web 渲染循环，无兼容 re-export（测试直接锚定 panel_view，防「改 panel_view 但旧路径仍绿」假安全感）。`build_view` 的展示配置（阈值/窗口长度/摘要/止盈止损/运行时长）经 `PanelConfig` 打包注入。
+- **监控面板（monitor）** — 只读 TUI，独立进程：从 `StateStore.load()` 读状态、trades.csv、book.json 构建视图。任何异常只显示不崩溃。展示逻辑（`build_view`/`render`/`PanelView`/`PanelConfig`）提取至 `panel_view.py` 深模块（纯函数 + 类型化视图，TUI 与 Web 控制台共用）；实时价轮询由 `spot_ticker.SpotTickerThread`（Binance WS + REST 兜底，原 `spot_price.SpotPrice` 已并入）。`monitor.py` 只负责 CLI 入口与 TUI/Web 渲染循环，无兼容 re-export（测试直接锚定 panel_view，防「改 panel_view 但旧路径仍绿」假安全感）。`build_view` 的展示配置（阈值/窗口长度/摘要/止盈止损/运行时长）经 `PanelConfig` 打包注入。
 - **展示视图（PanelView）** — `build_view` 输出的类型化视图：TUI render 属性访问（静态检查）；Web 控制台经 `asdict` 边界转换，字段名即 JSON 键名唯一出处。展示侧禁止魔法字符串键（ADR-0001 精神延伸）。
 - **运行路径（RuntimePaths）** — 数据目录派生单一事实源（status/trades/log_dir/pid_file/mode）：模拟 data/、实盘 data_live/；`paths_for(live, data_dir)` 工厂。
 - **协调状态（ProcessControl）** — monitor ↔ Web 控制台共享的进程协调（proc/show_tui/live/paths），替代裸 holder dict；模拟/实盘切换一次赋值（pc.paths 换新即全部跟随）。进程级操作也收敛于此：`spawn(config)`（按当前模式/数据目录拉起主循环）与 `loop_alive()`（读当前 pid 文件判存活），spawn_loop 模块函数在 paths.py，web_ui 只做 HTTP 路由。

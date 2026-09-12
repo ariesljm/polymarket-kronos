@@ -26,10 +26,10 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# 快照新鲜度阈值（秒）：快照年龄超过此值视为陈旧（断线/订阅失效/事件流停摆），
-# 消费方（best_ask/best_bid）与健康检查线程都会触发 REST 现拉刷新。
-# WS 正常时 price_change 秒级到达，age 远小于此值；1s 收紧后止盈/止损决策价
-# 最坏 ~1.5s 新鲜（REST 兜底 1s），避免 10s tick + 陈旧快照叠加的漏触发。
+# 快照新鲜度阈值（秒）：快照年龄超过此值视为陈旧（断线/订阅失效/事件流停摆）。
+# 仅健康观测用（connection_status / is_fresh / 健康检查 REST 刷新）——决策路径的
+# 新鲜度判定在 ClobExecutor.MAX_BOOK_AGE_SEC（见其注释：决策有意放宽到 3s 避免
+# 同步 REST 阻塞，两者语义不同，勿误以为同阈值应合并）。
 STALE_AGE_SEC = 1.0
 
 # REST 兜底失败退避（秒）：指数增长，上限 RETRY_MAX。市场已结算/无订单簿（404）
@@ -226,7 +226,7 @@ class BookSampler(ReconnectingWsThread):
     def _health_check(self) -> None:
         """WS 连接中：对快照缺失/陈旧的订阅 token 主动 REST 刷新。
 
-        断线期间跳过（_while_disconnected 已有 2s REST 兜底，避免重复查询）；
+        断线期间跳过（_fallback_once 已有 2s REST 兜底，避免重复查询）；
         健康检查覆盖的是 WS 显示连接但事件流不推/动态订阅失败的场景。
         """
         if self._connected_ws is None:
@@ -257,11 +257,8 @@ class BookSampler(ReconnectingWsThread):
         self._start_health()
         super().run()
 
-    def _on_disconnect(self) -> None:
-        self._rest_fallback()
-
-    def _while_disconnected(self) -> None:
-        # 重连等待期间每 2 秒 REST 刷新快照，面板盘口不因 WS 断开而陈旧
+    def _fallback_once(self) -> None:
+        # 断线即时 + 重连等待期间每 2 秒 REST 刷新快照，面板盘口不因 WS 断开而陈旧
         self._rest_fallback()
 
     async def _send_subscribe(self, ws: ClientConnection) -> None:
@@ -325,41 +322,8 @@ class BookSampler(ReconnectingWsThread):
                 if snap is None:
                     continue
                 _apply_price_change(snap, c)
-                # price_change 每条自带服务端权威 top-of-book（官方文档字段）；
-                # 存快照供 best_ask/best_bid 优先读——比本地档位排序更及时权威，零额外流量。
-                if c.get("best_bid") is not None:
-                    snap["best_bid"] = str(c["best_bid"])
-                if c.get("best_ask") is not None:
-                    snap["best_ask"] = str(c["best_ask"])
+                # 事件流心跳：刷新新鲜度（price_change 到达即证明事件流活着）
                 self._snapshot_ts[asset_id] = time.monotonic()
-
-    def best_ask(self, token_id: str) -> float | None:
-        """最优卖价：优先 WS 权威 best_ask（price_change 携带），缺失则档位加权。"""
-        snap = self.snapshot(token_id)
-        if snap is None:
-            return None
-        if snap.get("best_ask") is not None:
-            try:
-                return float(snap["best_ask"])
-            except (TypeError, ValueError):
-                pass
-        from pmbot.book_price import weighted_price
-
-        return weighted_price(snap, "asks", size=1.0)
-
-    def best_bid(self, token_id: str) -> float | None:
-        """最优买价：优先 WS 权威 best_bid（price_change 携带），缺失则档位加权。"""
-        snap = self.snapshot(token_id)
-        if snap is None:
-            return None
-        if snap.get("best_bid") is not None:
-            try:
-                return float(snap["best_bid"])
-            except (TypeError, ValueError):
-                pass
-        from pmbot.book_price import weighted_price
-
-        return weighted_price(snap, "bids", size=1.0)
 
     def _apply_tick_change(self, data: dict) -> None:
         """记录 tick size 变化（诊断用；当前 0.01 固定区间不消费）。"""

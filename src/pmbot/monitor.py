@@ -4,7 +4,7 @@
 数据只读自 status.json / trades.csv，不改主循环。
 
 展示逻辑（build_view / render / PanelView / PanelConfig）见 panel_view.py；
-实时价轮询见 spot_price.py；本模块只负责 CLI 入口与 TUI 渲染循环。
+实时价轮询见 spot_ticker.py（SpotTickerThread）；本模块只负责 CLI 入口与 TUI 渲染循环。
 """
 
 from __future__ import annotations

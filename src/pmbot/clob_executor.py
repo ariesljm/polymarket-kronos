@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 # 决策价可接受的最大快照年龄（秒）。WS 断线时 BookSampler 后台 REST 兜底 1s
 # 一轮，快照通常 ≤2s；放宽到 3s 使 "略陈旧" 不再触发同步 REST（那会在
 # 盘口秒级极化时错过整个入场窗口）。超过此值才现拉，且用短超时快速失败。
+# 注意：这是决策路径的新鲜度阈值，与 BookSampler 健康观测的 STALE_AGE_SEC
+# （1s，connection_status/is_fresh）语义不同——健康观测更严格、决策有意容忍
+# 以避免阻塞（见 executor_protocols.SamplerProto 注释）。
 MAX_BOOK_AGE_SEC = 3.0
 # 决策路径现拉盘口的超时（秒）：足够覆盖实测 0.7~1.3s 的正常往返，
 # 又不至于让一次卡顿拖死 tick。
@@ -61,6 +64,7 @@ class ClobExecutor:
         self._l1_client = None
         self._book_client = None
         self._sampler = sampler
+        self._warmed_tokens: set[str] = set()  # 已预热元数据的 token（防每 tick 重复）
 
     def _sampler_snapshot(self, token_id: str) -> dict | None:
         return self._sampler.snapshot(token_id) if self._sampler else None
@@ -330,8 +334,38 @@ class ClobExecutor:
         """限价卖出持仓（止盈/止损）。"""
         return self.place_limit(token_id, "sell", price, size)
 
-    def market_buy(self, token_id: str, amount: float) -> Fill | None:
+    def warmup(self, token_ids: list[str]) -> None:
+        """预热下单客户端的 token 元数据缓存（tick/fee/condition_id）。
+
+        py_clob_client 的 __ensure_market_info_cached 按 token 缓存，而 momentum
+        每窗口最多 1 笔、token 每窗口都新 → 每笔都是该 token 首单，缓存永远
+        未命中，下单前要额外 2 次 REST（GET_MARKET_BY_TOKEN + GET_CLOB_MARKET）。
+        窗口订阅时预热，把这两跳移出下单关键路径。失败静默（预热是优化，
+        不是下单前置条件——缺失时下单路径会自行拉取）。
+
+        调用方（subscribe_sampler）在每 tick 路径上，故用 _warmed_tokens 去重：
+        每个 token 只在窗口首个 tick 实际发请求。
+        """
+        try:
+            client = self._get_client()
+        except Exception:
+            return  # 凭证未就绪（未配置私钥/代理钱包）：跳过
+        for tid in token_ids:
+            if tid in self._warmed_tokens:
+                continue
+            try:
+                client.get_tick_size(tid)  # 内部触发 __ensure_market_info_cached
+                self._warmed_tokens.add(tid)
+            except Exception as e:
+                logger.debug("token 预热失败：%s: %s", tid[:16], e)
+
+    def market_buy(self, token_id: str, amount: float, max_price: float | None = None) -> Fill | None:
         """市价买入（FOK）。amount 为美元金额（SDK 语义：BUY=$$$）。
+
+        max_price: 显式保护价（最高可接受价）。不传时 SDK 自行拉盘口算
+        “吃满 amount 的最贵档价”——对小单 ≈ best ask，等于不设限（决策时
+        ≤cap、下单时已极化则照极化价成交）。传 entry_gate 上限，FOK 只在
+        ≤上限时成交（宁错过不追高），并省掉 SDK 的 get_order_book 一次 REST。
 
         返回 Fill（order_id/avg_price/filled_size）：优先取订单响应的
         averagePrice/matchedAmount，缺省时用 get_order 补查（以 API 为准，
@@ -347,6 +381,7 @@ class ClobExecutor:
                 amount=amount,  # BUY: 美元金额（SDK 语义）
                 side=Side.BUY,
                 order_type=OrderType.FOK,
+                price=max_price or 0.0,  # 0 = 不传，SDK 自动算吃穿价
             ),
             options=PartialCreateOrderOptions(),
         )
@@ -410,8 +445,12 @@ class ClobExecutor:
 
         return Fill(order_id=oid, avg_price=_f(avg), filled_size=_f(filled))
 
-    def market_sell(self, token_id: str, size: float) -> Fill | None:
+    def market_sell(self, token_id: str, size: float, min_price: float | None = None) -> Fill | None:
         """市价卖出持仓（FOK），返回 Fill（order_id/avg_price）。
+
+        min_price: 显式保护价（最低可接受价）。不传时 SDK 拉盘口算“吃穿到
+        size 的最低价”（对足量持仓 ≈ 不设限）；平仓只求成交，传 MIN_TICK_PRICE
+        即“接受任何合法价”，与自动行为等价但省掉 get_order_book 一次 REST。
 
         avg_price 为成交均价近似（响应字段 → 订单详情 price，卖单 making/taking
         方向反算）；取不到时回退 best_bid（0.0 为最后防御）。order_id 供
@@ -425,6 +464,7 @@ class ClobExecutor:
                 amount=size,  # SELL: 股数
                 side=Side.SELL,
                 order_type=OrderType.FOK,
+                price=min_price or 0.0,  # 0 = 不传，SDK 自动算吃穿价
             ),
             options=PartialCreateOrderOptions(tick_size="0.01"),
             order_type=OrderType.FOK,
@@ -574,18 +614,26 @@ class SimExecutor:
     def sell(self, token_id: str, size: float, price: float) -> str | None:
         return self.place_limit(token_id, "sell", price, size)
 
-    def market_buy(self, token_id: str, amount: float) -> Fill | None:
+    def warmup(self, token_ids: list[str]) -> None:
+        """dry-run 无真实下单，不下单客户端预热（仅盘口定价用 _live，无需预热）。"""
+        return
+
+    def market_buy(self, token_id: str, amount: float, max_price: float | None = None) -> Fill | None:
         """模拟市价买入：按最优档估算成交（结构与实盘一致：缺报价放弃建仓）。
 
         小单（1 USDC ≈ 1-3 股）用 size=1.0（≈最优档价）估算，贴近实盘实际成交。
+        max_price 为实盘 FOK 保护价（最高可接受价）：报价越界视为拒单，与实盘
+        同语义（dry-run 不因未模拟保护价而高估成交率）。
         """
         ask = self.best_ask(token_id, size=1.0)
         if ask is None:
             return None  # 无报价：不建仓（与实盘"缺成交数据放弃建仓"同语义）
+        if max_price and ask > max_price:
+            return None  # 保护价拒绝（与实盘 FOK 同语义：宁错过不追高）
         return Fill(order_id=f"sim-{token_id[:8]}", avg_price=ask,
                     filled_size=shares_for_amount(amount, ask))
 
-    def market_sell(self, token_id: str, size: float) -> Fill | None:
+    def market_sell(self, token_id: str, size: float, min_price: float | None = None) -> Fill | None:
         print(f"[dry-run] 市价卖 {size:.4f} 股 token={token_id[:16]}...")
         # 卖价取不到时回退 0.0（与实盘 market_sell 的 or 0.0 兜底一致，防成交语义分歧）
         return Fill(order_id=None, avg_price=self.best_bid(token_id, size=size) or 0.0)

@@ -24,6 +24,23 @@ def test_ws_url_uses_mirror_endpoint():
     assert t.ws_url == WS_URL_TMPL.format(sym="btcusdt")
     assert "data-stream.binance.vision" in t.ws_url
     assert "stream.binance.com" not in t.ws_url
+    # 组合流：逐笔 + 固定 1s 快照并存（成交稀疏的标的靠后者兜频率）
+    assert "streams=btcusdt@aggTrade/btcusdt@miniTicker" in t.ws_url
+
+
+def test_handle_message_unwraps_combined_stream():
+    """组合流把负载包在 data 下 → 必须解包，否则价格永不更新（回归）。
+
+    回归：单流（/ws/<stream>）时负载无包装，直接读 e/p；改组合流后若不解包，
+    e 永远为 None，latest_price 恒为 None。
+    """
+    t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
+    t._handle_message(json.dumps(
+        {"stream": "btcusdt@aggTrade", "data": json.loads(agg_trade(78_300.0))}))
+    assert t.latest_price() == 78_300.0
+    t._handle_message(json.dumps(
+        {"stream": "btcusdt@miniTicker", "data": json.loads(mini_ticker(78_310.0))}))
+    assert t.latest_price() == 78_310.0
 
 
 def test_handle_message_parses_mini_ticker():
@@ -36,10 +53,11 @@ def test_handle_message_parses_mini_ticker():
 
 
 def test_handle_message_parses_agg_trade():
-    """aggTrade（实时成交，当前主用流）→ 取 p 字段为最新价。
+    """aggTrade（实时逐笔）→ 取 p 字段为最新价。
 
-    换流动机：miniTicker 固定 1s 推送，穿越检测最多晚 1s；盘口穿越后秒级
-    极化，早 1s 才能抓到未调价的便宜档。两者 p/c 语义同为 last trade price。
+    组合流动机：miniTicker 固定 1s 推送，穿越检测最多晚 1s；盘口穿越后秒级
+    极化，早 1s 才能抓到未调价的便宜档。但单用 aggTrade 时成交稀疏标的反而
+    更慢（SOL/DOGE/XRP/BNB 实测 1.6-5.3s），故两流并存各取所长。
     """
     t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
     t._handle_message(agg_trade(78_200.0))
@@ -60,7 +78,7 @@ def test_rest_fallback_uses_injected_fetch():
     calls = []
     t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: calls.append(1) or 78000.0)
     assert t.latest_price() is None
-    t._while_disconnected()  # 断线等待期间兜底钩子
+    t._fallback_once()  # 断线等待期间兜底钩子
     assert t.latest_price() == 78000.0
     assert len(calls) == 1
 
@@ -68,7 +86,7 @@ def test_rest_fallback_uses_injected_fetch():
 def test_rest_fallback_failure_keeps_old_value():
     t = SpotTickerThread(symbol="BTC", fetch_ticker=lambda: None)
     t._handle_message(mini_ticker(77_000.0))
-    t._while_disconnected()  # 失败静默
+    t._fallback_once()  # 失败静默
     assert t.latest_price() == 77_000.0
 
 
@@ -97,7 +115,8 @@ def test_normalize_symbol_shared_single_source():
     assert normalize_symbol("btcusdt") == "BTCUSDT"  # 大小写幂等（原两实现互不相同）
     assert normalize_symbol("ETH/USDT") == "ETHUSDT"
     t = SpotTickerThread(symbol="BTCUSDT")
-    assert t.symbol == "BTCUSDT" and t.ws_url.endswith("btcusdt@aggTrade")
+    # WS 路径用小写交易对（镜像拒绝大写）；不依赖流顺序/结尾位置
+    assert t.symbol == "BTCUSDT" and "btcusdt@aggTrade" in t.ws_url
 
 
 # ---- 端到端 WS（patch websockets.connect → FakeWS，同 BookSampler 测试模式） ----

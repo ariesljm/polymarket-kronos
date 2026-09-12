@@ -35,7 +35,7 @@ def window_end_sec(now_sec: int, step_sec: int) -> int:
 def window_ended_at(window_start: int, now_sec: int, step_sec: int) -> bool:
     """持仓窗口是否已结束（now ≥ 窗口起点 + 步长）。单一事实源。
 
-    曾散在 main_loop._settle_expired / settler.should_run / wallet 幽灵判定三处
+    曾散在 main_loop._defer_expired_position / settler.should_run / wallet 幽灵判定三处
     各自复刻公式，步长按对象各持一份，配置不同步即漂移（回归事故同源防御）。
     """
     return now_sec >= window_start + step_sec

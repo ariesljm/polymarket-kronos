@@ -121,14 +121,15 @@ class ReconnectingWsThread(threading.Thread):
                 raise
             except Exception as e:
                 logger.warning("%s 断开（%s），%.0fs 后重连", self.__class__.__name__, e, backoff)
-                self._on_disconnect()
-                # 等待重连期间周期调用兜底钩子（如 REST 轮询），保持数据新鲜。
+                # 断线即时 + 重连等待期间周期调用兜底钩子（如 REST 轮询），
+                # 保持数据新鲜（BookSampler/SpotTickerThread 覆写 _fallback_once）。
+                self._fallback_once()
                 # 重连等待加 ±50% 抖动：多 bot 并发断开时错开同步握手，
                 # 避免同时重连触发服务端连接限流（曾见 3 bot 同步重连风暴）。
                 wait_total = backoff * random.uniform(0.5, 1.5)
                 waited = 0.0
                 while not self._stop.is_set() and waited < wait_total:
-                    self._while_disconnected()
+                    self._fallback_once()
                     wait = min(self.disconnect_poll_sec, wait_total - waited)
                     self._stop.wait(wait)
                     waited += wait
@@ -184,11 +185,12 @@ class ReconnectingWsThread(threading.Thread):
     def _on_connect(self) -> None:
         """连接成功回调（默认无操作）。"""
 
-    def _on_disconnect(self) -> None:
-        """断线回调（默认无操作；如 REST 兜底、状态标记）。"""
+    def _fallback_once(self) -> None:
+        """断线 + 重连等待期间的周期兜底钩子（默认无操作；如 REST 轮询保持数据新鲜）。
 
-    def _while_disconnected(self) -> None:
-        """等待重连期间的周期兜底钩子（默认无操作；如 REST 轮询保持数据新鲜）。"""
+        _ws_loop 断线分支调用一次、重连等待期间每 disconnect_poll_sec 秒调用一次
+        ——曾以 _on_disconnect/_while_disconnected 双钩子表达同一意图，子类两处
+        覆写同体样板重复，收敛为单钩子。"""
 
     async def _send_subscribe(self, ws: ClientConnection) -> None:
         """连接后发送订阅消息。"""

@@ -18,13 +18,19 @@ CLOB_HOST = "https://clob.polymarket.com"
 # - 可成交单最小金额 $1（size × price >= 1.0）
 MIN_ORDER_SIZE = 5
 MIN_ORDER_AMOUNT = 1.0
+# Polymarket 价格区间 0.01~0.99（tick 0.01）：市价卖出“接受任意合法价”的显式保护价。
+# 与不传保护价时 SDK 自动拉盘口算吃穿价的实际效果等价，但省掉一次 REST。
+MIN_TICK_PRICE = 0.01
 
 
 class SamplerProto(Protocol):
     """盘口采样器窄接口：取内存快照与新鲜度（BookSampler 隐式实现，可注入 None）。
 
-    is_fresh: 快照是否新鲜（陈旧判定单一事实源，消费方不自行实现）——决策价读
-    快照前必须先问新鲜度，不无条件信快照；
+    健康观测语义：快照新鲜度（is_fresh / snapshot_age）供健康检查与面板展示用；
+    **决策路径不依赖它**——ClobExecutor._best_price 为性能采用独立长阈值
+    MAX_BOOK_AGE_SEC（决策容忍陈旧避免同步 REST，见 clob_executor）。两套阈值
+    语义不同、各有消费方，勿误以为 is_fresh 是决策价的新鲜度事实源（曾文档
+    声称"消费方不自行实现"但决策路径实际绕过——此为有意取舍）。
     update_snapshot: 消费方 REST 现拉结果回填（防重复 REST）；
     subscribe: 订阅/退订 token（传 [] 退订；direction_map 为 token→方向映射）。
     """
@@ -56,12 +62,21 @@ class MarketBook(Protocol):
 class TradeExecutor(Protocol):
     """下单能力窄接口：市价/限价/撤单/成交确认。
 
+    market_buy / market_sell 的可选保护价（max_price / min_price）直接作为
+    市价单的限价——不传时 SDK 自行拉盘口算吃穿价（对小单≈不设限，下单时
+    盘口已极化则照极化价成交）；传了则越界即拒单，并省掉 SDK 的一次
+    get_order_book REST。
+
+    warmup: 预热下单客户端按 token 缓存的元数据（tick/fee/condition_id），
+    把下单前的额外 REST 移到窗口订阅时。
+
     消费方：引擎执行动作；生命周期成交检测只依赖其撤单子面
     （CancelExecutor，见 market_lifecycle）。
     """
 
-    def market_buy(self, token_id: str, amount: float) -> Fill | None: ...
-    def market_sell(self, token_id: str, size: float) -> Fill | None: ...
+    def market_buy(self, token_id: str, amount: float, max_price: float | None = None) -> Fill | None: ...
+    def market_sell(self, token_id: str, size: float, min_price: float | None = None) -> Fill | None: ...
+    def warmup(self, token_ids: list[str]) -> None: ...
     def sell_proceeds(self, order_id: str, token_id: str) -> float | None: ...
     def settle_proceeds(self, condition_id: str) -> float | None: ...
     def place_limit(self, token_id: str, side: str, price: float, size: float) -> str | None: ...

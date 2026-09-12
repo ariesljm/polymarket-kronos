@@ -73,9 +73,11 @@ class MomentumStrategy(Strategy):
         self.interval = sc.market_interval
         self.step_ms = step_ms_for(self.interval)
         # 穿越阈值：全局单值（曾试分标的覆盖 → 升阈致 0 成交已回退，见 ADR-0004）
-        self.threshold_pct = getattr(sc, "threshold_pct", 0.08)
+        # StrategyConfig 字段已声明（白名单自动映射，见 config.to_strategy_config），
+        # 直接访问，不防御 getattr（对照 ADR-0005「接口已保证却仍防御」先例）
+        self.threshold_pct = sc.threshold_pct
         # BTC 反向矛盾过滤阈值（0 = 关闭）：标的穿越方向与 BTC 反向时跳过
-        self.btc_contradiction_pct = getattr(sc, "btc_contradiction_pct", 0.0)
+        self.btc_contradiction_pct = sc.btc_contradiction_pct
         # 依赖注入（测试用 fake；运行态默认走 Binance REST）
         self._fetch_price = fetch_price or (lambda: _fetch_price_rest(symbol))
         self._fetch_window_open = fetch_window_open or self._default_window_open
@@ -207,9 +209,12 @@ class MomentumStrategy(Strategy):
             state = "🔺 已穿越 UP"
         elif dev is not None and dev <= -self.threshold_pct:
             state = "🔻 已穿越 DOWN"
+        # 基准用 8 位有效数字而非固定 1 位小数：面板经 parse_strategy_spot 反推现货价
+        # （基准×(1+偏离)）。{:,.1f} 会把 DOGE 的 0.0838 截成 0.1（误差 19%），且价格在
+        # 0.05-0.15 区间怎么动都格式化回 0.1 → 面板价格看起来长期不变。
         return (
             f"策略状态: momentum（穿越±{self.threshold_pct}%） "
-            f"基准 {self._base:,.1f} 偏离 {dev_s} {state}"
+            f"基准 {self._base:,.8g} 偏离 {dev_s} {state}"
         )
 
     # ---- 结算判定（dry-run 模拟结算单一事实源） ----

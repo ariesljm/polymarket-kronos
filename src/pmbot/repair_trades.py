@@ -28,7 +28,8 @@ from pathlib import Path
 
 from pmbot.clob_executor import ClobExecutor
 
-SELL_REASONS = {"take_profit", "stop_loss", "sell"}  # 有卖出订单的交易
+# 有卖出订单的交易（离场 reason 合法集见 types.EXIT_REASONS；本集是其子集）
+SELL_REASONS = {"take_profit", "stop_loss", "sell"}
 BOOK_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*book\?token_id=(\d{20,})")
 
 

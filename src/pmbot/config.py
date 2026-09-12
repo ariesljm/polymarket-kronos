@@ -30,6 +30,13 @@ _ENGINE_FIELDS = (
     "no_entry_before_end_sec", "open_delay_sec", "contradiction_skip_pct",
     "max_entry_price", "min_entry_price", "taker_fee_pct",
 )
+# 策略窄视图白名单（Config → StrategyConfig 自动映射字段名；与 StrategyConfig
+# 字段一致——加新策略参数 = StrategyConfig 加字段 + 本白名单加名，与 _ENGINE_FIELDS
+# 同机制，不再手抄构造映射。注意：StrategyConfig 是策略能力面，策略专属参数
+# 按注册名下钻（create_strategy 消费），勿把第二策略的专属字段塞进本白名单）
+_STRATEGY_FIELDS = (
+    "market_interval", "threshold_pct", "btc_contradiction_pct",
+)
 
 DEFAULTS: dict = {
     "symbols": ["BTC"],
@@ -130,11 +137,8 @@ class Config:
         return EngineConfig(**{f: getattr(self, f) for f in _ENGINE_FIELDS})
 
     def to_strategy_config(self) -> StrategyConfig:
-        return StrategyConfig(
-            market_interval=self.market_interval,
-            threshold_pct=self.threshold_pct,
-            btc_contradiction_pct=self.btc_contradiction_pct,
-        )
+        """策略窄视图派生：白名单自动映射（与 _ENGINE_FIELDS 同机制，不手抄）。"""
+        return StrategyConfig(**{f: getattr(self, f) for f in _STRATEGY_FIELDS})
 
 
 def load_config(path: str | Path) -> Config:

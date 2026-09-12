@@ -31,10 +31,15 @@ from pmbot.ws_thread import ReconnectingWsThread
 
 logger = logging.getLogger(__name__)
 
-# Binance 数据流镜像 WS（与 K 线 REST 镜像同源；单流 GET 连接，无需订阅消息）
+# Binance 数据流镜像 WS（与 K 线 REST 镜像同源；连接自带流声明，无需订阅消息）
 # WS stream 路径用小写交易对（btcusdt@aggTrade）；REST 端点用大写（镜像 400 拒小写）
-# aggTrade（实时逐笔）而非 miniTicker（1s 快照）：穿越检测延迟是入场价的核心变量
-WS_URL_TMPL = "wss://data-stream.binance.vision/ws/{sym}@aggTrade"
+# 组合流 aggTrade + miniTicker：穿越检测延迟是入场价的核心变量，单用 aggTrade 时
+# 成交稀疏的标的推送间隔反而从 miniTicker 的固定 1s 退化到 1.6-5.3s（SOL/XRP/
+# DOGE/BNB 实测中位），穿越最多晚 5s；两者并存则活跃标的拿逐笔、稀疏标的拿 1s。
+WS_URL_TMPL = (
+    "wss://data-stream.binance.vision/stream"
+    "?streams={sym}@aggTrade/{sym}@miniTicker"
+)
 # REST 兜底（断线等待期间 1s 轮询；强制直连不跟随代理——data_source 同款实证）
 REST_URL_TMPL = "https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}"
 REST_POLL_SEC = 1.0
@@ -86,7 +91,7 @@ class SpotTickerThread(ReconnectingWsThread):
     # ---- WS 钩子（ReconnectingWsThread 子类实现） ----
 
     async def _send_subscribe(self, ws: "ClientConnection") -> None:
-        # Binance 单流 GET 连接（/ws/<stream>）无需发送订阅消息，连上即收
+        # 流已在 URL 查询串声明，连上即收，无需发送订阅消息
         pass
 
     def _handle_message(self, raw: str) -> None:
@@ -94,8 +99,11 @@ class SpotTickerThread(ReconnectingWsThread):
             data = json.loads(raw)
         except json.JSONDecodeError:
             return
-        # aggTrade 实时成交价在 "p"；miniTicker 收盘价在 "c"（兼容两种流，
-        # 两者语义同为 last trade price，仅推送频率不同）
+        # 组合流（/stream?streams=）把负载包在 "data" 下，单流不包
+        if "stream" in data and isinstance(data.get("data"), dict):
+            data = data["data"]
+        # aggTrade 实时成交价在 "p"；miniTicker（事件名 24hrMiniTicker）收盘价在 "c"
+        # （两者语义同为 last trade price，仅推送频率不同）
         price_raw = data.get("p") if data.get("e") == "aggTrade" else data.get("c")
         if price_raw is None:
             return
@@ -124,11 +132,8 @@ class SpotTickerThread(ReconnectingWsThread):
                 except Exception:
                     logger.exception("%s 更新回调异常", self.__class__.__name__)
 
-    def _while_disconnected(self) -> None:
-        """等待重连期间 REST 兜底（1s 轮询，保持价格新鲜）。"""
-        self._rest_fallback()
-
-    def _on_disconnect(self) -> None:
+    def _fallback_once(self) -> None:
+        """断线 + 重连等待期间 REST 兜底（1s 轮询，保持价格新鲜）。"""
         self._rest_fallback()
 
     def _rest_fallback(self) -> None:

@@ -73,7 +73,9 @@ class UserStream(ReconnectingWsThread):
         self.connected = True
         logger.info("用户 WS 已连接（auth ok）")
 
-    def _on_disconnect(self) -> None:
+    def _fallback_once(self) -> None:
+        # 断线即置断开标记（幂等；重连成功后 _on_connect 恢复）。曾以
+        # _on_disconnect 表达，基类双钩子收敛为单钩子后语义不变。
         self.connected = False
 
     async def _send_subscribe(self, ws: ClientConnection) -> None:

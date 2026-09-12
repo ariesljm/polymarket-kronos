@@ -162,6 +162,15 @@ class MarketView:
     elapsed_sec: int = 0  # 窗口已进行秒数（开仓延迟判断用，0 = 未知）
     live_delta_pct: float | None = None  # 窗口起点至今 Binance 实时移动 %（None=无实时价，不过滤）
 
+
+# 离场 reason 词表单一事实源：engine 产出（take_profit/window_end/stop_loss）、
+# 执行分派器结算回调（settle/sell）写入 trades.csv reason 列；面板 EXIT_LABELS
+# 展示映射、repair_trades 修复判定消费。新 reason 必须同步本集与
+# panel_view.EXIT_LABELS（测试守卫二者一致，防静默失配）。
+EXIT_REASONS: frozenset[str] = frozenset({
+    "take_profit", "window_end", "stop_loss", "settle", "sell",
+})
+
 def token_for(market: "MarketInfo", direction: Direction) -> str:
     """方向 → 市场 token（UP→yes，DOWN→no）。单一事实源（main_loop/lifecycle 共用）。"""
     return market.yes_token_id if direction is Direction.UP else market.no_token_id
