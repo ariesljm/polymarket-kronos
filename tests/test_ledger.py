@@ -8,7 +8,7 @@ import csv
 
 import pytest
 
-from pmbot.ledger import RECORD_COLUMNS, load_records
+from pmbot.ledger import RECORD_COLUMNS, build_records, load_records
 
 
 def _write_csv(path, header, rows):
@@ -94,6 +94,53 @@ def test_load_records_filters_by_symbol(tmp_path):
     eth = load_records(tmp_path, symbol="ETH")
     assert [r.symbol for r in eth] == ["ETH"]
     assert load_records(tmp_path, symbol="DOGE") == []  # 无该标的流水
+
+
+def test_load_records_source_engine_ignores_api_history(tmp_path):
+    """source='engine' 强制用本 bot 引擎记录——api 流水含钱包全量历史（非本 bot 交易），
+    策略统计/面板样本量必须只反映本 bot 实盘成交（实盘上线检查根因）。"""
+    # api 流水有 3 条（全钱包历史），引擎记录只有 1 条
+    _write_csv(tmp_path / "api_trades.csv", ["ts", "type", "side", "size", "price",
+                                             "usdc_size", "condition_id", "title", "slug", "outcome", "tx_hash"], [
+        {"ts": 100, "type": "trade", "side": "BUY", "size": 2, "price": 0.5,
+         "usdc_size": 1.04, "condition_id": "c1", "title": "t",
+         "slug": "eth-updown-5m-100", "outcome": "Up", "tx_hash": "b1"},
+        {"ts": 200, "type": "redeem", "side": "", "size": 2, "price": "",
+         "usdc_size": 2.0, "condition_id": "c1", "title": "t",
+         "slug": "eth-updown-5m-100", "outcome": "Up", "tx_hash": "r1"},
+    ])
+    _write_csv(tmp_path / "trades.csv", RECORD_COLUMNS, [{
+        "ts": "2026-09-12T03:42:25+00:00", "window_start": 1789184400, "symbol": "BNB",
+        "direction": "down", "entry_price": "0.98", "exit_price": "0.97",
+        "size": "1.02", "pnl": "-0.01", "reason": "take_profit",
+    }])
+    assert len(load_records(tmp_path, source="engine")) == 1  # 只读本 bot 引擎记录
+    assert load_records(tmp_path, source="engine")[0].symbol == "BNB"
+    assert len(load_records(tmp_path, source="auto")) == 1  # auto 仍 api 优先（对账兼容）
+
+
+def test_build_records_skips_non_bot_markets(tmp_path):
+    """钱包 api 流水混入非 bot 市场（ethereum-above-3000 等）→ 不构成交易记录。
+
+    非 bot slug 首段会被 symbol_from_slug 当成标的（ETHEREUM/NEW/WILL），
+    配对必须只认 bot 格式 {sym}-updown-{interval}-{epoch}。"""
+    rows = [
+        {"ts": 100, "type": "trade", "side": "BUY", "size": 2, "price": 0.5,
+         "usdc_size": 1.04, "condition_id": "c-bot", "title": "t",
+         "slug": "eth-updown-5m-100", "outcome": "Up", "tx_hash": "b1"},
+        {"ts": 200, "type": "redeem", "side": "", "size": 2, "price": "",
+         "usdc_size": 2.0, "condition_id": "c-bot", "title": "t",
+         "slug": "eth-updown-5m-100", "outcome": "Up", "tx_hash": "r1"},
+        {"ts": 300, "type": "trade", "side": "BUY", "size": 2, "price": 0.5,
+         "usdc_size": 1.04, "condition_id": "c-manual", "title": "t",
+         "slug": "ethereum-above-3000-on-december-1", "outcome": "Up", "tx_hash": "b2"},
+        {"ts": 400, "type": "redeem", "side": "", "size": 2, "price": "",
+         "usdc_size": 2.0, "condition_id": "c-manual", "title": "t",
+         "slug": "ethereum-above-3000-on-december-1", "outcome": "Up", "tx_hash": "r2"},
+    ]
+    recs = build_records(rows)
+    assert len(recs) == 1  # 只保留 bot 市场 eth-updown-5m
+    assert recs[0].symbol == "ETH"
 
 
 def test_load_records_empty_api_file(tmp_path):

@@ -450,9 +450,9 @@ def build_live_view(symbol: str | None, config: str, paths: str | RuntimePaths,
     symbol = symbol or (st.symbol if st else None)
     from pmbot.ledger import load_records
 
-    # 按标的过滤：api 流水是全钱包的（live 下每标的目录同步同一份 api_trades.csv），
-    # 不过滤则单标的视图串入其它标的交易、多标的聚合每笔 ×N 重复
-    trades = load_records(paths.data_dir, symbol=symbol)
+    # 按标的过滤 + 只用本 bot 引擎记录（api 流水是全钱包历史，会把钱包全部
+    # 旧交易计入样本量；策略统计必须反映本 bot 实盘成交）
+    trades = load_records(paths.data_dir, symbol=symbol, source="engine")
     from pmbot.config import load_config
 
     model_variant = "—"

@@ -19,11 +19,23 @@ trade_history.RECORD_COLUMNS（手抄）两处维护；消费方各自裸 dict �
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pmbot.types import symbol_from_slug, window_start_from_slug
+
+# bot 市场 slug 格式：{sym}-updown-{interval}-{epoch}（如 eth-updown-5m-1786897500）。
+# 钱包 api 流水是**全钱包全市场**的（含非 bot 市场：ethereum-above-3000、
+# new-playboi-carti-...、will-argentina-... 等手动/历史交易）——配对必须只认
+# bot 格式，否则垃圾 slug 首段会被 symbol_from_slug 当成标的（ETHEREUM/NEW/WILL）。
+_BOT_SLUG_RE = re.compile(r"^[a-z]+-updown-\d+[mh]-\d+$")
+
+
+
+def _is_bot_slug(slug: str) -> bool:
+    return bool(_BOT_SLUG_RE.match(str(slug or "")))
 
 # 交易记录 schema（trades.csv 写入 / api 流水配对 / 展示统计共用，单一事实源）
 RECORD_COLUMNS = [
@@ -80,28 +92,41 @@ def records_from_csv(path: str | Path) -> list[TradeRecord]:
     return records
 
 
-def load_records(data_dir: str | Path, symbol: str | None = None) -> list[TradeRecord]:
-    """统一读面：返回 TradeRecord 列表（api 流水配对优先，引擎记录回退）。
+def load_records(data_dir: str | Path, symbol: str | None = None,
+                 source: str = "auto") -> list[TradeRecord]:
+    """统一读面：返回 TradeRecord 列表。
 
-    判据唯一：api_trades.csv 存在且含数据行（同步中断/半写会留下空表头，
-    此时回退 trades.csv 的完整引擎业务记录）才优先；否则回退 trades.csv；
-    两者都不存在返回 []。
+    source 决定读哪个文件（区分两种账本语义）：
+    - "engine"：只读 trades.csv（引擎逐笔业务记录）——**本 bot 的交易**，
+      策略统计/面板样本量/盈亏/auto_tune 必须用它；
+    - "api"：只读 api_trades.csv（钱包真实流水配对，含手续费）——对账/审计用；
+    - "auto"（默认）：api 有数据优先，缺回退 trades.csv（历史行为，对账工具兼容）。
 
-    symbol: 按标的过滤（api 流水是全钱包的——live 下每个标的目录都同步了
-    同一份全钱包 api_trades.csv，不过滤会把其它标的的交易混入本标的视图：
-    单标的面板串标、多标的聚合每笔 ×N 重复。None = 不过滤）。
+    api_trades.csv 是**全钱包全市场**流水（非本 bot 的交易也在内：旧历史 / 手动
+    / 非 up-down 市场）。面板若用 auto 会把钱包全部历史算进样本量——
+    "样本量明显不对"的根因（实盘上线检查：钱包 2025-12 起的历史被计入）。
+
+    symbol: 按标的过滤（api 流水是全钱包的，6 个标的目录同步同一份）。
     """
     data_dir = Path(data_dir)
     api = data_dir / "api_trades.csv"
+    trades = data_dir / "trades.csv"
     recs: list[TradeRecord] = []
-    if api.is_file():
-        with open(api, encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        if rows:
-            recs = build_records(rows)
-    if not recs:
-        trades = data_dir / "trades.csv"
+    if source == "api":
+        if api.is_file():
+            with open(api, encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            recs = build_records(rows) if rows else []
+    elif source == "engine":
         if trades.is_file():
+            recs = records_from_csv(trades)
+    else:  # auto：api 有数据优先（含数据判据：同步中断/半写会留下空表头）
+        if api.is_file():
+            with open(api, encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            if rows:
+                recs = build_records(rows)
+        if not recs and trades.is_file():
             recs = records_from_csv(trades)
     if symbol:
         want = symbol.upper()
@@ -147,6 +172,8 @@ def build_records(rows: list[dict]) -> list["TradeRecord"]:
 
     records = []
     for cid, g in groups.items():
+        if not _is_bot_slug(g["slug"]):
+            continue  # 非 bot 市场（钱包混入的手动/旧交易）：不构成策略交易记录
         if not g["buys"] or not g["exits"]:
             continue  # 未平仓（进行中窗口/纯兑付）不构成交易记录
         size = sum(float(b.get("size") or 0) for b in g["buys"])

@@ -431,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             # cfg 一次加载复用（build_live_view 不再每标的每 2s 重复解析 config.yaml）
             views = build_multi_view(paths_list, str(ROOT / "config.yaml"), cfg=cfg_loaded)
             # 按标的过滤（api 流水是全钱包的，不过滤聚合会每笔 ×N 重复）
-            per_dir_trades = {d: load_records(ROOT / d, symbol=Path(d).name.upper()) for d in dirs}
+            per_dir_trades = {d: load_records(ROOT / d, symbol=Path(d).name.upper(), source="engine") for d in dirs}
             online_flags = [_is_online(ROOT / d) for d in dirs]
 
             # 高度预算：固定开销(边框/标题/配置/分隔/表头/汇总/状态/操作) + 卡片行数,

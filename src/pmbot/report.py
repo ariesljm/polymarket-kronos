@@ -22,10 +22,10 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     symbol = cfg.symbols[0]
-    # 统一读面（账本）：实盘 API 流水优先，缺回退引擎业务记录
+    # 统一读面（账本）：策略统计只用本 bot 引擎记录（api 流水是全钱包历史）
     from pmbot.ledger import load_records
 
-    stats = compute_stats(load_records(args.data_dir))
+    stats = compute_stats(load_records(args.data_dir, source="engine"))
     params = {
         "amount_per_trade": cfg.amount_per_trade,
         "p_up_buy": cfg.p_up_buy,

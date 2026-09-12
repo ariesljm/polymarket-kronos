@@ -577,7 +577,7 @@ class TradingLoop:
             from pmbot.auto_tune import band_stats, tune, tune_reason
             from pmbot.ledger import load_records
 
-            trades = load_records(self.trades_path.parent, symbol=self.symbol)  # 按标的过滤：api 流水是全钱包的，不过滤会把其它标的分到本标的 band stats（auto_tune 被污染）
+            trades = load_records(self.trades_path.parent, symbol=self.symbol, source="engine")  # 只看本 bot 引擎记录（api 流水含钱包全量历史，会污染 band stats）
             stats = band_stats(trades)
             override = tune(
                 trades,
