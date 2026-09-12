@@ -47,7 +47,7 @@ def test_start_bot_spawns_run_and_stops(monkeypatch):
     monkeypatch.setattr("pmbot.monitor.main", fake_monitor)
     monkeypatch.setattr("pmbot.run.main", lambda *a, **kw: None)
     killed = []
-    monkeypatch.setattr(start_bot, "_kill_tree", lambda pid: killed.append(pid))  # 整树杀（避免真实 taskkill）
+    monkeypatch.setattr("pmbot.entry_support.kill_tree", lambda pid: killed.append(pid))  # 整树杀（避免真实 taskkill）
 
     assert start_bot.main(["--dry-run"]) == 0
     assert calls, "应启动主循环子进程"

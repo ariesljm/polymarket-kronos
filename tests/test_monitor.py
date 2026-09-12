@@ -268,8 +268,8 @@ def test_status_note_shows_actual_exit_reason():
     """本窗口已平仓：按 trades.csv reason 显示实际离场原因。"""
     th = {"p_up_buy": 0.60, "p_down_buy": 0.40}
     for reason, label in (("take_profit", "已止盈"), ("stop_loss", "已止损"),
-                          ("time_stop", "已时间止损"), ("window_end", "窗口结束平仓"),
-                          ("settle", "已结算")):
+                          ("window_end", "窗口结束平仓"),
+                          ("settle", "已结算"), ("sell", "已平仓")):
         rows = [dataclasses.replace(trades_rows(1)[0], reason=reason)]
         v = build_view(status_dict(pending_order=None, position=None), rows,
                        now_sec=WINDOW_START, today=TODAY, panel=PanelConfig(thresholds=th))
@@ -545,13 +545,44 @@ def test_recent_trade_has_chinese_label():
 
 def test_fmt_cents_low_price_keeps_precision():
     """0.1 美分价格不得显示为 0（如 entry=0.001 → 0.10 美分）。"""
-    from pmbot.panel_view import _fmt_cents
+    from pmbot.panel_view import fmt_cents
 
-    assert _fmt_cents(0.001) == "0.10"
-    assert _fmt_cents(0.008) == "0.80"
-    assert _fmt_cents(0.01) == "1"
-    assert _fmt_cents(0.45) == "45"
-    assert _fmt_cents(0.8) == "80"
+    assert fmt_cents(0.001) == "0.10"
+    assert fmt_cents(0.008) == "0.80"
+    assert fmt_cents(0.01) == "1"
+    assert fmt_cents(0.45) == "45"
+    assert fmt_cents(0.8) == "80"
+
+
+def test_exit_labels_match_exit_reasons():
+    """展示标签键集与离场 reason 合法集一致：缺键面板回退原文、多键是死键，
+    新 reason 必须同步两端（单一事实源 types.EXIT_REASONS）。"""
+    from pmbot.panel_view import EXIT_LABELS
+    from pmbot.types import EXIT_REASONS
+
+    assert set(EXIT_LABELS) == set(EXIT_REASONS)
+
+
+def test_strategy_status_text_parses_in_panel():
+    """momentum.status_text() 输出必须能被 panel_view 逆解析（跨层字符串契约）。
+
+    改 momentum 文案格式（基准/偏离/状态词）须保持可解析——本测试锚定典型输出
+    （等待 / 已穿越 UP / 已穿越 DOWN + DOGE 低价精度），防止静默破坏 multi_panel
+    的现货价推算与状态图标。"""
+    from pmbot.panel_view import parse_strategy_spot, status_tail
+
+    samples = [
+        "策略状态: momentum（穿越±0.08%） 基准 0.0838 偏离 +0.001% ⏳ 等待穿越",
+        "策略状态: momentum（穿越±0.08%） 基准 79,930 偏离 +0.094% 🔺 已穿越 UP",
+        "策略状态: momentum（穿越±0.08%） 基准 1.2345 偏离 -0.123% 🔻 已穿越 DOWN",
+    ]
+    want_devs = [0.001, 0.094, -0.123]
+    for text, want in zip(samples, want_devs):
+        r = parse_strategy_spot(text)
+        assert r is not None, text
+        _, dev = r
+        assert dev == want
+        assert status_tail(text)  # 状态词可解析
 
 
 def test_render_trade_low_entry_shows_fractional_cents():

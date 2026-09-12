@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -29,7 +28,8 @@ from pmbot.panel_view import (  # noqa: E402
     build_multi_view,
     parse_strategy_spot,
     status_tail,
-    _fmt_cents,
+    fmt_cents,
+    fmt_ts,
 )
 from pmbot.paths import RuntimePaths  # noqa: E402
 
@@ -51,30 +51,6 @@ _checks = 0  # 刷新计数（底部状态栏 checks）
 
 
 # ---- 工具 ----
-
-def _t_stat(trades: list) -> float | None:
-    """全量 PnL 的 t 统计量（纯 python，不依赖 numpy）。"""
-    pnls = [t.pnl for t in trades]
-    n = len(pnls)
-    if n < 2:
-        return None
-    mean = sum(pnls) / n
-    var = sum((x - mean) ** 2 for x in pnls) / (n - 1)
-    if var == 0:
-        return None
-    return mean / (var / n) ** 0.5
-
-
-def _fmt_ts(ts: str) -> str:
-    try:
-        return (
-            datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            .astimezone(None)
-            .strftime("%H:%M")
-        )
-    except Exception:
-        return (ts or "")[:5]
-
 
 def _t_stat(trades: list) -> float | None:
     """全量 PnL 的 t 统计量（纯 python，不依赖 numpy）。"""
@@ -170,6 +146,18 @@ def _cfg_line(symbols: int, interval: str, amount: float,
     return bar
 
 
+def _fmt_price(price: float) -> str:
+    """现货价显示：按量级定小数位（低价币需更多位，否则微小波动不可见）。
+
+    固定 2 位小数时 DOGE（0.0838）永远显示 $0.08，价格变动全被吞掉。
+    """
+    if price >= 10:
+        return f"${price:,.2f}"
+    if price >= 1:
+        return f"${price:.4f}"
+    return f"${price:.6f}"
+
+
 def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
     """单标的卡片：2 行内容 + 边框（4 卡/行也能读，标的信息一目了然）。
 
@@ -183,7 +171,7 @@ def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
     spot = parse_strategy_spot(v.strategy_state)
     if spot:
         price, dev = spot
-        l1.append(Text(f"${price:,.2f}", style="bold cyan"))
+        l1.append(Text(_fmt_price(price), style="bold cyan"))
         l1.append(Text(
             f" {'▲' if dev >= 0 else '▼'}{abs(dev):.2f}%",
             style="green" if dev >= 0 else "red",
@@ -194,9 +182,9 @@ def _card(v: PanelView, online: bool, threshold: float | None) -> Panel:
     up = prices.get("up_ask")
     down = prices.get("down_ask")
     l1.append(Text("  涨", style="dim"))
-    l1.append(Text(_fmt_cents(up) + "¢", style="bold green") if up is not None else Text("—", style="dim"))
+    l1.append(Text(fmt_cents(up) + "¢", style="bold green") if up is not None else Text("—", style="dim"))
     l1.append(Text(" 跌", style="dim"))
-    l1.append(Text(_fmt_cents(down) + "¢", style="bold red") if down is not None else Text("—", style="dim"))
+    l1.append(Text(fmt_cents(down) + "¢", style="bold red") if down is not None else Text("—", style="dim"))
     body.append(l1)
 
     # 行2：持仓/挂单置首 + 反色高亮，**空仓显式写出**（原先只在有仓时显示文字，
@@ -328,8 +316,8 @@ def _history_table(records_by_dir: dict[str, list], max_rows: int = 12) -> Table
         # 原因中文化：复用 panel_view.EXIT_LABELS（展示文案单一事实源，与面板状态同源）
         label = EXIT_LABELS.get(r.reason, r.reason)
         table.add_row(
-            f"{ts[5:16].replace('T', ' ')}", r.symbol or "?", dir_name(r.direction),
-            f"{r.size:.2f}", _fmt_cents(r.entry_price), _fmt_cents(r.exit_price),
+            fmt_ts(ts), r.symbol or "?", dir_name(r.direction),
+            f"{r.size:.2f}", fmt_cents(r.entry_price), fmt_cents(r.exit_price),
             _pnl_text(r.pnl), label,
         )
     return table
@@ -369,7 +357,7 @@ def _status_bar(views: list[PanelView], online_flags: list[bool]) -> Text:
             continue
         t.append(Text(f"  {v.symbol or '?'} ", style="bold"))
         if up is not None:
-            t.append(Text(f"涨{_fmt_cents(up)}¢", style="green"))
+            t.append(Text(f"涨{fmt_cents(up)}¢", style="green"))
         if spot:
             t.append(Text(f" {spot[1]:+.2f}%", style="dim"))
     return t

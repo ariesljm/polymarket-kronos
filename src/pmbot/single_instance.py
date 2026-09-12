@@ -1,5 +1,6 @@
 """单实例守护：启动时清理同角色旧进程，防止多实例互踩状态文件。
 
+_CREATE_NO_WINDOW 常量已收敛于 pmbot.entry_support（kill_tree 共享来源，见其 docstring）。
 PID 文件 data/bot.pids 记录各角色 pid（start_bot / run），JSON 原子写。
 新实例启动时先杀掉旧实例再注册自己；正常退出时注销。
 
@@ -13,7 +14,6 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 PID_FILE = "data/bot.pids"
 
-_CREATE_NO_WINDOW = 0x08000000
 _OPEN_PROCESS_QUERY_LIMITED = 0x1000
 
 
@@ -65,18 +64,11 @@ class InstanceGuard:
 
     @classmethod
     def _kill(cls, pid: int) -> None:
+        from pmbot.entry_support import kill_tree
+
+        kill_tree(pid)  # win: taskkill /T /F 整树（uv shim + base python 一并清理）
         if sys.platform == "win32":
-            # taskkill /T：整树杀（uv shim 派生 base python 的两层结构一并清理）
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            return
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            return
+            return  # taskkill /T /F 已是强杀，无需等优雅退出
         for _ in range(6):  # 最多等 3 秒优雅退出
             if not cls.alive(pid):
                 return

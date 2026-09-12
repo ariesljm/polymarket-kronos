@@ -9,41 +9,15 @@ from __future__ import annotations
 
 import argparse
 import logging
-import logging.handlers
 import os
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from types import FrameType
 
+from pmbot import entry_support
 from pmbot.paths import RuntimePaths
 from pmbot.state import TradeState
-
-
-def _setup_logging(log_dir: Path, symbol: str) -> None:
-    """日志：按天滚动文件 logs/{symbol}.log（保留 14 天，UTF-8）
-    + 交互终端（stderr 为 TTY）时附加控制台输出。
-    后台启动（nohup/start /b 重定向到 nul）只写文件——日志唯一来源。
-    """
-    root = logging.getLogger()
-    if root.handlers:  # 重复启动防御（同一进程多次调用 main）
-        return
-    log_dir.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    fh = logging.handlers.TimedRotatingFileHandler(
-        log_dir / f"{symbol}.log", when="midnight", backupCount=14, encoding="utf-8"
-    )
-    fh.setFormatter(fmt)
-    handlers: list[logging.Handler] = [fh]
-    if sys.stderr.isatty():
-        sh = logging.StreamHandler()
-        sh.setFormatter(fmt)
-        handlers.append(sh)
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
-    # 降噪：httpx/py_clob 每 tick 刷屏的请求日志提升到 WARNING（曾占满日志 90%+）
-    for noisy in ("httpx", "py_clob_client_v2.http_helpers.helpers", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 @dataclass
@@ -192,8 +166,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="只跑一个 tick 后退出（调试）")
     args = parser.parse_args(argv)
 
-    _setup_logging(Path(__file__).resolve().parents[2] / "logs",
-                   (args.symbol or "pmbot"))
+    # 日志：按天滚动文件 + 控制台（装配收敛于 entry_support）
+    from pmbot.entry_support import setup_logging
+
+    setup_logging(Path(__file__).resolve().parents[2] / "logs",
+                  f"{symbol}.log")
 
     # 依赖集中导入（函数内：入口模块冷启动不加载重型依赖链）
     from pmbot.config import load_config
@@ -210,18 +187,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # 实盘前置自检：不通过则拒绝启动（真钱守门；干跑发现不了的问题在此拦下）
     if not args.dry_run:
-        from pmbot.clob_executor import ClobExecutor
-        from pmbot.preflight import live_advisories, live_preflight
-
-        problems = live_preflight(cfg, ClobExecutor())
-        if problems:
-            for p in problems:
-                logging.error("实盘自检未通过：%s", p)
-            logging.error("拒绝以实盘模式启动（修正后重试；先干跑请用 start_multi.bat）")
-            return 3
-        for note in live_advisories(cfg):
-            logging.warning("实盘提醒：%s", note)
-        logging.info("实盘自检通过：凭证 / 余额 / 授权 均正常")
+        rc = entry_support.run_live_preflight(cfg)
+        if rc != 0:
+            return rc
 
     bundle = build_loop(cfg, symbol=symbol, paths=paths,
                         dry_run=args.dry_run, poll_sec=args.poll)
@@ -251,15 +219,7 @@ def main(argv: list[str] | None = None) -> int:
             bundle.shutdown_all()  # 停本标的全部 WS 线程（生命周期收口于 LoopBundle）
 
     # 终端关闭（CTRL_CLOSE）在 Windows 触发 SIGTERM → 优雅停机（同 Ctrl-C）
-    import signal as _signal
-
-    def _on_sigterm(signum: int, frame: FrameType | None) -> None:
-        raise KeyboardInterrupt
-
-    try:
-        _signal.signal(_signal.SIGTERM, _on_sigterm)
-    except (ValueError, OSError):
-        pass
+    entry_support.on_sigterm()
 
     # 单实例守护：杀旧 run 实例防多开互踩状态文件；退出自动注销
     try:

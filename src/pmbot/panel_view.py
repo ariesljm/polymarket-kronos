@@ -22,10 +22,11 @@ REFRESH_SEC = 1.0
 RECENT_LIMIT = 5
 
 # 平仓原因 → 面板状态文案（trades.csv reason 字段）
+# 离场 reason → 中文标签（键集合与 types.EXIT_REASONS 一致，测试守卫防失配：
+# 键缺则面板回退原文、键多则是死键，新 reason 必须同步两端）
 EXIT_LABELS = {
     "take_profit": "已止盈",
     "stop_loss": "已止损",
-    "time_stop": "已时间止损",
     "window_end": "窗口结束平仓",
     "settle": "已结算",
     "sell": "已平仓",
@@ -99,12 +100,12 @@ def _parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
-def _fmt_ts(ts: str) -> str:
+def fmt_ts(ts: str) -> str:
     """ISO 时间 → 本地时区 MM-DD HH:MM（astimezone(None) = 系统本地时区）。"""
     return _parse_ts(ts).astimezone(None).strftime("%m-%d %H:%M")
 
 
-def _fmt_cents(x: float) -> str:
+def fmt_cents(x: float) -> str:
     """价格（0-1 概率）→ 美分显示；不足 1 美分保留 2 位小数（防 0.1 美分显示成 0）。"""
     c = x * 100
     return f"{c:.2f}" if c < 1 else f"{c:.0f}"
@@ -225,7 +226,7 @@ def _fill_trades(v: PanelView, trades: list, today: str, tz: tzinfo,
     for r in reversed(limit):
         recent.append(
             {
-                "ts": _fmt_ts(r.ts),
+                "ts": fmt_ts(r.ts),
                 "direction": r.direction,
                 "size": r.size,
                 "entry": r.entry_price,
@@ -344,7 +345,7 @@ def render(v: PanelView) -> str:
     prices = v.prices
     if prices:
         def fmt(x: object) -> str:
-            return _fmt_cents(x) if x is not None else "—"
+            return fmt_cents(x) if x is not None else "—"
 
         lines.append(f"盘口 UP: {fmt(prices.get('up_bid'))}/{fmt(prices.get('up_ask'))}  "
                      f"DOWN: {fmt(prices.get('down_bid'))}/{fmt(prices.get('down_ask'))}（买/卖）")
@@ -363,18 +364,18 @@ def render(v: PanelView) -> str:
         lines.append("信号: —")
     pend = v.pending
     if pend:
-        lines.append(f"挂单: {pend['direction'].upper()} {pend['size'] or '?'}股 @{_fmt_cents(pend['price'])}")
+        lines.append(f"挂单: {pend['direction'].upper()} {pend['size'] or '?'}股 @{fmt_cents(pend['price'])}")
     else:
         lines.append("挂单: —")
     pos = v.position
     if pos:
-        lines.append(f"持仓: {pos['direction'].upper()} {pos['size']:.2f}股 @{_fmt_cents(pos['entry_price'])}")
+        lines.append(f"持仓: {pos['direction'].upper()} {pos['size']:.2f}股 @{fmt_cents(pos['entry_price'])}")
     else:
         lines.append("持仓: —")
     if v.settle_pending:
         sp = v.settle_pending
         lines.append(
-            f"待结算: {sp['direction'].upper()} {sp['size']:.2f}股 @{_fmt_cents(sp['entry_price'])}（窗口已结束，结算后自动入账）"
+            f"待结算: {sp['direction'].upper()} {sp['size']:.2f}股 @{fmt_cents(sp['entry_price'])}（窗口已结束，结算后自动入账）"
         )
     if v.live_positions:
         lines.append("实时持仓（Polymarket）:")
@@ -414,7 +415,7 @@ def render(v: PanelView) -> str:
     if v.recent_trades:
         for t in v.recent_trades:
             lines.append(
-                f"  {t['ts']}  {t['direction'].upper():4} 入{_fmt_cents(t['entry'])} 出{_fmt_cents(t['exit'])} "
+                f"  {t['ts']}  {t['direction'].upper():4} 入{fmt_cents(t['entry'])} 出{fmt_cents(t['exit'])} "
                 f"{t['pnl']:+.2f}  {EXIT_LABELS.get(t['reason'], t['reason'])}"
             )
     else:

@@ -13,29 +13,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import signal
 import subprocess
-from types import FrameType
 import sys
 
-
-def _kill_tree(pid: int) -> None:
-    """整树强杀子进程（uv shim → base python 双层结构）。
-
-    terminate() 只能杀直接子进程（uv shim），base python 会成孤儿继续跑——
-    与 single_instance._kill 同一策略（taskkill /T /F）。
-    """
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    else:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+from pmbot import entry_support
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,13 +47,7 @@ def _main_with_guard(args: argparse.Namespace, mode: str, data_dir: str) -> int:
 
     # 终端关闭（CTRL_CLOSE/LOGOFF/SHUTDOWN）在 Windows 上触发 SIGTERM：
     # 转为 KeyboardInterrupt 走统一优雅退出路径（finally 整树清理）。
-    def _on_sigterm(signum: int, frame: FrameType | None) -> None:
-        raise KeyboardInterrupt
-
-    try:
-        signal.signal(signal.SIGTERM, _on_sigterm)
-    except (ValueError, OSError):
-        pass
+    entry_support.on_sigterm()
 
     # 主循环子进程：输出进 logs/bot.log（不占终端）。
     # spawn 细节（base python + PYTHONPATH 绕 venv shim、日志重定向）收敛在
@@ -91,7 +66,7 @@ def _main_with_guard(args: argparse.Namespace, mode: str, data_dir: str) -> int:
         parent_pid=parent_pid,
         child_process=bot,
         is_alive=lambda pid: InstanceGuard.alive(pid),
-        on_parent_exit=_kill_tree,
+        on_parent_exit=entry_support.kill_tree,
     )
     watchdog.start()
 
@@ -103,7 +78,7 @@ def _main_with_guard(args: argparse.Namespace, mode: str, data_dir: str) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        _kill_tree(bot.pid)  # 整树杀（uv shim + base python 一并清理）
+        entry_support.kill_tree(bot.pid)  # 整树杀（uv shim + base python 一并清理）
         try:
             bot.wait(timeout=5)
         except subprocess.TimeoutExpired:

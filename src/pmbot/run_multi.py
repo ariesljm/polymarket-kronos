@@ -22,9 +22,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import FrameType
 
-from pmbot.run import build_loop, resolve_proxy
+from pmbot.run import build_loop
+
 
 LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
@@ -32,21 +32,10 @@ LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 def _setup_multi_logging(mode: str) -> Path:
     """单文件日志:dry-run=logs/multi.log, live=logs/multi_live.log(按天滚动 14 天,不混)。"""
     log_dir = Path(__file__).resolve().parents[2] / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
     fname = "multi_live.log" if mode == "live" else "multi.log"
-    fmt = logging.Formatter(LOG_FMT)
-    fh = logging.handlers.TimedRotatingFileHandler(
-        log_dir / fname, when="midnight", backupCount=14, encoding="utf-8"
-    )
-    fh.setFormatter(fmt)
-    handlers: list[logging.Handler] = [fh]
-    if sys.stderr.isatty():
-        sh = logging.StreamHandler()
-        sh.setFormatter(fmt)
-        handlers.append(sh)
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
-    for noisy in ("httpx", "py_clob_client_v2.http_helpers.helpers", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    from pmbot.entry_support import setup_logging
+
+    setup_logging(log_dir, fname)
     return log_dir
 
 
@@ -85,19 +74,11 @@ def main(argv: list[str] | None = None) -> int:
     # 实盘前置自检（真钱守门）：先写回代理环境——py_clob_client 的 httpx 客户端
     # 在首次调用时才创建，环境变量必须在此之前就位；不通过则拒绝启动。
     if not args.dry_run:
-        from pmbot.clob_executor import ClobExecutor
-        from pmbot.preflight import live_advisories, live_preflight
+        from pmbot.entry_support import run_live_preflight
 
-        resolve_proxy()
-        problems = live_preflight(cfg, ClobExecutor())
-        if problems:
-            for p in problems:
-                logging.error("实盘自检未通过：%s", p)
-            logging.error("拒绝以实盘模式启动（修正后重试；先干跑请用 start_multi.bat）")
-            return 3
-        for note in live_advisories(cfg):
-            logging.warning("实盘提醒：%s", note)
-        logging.info("实盘自检通过：凭证 / 余额 / 授权 均正常")
+        rc = run_live_preflight(cfg)
+        if rc != 0:
+            return rc
     bundles: list = []
     loops: list = []
     for sym, dd in zip(symbols, data_dirs):
@@ -114,13 +95,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("日志: %s", log_dir / ("multi_live.log" if mode == "live" else "multi.log"))
     logging.info("=" * 56)
 
-    def _on_sigterm(signum: int, frame: FrameType | None) -> None:
-        raise KeyboardInterrupt
+    from pmbot.entry_support import on_sigterm
 
-    try:
-        signal.signal(signal.SIGTERM, _on_sigterm)
-    except (ValueError, OSError):
-        pass
+    on_sigterm()
 
     def _run() -> int:
         stop_event = threading.Event()
