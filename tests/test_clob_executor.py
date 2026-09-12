@@ -459,6 +459,19 @@ def test_market_buy_passes_protection_price(monkeypatch):
     assert client.price == 0.0
 
 
+def test_market_buy_zero_protection_price_rejects(monkeypatch):
+    """上限 0.0 = 拒绝一切（auto_tune 收窄结果）：直接放弃下单。
+
+    回归：`price=max_price or 0.0` 把 0.0 洗成 SDK 的“不传”（自动算吃穿价）→
+    保护价静默失效，实盘以 0.98 成交远高于任何上限。
+    """
+    ex = ClobExecutor(private_key="0x" + "0" * 64)
+    client = _OrderArgsRecorder()
+    monkeypatch.setattr(ex, "_get_client", lambda: client)
+    assert ex.market_buy("tok", 1.0, max_price=0.0) is None
+    assert client.price == "unset"  # 未下单
+
+
 def test_market_sell_passes_protection_price(monkeypatch):
     """卖出保护价透传到市价单（平仓传最小 tick = 接受任何合法价）。"""
     ex = ClobExecutor(private_key="0x" + "0" * 64)
@@ -517,3 +530,10 @@ def test_sim_market_buy_respects_protection_price(monkeypatch):
     monkeypatch.setattr(ex, "best_ask", lambda t, size=5.0: 0.90)
     assert ex.market_buy("tok", 1.0, max_price=0.60) is None  # 越界拒单
     assert ex.market_buy("tok", 1.0) is not None              # 不传保护价 → 成交
+
+
+def test_sim_market_buy_zero_protection_price_rejects(monkeypatch):
+    """dry-run 同语义：上限 0.0 拒绝一切（曾用 `if max_price` 真值判断放过）。"""
+    ex = SimExecutor(private_key="0x" + "0" * 64)
+    monkeypatch.setattr(ex, "best_ask", lambda t, size=5.0: 0.05)  # 低于任何正常上限
+    assert ex.market_buy("tok", 1.0, max_price=0.0) is None

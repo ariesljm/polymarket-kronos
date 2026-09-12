@@ -366,6 +366,9 @@ class ClobExecutor:
         “吃满 amount 的最贵档价”——对小单 ≈ best ask，等于不设限（决策时
         ≤cap、下单时已极化则照极化价成交）。传 entry_gate 上限，FOK 只在
         ≤上限时成交（宁错过不追高），并省掉 SDK 的 get_order_book 一次 REST。
+        max_price=0.0 语义是「拒绝一切」（auto_tune 收窄结果），直接放弃下单：
+        SDK 的 price=0 表示“不传、自动算吃穿价”，无法表达拒绝，会把保护价
+        静默洗成不设限。
 
         返回 Fill（order_id/avg_price/filled_size）：优先取订单响应的
         averagePrice/matchedAmount，缺省时用 get_order 补查（以 API 为准，
@@ -375,13 +378,18 @@ class ClobExecutor:
         """
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
 
+        if max_price is not None and max_price <= 0:
+            logger.warning("市价买入放弃：上限=%s 拒绝一切 token=%s",
+                           max_price, token_id[:16])
+            return None
+
         resp = self._get_client().create_and_post_market_order(
             order_args=MarketOrderArgs(
                 token_id=token_id,
                 amount=amount,  # BUY: 美元金额（SDK 语义）
                 side=Side.BUY,
                 order_type=OrderType.FOK,
-                price=max_price or 0.0,  # 0 = 不传，SDK 自动算吃穿价
+                price=max_price if max_price is not None else 0.0,  # 0 = 不传，SDK 自动算吃穿价
             ),
             options=PartialCreateOrderOptions(),
         )
@@ -628,7 +636,7 @@ class SimExecutor:
         ask = self.best_ask(token_id, size=1.0)
         if ask is None:
             return None  # 无报价：不建仓（与实盘"缺成交数据放弃建仓"同语义）
-        if max_price and ask > max_price:
+        if max_price is not None and ask > max_price:
             return None  # 保护价拒绝（与实盘 FOK 同语义：宁错过不追高）
         return Fill(order_id=f"sim-{token_id[:8]}", avg_price=ask,
                     filled_size=shares_for_amount(amount, ask))

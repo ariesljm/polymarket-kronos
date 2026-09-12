@@ -134,6 +134,27 @@ def test_exec_no_cap_passes_no_protection_price():
     assert seen["max_price"] is None
 
 
+def test_exec_zero_cap_rejects_entry_and_skips_order():
+    """auto_tune 收窄上限到 0 → 执行层按 entry_price_cap 拦下，不下单。
+
+    回归（2026-09-12 实盘事故）：闸门曾把 0.0 当成「不限制」，把盘口 0.98 的
+    仓位以市价单送出（且保护价为 None），远超任何入场上限。
+    """
+    calls = []
+
+    def buy(token_id, amount, max_price=None):
+        calls.append(max_price)
+        return Fill(order_id="o1", avg_price=0.50, filled_size=2.0)
+
+    disp, _ = make_dispatcher(book=_book(0.98), trade=SimpleNamespace(market_buy=buy),
+                              min_entry=0.30, max_entry=0.60,
+                              auto_override=lambda: AutoTuneOverride(max_entry_price=0.0))
+    disp.state.window_start = 1780000000
+    disp.execute(_place(), _market(), 1780000000)
+    assert calls == []  # 未下单
+    assert disp.state.retry_until_sec > 1780000000  # 走冷却，不每 tick 重试
+
+
 def test_exec_sell_passes_min_tick_as_protection_price():
     """平仓市价卖传最小 tick 作保护价：接受任何合法价（平仓只求成交），
     与 SDK 自动算吃穿价等价，但省掉下单前的一次 get_order_book REST。"""

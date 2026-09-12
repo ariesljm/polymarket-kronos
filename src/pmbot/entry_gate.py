@@ -19,14 +19,20 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class EntryGate:
-    """有效入场价区间（0 = 该侧关闭）。
+    """有效入场价区间（None = 该侧不限制）。
 
     上限：盘口 ask 高于此价不入场（穿越后追高仓位历史净亏，高价位 q−p 转负）。
     下限：盘口 ask 低于此价不入场（0.45-0.55 五五开档无信息优势，买卖价差双向吞噬）。
+
+    注意 None 与 0.0 语义不同，勿混用：
+    - None = 该侧不限制（config 的 `0 = 关闭` 由 resolve 映射而来）
+    - 0.0 = 有效上限/下限 0（auto_tune 判「最低价带累计 EV≤0」→ 拒绝一切入场）
+    曾以 `max_price > 0` 判定，把 auto_tune 的 0.00 上限当成「不限制」：盘口 0.98
+    的仓位静默放行并以市价成交（2026-09-12 实盘事故）。
     """
 
-    min_price: float = 0.0
-    max_price: float = 0.0
+    min_price: float | None = None
+    max_price: float | None = None
 
     def check(self, ask: float | None) -> str | None:
         """入场价越界原因：entry_price_cap / entry_price_floor；放行返回 None。
@@ -35,9 +41,9 @@ class EntryGate:
         """
         if ask is None:
             return None
-        if self.max_price > 0 and ask > self.max_price:
+        if self.max_price is not None and ask > self.max_price:
             return "entry_price_cap"
-        if self.min_price > 0 and ask < self.min_price:
+        if self.min_price is not None and ask < self.min_price:
             return "entry_price_floor"
         return None
 
@@ -49,7 +55,10 @@ def resolve(config_min: float, config_max: float,
 
     下限无自适应，直取 config（config.max_entry_price 与 min_entry_price 的
     `min < max` 关系已在 config 校验）。
+
+    config 的 `0 = 关闭` 映射为 None（不限制）；但 auto_tune 覆盖值 0.0 语义是
+    「拒绝一切」而非「关闭」——它是收窄结果，不得回退 config。
     """
     cap = override.max_entry_price if override is not None else None
-    max_price = config_max if cap is None else cap
-    return EntryGate(min_price=config_min, max_price=max_price)
+    max_price = (config_max or None) if cap is None else cap
+    return EntryGate(min_price=config_min or None, max_price=max_price)

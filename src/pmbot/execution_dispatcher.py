@@ -199,7 +199,10 @@ class ExecutionDispatcher:
         try:
             # 保护价 = 闸门上限：下单瞬间盘口若已极化到上限之上，FOK 直接拒单
             # （宁错过不追高）；同时省掉 SDK 拉盘口算吃穿价的一次 REST。
-            filled = self.trade.market_buy(token, action.amount, max_price=gate.max_price or None)
+            # 直传 gate.max_price：None = 未配置上限（不传保护价），
+            # 0.0 = auto_tune 收窄到拒绝一切（曾用 `or None` 把 0.0 洗成 None
+            # → 保护价静默丢失，实盘以 0.98 成交）。
+            filled = self.trade.market_buy(token, action.amount, max_price=gate.max_price)
         except Exception as e:
             # 服务端拒单（最小单量 / 余额不足 / 合规等）：必须走同一冷却，否则
             # 异常路径不设 retry_until_sec → 信号不变时每 tick（1s）重复下单刷屏。
